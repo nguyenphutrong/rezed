@@ -1533,8 +1533,7 @@ impl GitGraph {
         git_store.repositories().get(&self.repo_id).cloned()
     }
 
-    fn selected_commit_info(&self, cx: &App) -> Option<SelectedCommitInfo> {
-        let index = self.selected_entry_idx?;
+    fn commit_info_for_entry(&self, index: usize, cx: &App) -> Option<SelectedCommitInfo> {
         let commit = self.graph_data.commits.get(index)?;
         let repository = self.get_repository(cx)?;
         let subject = match repository.read(cx).commit_data_state(commit.data.sha) {
@@ -1547,6 +1546,10 @@ impl GitGraph {
             sha: commit.data.sha.to_string().into(),
             subject,
         })
+    }
+
+    fn context_menu_commit_info(&self, cx: &App) -> Option<SelectedCommitInfo> {
+        self.commit_info_for_entry(self.context_menu.as_ref()?.entry_idx, cx)
     }
 
     fn prompt_confirmation(
@@ -1631,16 +1634,14 @@ impl GitGraph {
         cx.notify();
     }
 
-    fn deploy_commit_context_menu(
+    fn deploy_entry_context_menu(
         &mut self,
         position: Point<Pixels>,
-        row_index: usize,
+        entry_idx: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_entry(row_index, ScrollStrategy::Nearest, cx);
-
-        let Some(commit) = self.graph_data.commits.get(row_index) else {
+        let Some(commit) = self.graph_data.commits.get(entry_idx) else {
             return;
         };
         let Some(repository) = self.get_repository(cx) else {
@@ -1662,11 +1663,11 @@ impl GitGraph {
 
             let _ = this.update_in(cx, |this, window, cx| {
                 this.commit_context_menu_state = Some(CommitContextMenuState {
-                    row_index,
+                    row_index: entry_idx,
                     drop_support,
                 });
-                if let Some(context_menu) = this.build_commit_context_menu(window, cx) {
-                    this.set_context_menu(context_menu, position, row_index, window, cx);
+                if let Some(context_menu) = this.build_commit_context_menu(entry_idx, window, cx) {
+                    this.set_context_menu(context_menu, position, entry_idx, window, cx);
                 }
             });
         })
@@ -1675,10 +1676,11 @@ impl GitGraph {
 
     fn build_commit_context_menu(
         &self,
+        entry_idx: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<ContextMenu>> {
-        let selected_commit = self.selected_commit_info(cx)?;
+        let selected_commit = self.commit_info_for_entry(entry_idx, cx)?;
         let context_state = self.commit_context_menu_state.as_ref()?;
         if context_state.row_index != selected_commit.index {
             return None;
@@ -1728,8 +1730,6 @@ impl GitGraph {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_entry(row_index, ScrollStrategy::Nearest, cx);
-
         let context_menu = match &ref_kind {
             RefNameKind::Branch(_) => self.build_branch_context_menu(&ref_kind, window, cx),
             RefNameKind::Tag(_) => self.build_tag_context_menu(&ref_kind, window, cx),
@@ -1928,7 +1928,7 @@ impl GitGraph {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
         let workspace = self.workspace.clone();
@@ -1947,7 +1947,7 @@ impl GitGraph {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
         let workspace = self.workspace.clone();
@@ -2642,16 +2642,16 @@ impl GitGraph {
         );
     }
 
-    fn copy_selected_commit_hash(&mut self, cx: &mut Context<Self>) {
-        let Some(commit) = self.selected_commit_info(cx) else {
+    fn copy_context_menu_commit_hash(&mut self, cx: &mut Context<Self>) {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
 
         cx.write_to_clipboard(ClipboardItem::new_string(commit.sha.to_string()));
     }
 
-    fn copy_selected_commit_subject(&mut self, cx: &mut Context<Self>) {
-        let Some(commit) = self.selected_commit_info(cx) else {
+    fn copy_context_menu_commit_subject(&mut self, cx: &mut Context<Self>) {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
         let Some(subject) = commit.subject else {
@@ -2684,11 +2684,11 @@ impl GitGraph {
         self.run_git_operation(task, "Failed to checkout branch", window, cx);
     }
 
-    fn checkout_selected_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn checkout_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
 
@@ -2726,11 +2726,11 @@ impl GitGraph {
         });
     }
 
-    fn cherry_pick_selected_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn cherry_pick_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
         let workspace = self.workspace.clone();
@@ -2745,11 +2745,11 @@ impl GitGraph {
         }
     }
 
-    fn revert_selected_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn revert_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
 
@@ -2787,16 +2787,19 @@ impl GitGraph {
         });
     }
 
-    fn drop_selected_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn drop_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
         let Some(context_state) = self.commit_context_menu_state.as_ref() else {
             return;
         };
+        if context_state.row_index != commit.index {
+            return;
+        }
         if !context_state.drop_support.can_drop {
             return;
         }
@@ -2835,11 +2838,11 @@ impl GitGraph {
         });
     }
 
-    fn merge_selected_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn merge_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
 
@@ -2877,11 +2880,11 @@ impl GitGraph {
         });
     }
 
-    fn rebase_selected_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn rebase_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
 
@@ -2922,11 +2925,11 @@ impl GitGraph {
         );
     }
 
-    fn reset_selected_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn reset_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
         };
-        let Some(commit) = self.selected_commit_info(cx) else {
+        let Some(commit) = self.context_menu_commit_info(cx) else {
             return;
         };
 
@@ -4134,20 +4137,28 @@ impl GitGraph {
         }
     }
 
+    fn handle_entry_secondary_mouse_down(
+        &mut self,
+        entry_idx: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.deploy_entry_context_menu(event.position, entry_idx, window, cx);
+        cx.stop_propagation();
+    }
+
     fn handle_graph_secondary_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.button != MouseButton::Right {
+        let Some(row) = self.row_at_position(event.position.y, window, cx) else {
             return;
-        }
+        };
 
-        if let Some(row) = self.row_at_position(event.position.y, window, cx) {
-            self.deploy_commit_context_menu(event.position, row, window, cx);
-            cx.stop_propagation();
-        }
+        self.handle_entry_secondary_mouse_down(row, event, window, cx);
     }
 
     fn handle_graph_scroll(
@@ -4796,23 +4807,13 @@ impl Render for GitGraph {
                                         .on_mouse_down(
                                             MouseButton::Right,
                                             move |event: &MouseDownEvent, window, cx| {
-                                                if event.button != MouseButton::Right {
-                                                    return;
-                                                }
-
-                                                let Some(this) = weak_for_context_menu.upgrade()
-                                                else {
-                                                    return;
-                                                };
-                                                this.update(cx, |this, cx| {
-                                                    this.deploy_commit_context_menu(
-                                                        event.position,
-                                                        index,
-                                                        window,
-                                                        cx,
-                                                    );
-                                                });
-                                                cx.stop_propagation();
+                                                weak_for_context_menu
+                                                    .update(cx, |this, cx| {
+                                                        this.handle_entry_secondary_mouse_down(
+                                                            index, event, window, cx,
+                                                        );
+                                                    })
+                                                    .ok();
                                             },
                                         )
                                         .into_any_element()
@@ -4947,31 +4948,31 @@ impl Render for GitGraph {
                 this.show_create_branch_modal(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CheckoutCommit, window, cx| {
-                this.checkout_selected_commit(window, cx);
+                this.checkout_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CherryPickCommit, window, cx| {
-                this.cherry_pick_selected_commit(window, cx);
+                this.cherry_pick_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RevertCommit, window, cx| {
-                this.revert_selected_commit(window, cx);
+                this.revert_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DropCommit, window, cx| {
-                this.drop_selected_commit(window, cx);
+                this.drop_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &MergeCommit, window, cx| {
-                this.merge_selected_commit(window, cx);
+                this.merge_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RebaseOntoCommit, window, cx| {
-                this.rebase_selected_commit(window, cx);
+                this.rebase_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ResetCommit, window, cx| {
-                this.reset_selected_commit(window, cx);
+                this.reset_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &CopyCommitHash, _window, cx| {
-                this.copy_selected_commit_hash(cx);
+                this.copy_context_menu_commit_hash(cx);
             }))
             .on_action(cx.listener(|this, _: &CopyCommitSubject, _window, cx| {
-                this.copy_selected_commit_subject(cx);
+                this.copy_context_menu_commit_subject(cx);
             }))
             .child(
                 v_flex()
