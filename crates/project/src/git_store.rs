@@ -34,10 +34,10 @@ use git::{
     parse_git_remote_url,
     repository::{
         Branch, CommitData, CommitDetails, CommitDiff, CommitFile, CommitOptions,
-        CreateWorktreeTarget, DiffType, FetchOptions, GitCommitTemplate, GitRepository,
-        GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote,
-        RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
-        Worktree as GitWorktree, delete_branch_flag,
+        CreateWorktreeTarget, DiffType, DropCommitSupport, FetchOptions, GitCommitTemplate,
+        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
+        PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -505,6 +505,66 @@ pub enum GitStoreEvent {
 impl EventEmitter<RepositoryEvent> for Repository {}
 impl EventEmitter<JobsUpdated> for Repository {}
 impl EventEmitter<GitStoreEvent> for GitStore {}
+
+fn push_mode_from_proto(mode: proto::push::push_options_v2::PushMode) -> git::repository::PushMode {
+    match mode {
+        proto::push::push_options_v2::PushMode::Normal => git::repository::PushMode::Normal,
+        proto::push::push_options_v2::PushMode::ForceWithLease => {
+            git::repository::PushMode::ForceWithLease
+        }
+        proto::push::push_options_v2::PushMode::Force => git::repository::PushMode::Force,
+    }
+}
+
+fn push_mode_to_proto(mode: git::repository::PushMode) -> proto::push::push_options_v2::PushMode {
+    match mode {
+        git::repository::PushMode::Normal => proto::push::push_options_v2::PushMode::Normal,
+        git::repository::PushMode::ForceWithLease => {
+            proto::push::push_options_v2::PushMode::ForceWithLease
+        }
+        git::repository::PushMode::Force => proto::push::push_options_v2::PushMode::Force,
+    }
+}
+
+fn push_options_from_proto(payload: &proto::Push) -> Option<git::repository::PushOptions> {
+    if let Some(options) = payload.options_v2.as_ref() {
+        return Some(git::repository::PushOptions {
+            set_upstream: options.set_upstream,
+            push_mode: push_mode_from_proto(options.push_mode()),
+        });
+    }
+
+    payload.options.as_ref().map(|_| match payload.options() {
+        proto::push::PushOptions::SetUpstream => git::repository::PushOptions {
+            set_upstream: true,
+            push_mode: git::repository::PushMode::Normal,
+        },
+        proto::push::PushOptions::Force => git::repository::PushOptions {
+            set_upstream: false,
+            push_mode: git::repository::PushMode::ForceWithLease,
+        },
+    })
+}
+
+fn push_options_to_proto(
+    options: git::repository::PushOptions,
+) -> (
+    Option<proto::push::PushOptions>,
+    Option<proto::push::PushOptionsV2>,
+) {
+    let options_v2 = proto::push::PushOptionsV2 {
+        set_upstream: options.set_upstream,
+        push_mode: push_mode_to_proto(options.push_mode) as i32,
+    };
+
+    let legacy_options = match (options.set_upstream, options.push_mode) {
+        (true, git::repository::PushMode::Normal) => Some(proto::push::PushOptions::SetUpstream),
+        (false, git::repository::PushMode::ForceWithLease) => Some(proto::push::PushOptions::Force),
+        _ => None,
+    };
+
+    (legacy_options, Some(options_v2))
+}
 
 pub struct GitJob {
     job: Box<dyn FnOnce(RepositoryState, &mut AsyncApp) -> Task<()>>,
@@ -2217,14 +2277,7 @@ impl GitStore {
             &mut cx,
         );
 
-        let options = envelope
-            .payload
-            .options
-            .as_ref()
-            .map(|_| match envelope.payload.options() {
-                proto::push::PushOptions::SetUpstream => git::repository::PushOptions::SetUpstream,
-                proto::push::PushOptions::Force => git::repository::PushOptions::Force,
-            });
+        let options = push_options_from_proto(&envelope.payload);
 
         let branch_name = envelope.payload.branch_name.into();
         let remote_branch_name = envelope.payload.remote_branch_name.into();
@@ -5043,11 +5096,162 @@ impl Repository {
                             mode: match reset_mode {
                                 ResetMode::Soft => git_reset::ResetMode::Soft.into(),
                                 ResetMode::Mixed => git_reset::ResetMode::Mixed.into(),
+                                ResetMode::Hard => {
+                                    bail!("Hard reset is not supported for collab repositories")
+                                }
                             },
                         })
                         .await?;
 
                     Ok(())
+                }
+            }
+        })
+    }
+
+    pub fn create_tag(
+        &mut self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job(None, move |repo, mut cx| async move {
+            let result = match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.create_tag(sha, name, message).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |this, cx| {
+                    this.initial_graph_data.clear();
+                    cx.notify();
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn create_branch_at(&mut self, sha: String, name: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job(None, move |repo, mut cx| async move {
+            let result = match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.create_branch_at(sha, name).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |this, cx| {
+                    this.initial_graph_data.clear();
+                    cx.notify();
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn checkout_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.checkout_commit(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            }
+        })
+    }
+
+    pub fn cherry_pick(
+        &mut self,
+        sha: String,
+        record_origin: bool,
+        no_commit: bool,
+    ) -> oneshot::Receiver<Result<()>> {
+        self.send_job(None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.cherry_pick(sha, record_origin, no_commit).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            }
+        })
+    }
+
+    pub fn revert_commit(&mut self, sha: String, no_commit: bool) -> oneshot::Receiver<Result<()>> {
+        self.send_job(None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.revert_commit(sha, no_commit).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            }
+        })
+    }
+
+    pub fn drop_commit_support(
+        &mut self,
+        sha: String,
+    ) -> oneshot::Receiver<Result<DropCommitSupport>> {
+        self.send_job(None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.drop_commit_support(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            }
+        })
+    }
+
+    pub fn drop_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.drop_commit(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            }
+        })
+    }
+
+    pub fn merge_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.merge_commit(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
+                }
+            }
+        })
+    }
+
+    pub fn rebase_onto(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        self.send_job(None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.rebase_onto(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("Git graph commit operations are not supported for collab repositories")
                 }
             }
         })
@@ -5456,6 +5660,10 @@ impl Repository {
             debug_assert!(!has_failed, "This should always be inserted");
             &CommitDataState::Loading(None)
         })
+    }
+
+    pub fn commit_data_state(&self, sha: Oid) -> Option<&CommitDataState> {
+        self.commit_data.get(&sha)
     }
 
     fn get_handler(&mut self, cx: &mut Context<Self>) -> &mut CommitDataHandler {
@@ -6435,11 +6643,14 @@ impl Repository {
         let id = self.id;
 
         let args = options
-            .map(|option| match option {
-                PushOptions::SetUpstream => " --set-upstream",
-                PushOptions::Force => " --force-with-lease",
+            .map(|options| {
+                options
+                    .command_args()
+                    .into_iter()
+                    .map(|arg| format!(" {arg}"))
+                    .collect::<String>()
             })
-            .unwrap_or("");
+            .unwrap_or_default();
 
         let updates_tx = self
             .git_store()
@@ -6495,6 +6706,8 @@ impl Repository {
                             let askpass_delegate = askpass_delegates.lock().remove(&askpass_id);
                             debug_assert!(askpass_delegate.is_some());
                         });
+                        let (legacy_options, options_v2) =
+                            options.map(push_options_to_proto).unwrap_or((None, None));
                         let response = client
                             .request(proto::Push {
                                 project_id: project_id.0,
@@ -6503,13 +6716,8 @@ impl Repository {
                                 branch_name: branch.to_string(),
                                 remote_branch_name: remote_branch.to_string(),
                                 remote_name: remote.to_string(),
-                                options: options.map(|options| match options {
-                                    PushOptions::Force => proto::push::PushOptions::Force,
-                                    PushOptions::SetUpstream => {
-                                        proto::push::PushOptions::SetUpstream
-                                    }
-                                }
-                                    as i32),
+                                options: legacy_options.map(Into::into),
+                                options_v2,
                             })
                             .await?;
 
@@ -7003,6 +7211,89 @@ impl Repository {
 
     pub fn delete_ref(&mut self, ref_name: String) -> oneshot::Receiver<Result<()>> {
         self.edit_ref(ref_name, None)
+    }
+
+    pub fn delete_tag(&mut self, name: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job(None, move |repo, mut cx| async move {
+            let result = match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.delete_tag(name).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!(
+                        "Git graph commit operations are not supported for collab repositories"
+                    )
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |this, cx| {
+                    this.initial_graph_data.clear();
+                    cx.notify();
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn push_tag(
+        &mut self,
+        name: SharedString,
+        remote: SharedString,
+        askpass: AskPassDelegate,
+        _cx: &mut Context<Self>,
+    ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
+        let askpass_delegates = self.askpass_delegates.clone();
+        let askpass_id = util::post_inc(&mut self.latest_askpass_id);
+        let id = self.id;
+
+        self.send_job(
+            Some(format!("git push {} refs/tags/{}", remote, name).into()),
+            move |repo, _cx| async move {
+                match repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => {
+                        backend
+                            .push_tag(
+                                name.to_string(),
+                                remote.to_string(),
+                                askpass,
+                                environment,
+                                _cx,
+                            )
+                            .await
+                    }
+                    RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                        askpass_delegates.lock().insert(askpass_id, askpass);
+                        let _defer = util::defer(|| {
+                            let askpass_delegate = askpass_delegates.lock().remove(&askpass_id);
+                            debug_assert!(askpass_delegate.is_some());
+                        });
+
+                        client
+                            .request(proto::Push {
+                                project_id: project_id.0,
+                                repository_id: id.to_proto(),
+                                askpass_id,
+                                remote_name: remote.to_string(),
+                                branch_name: format!("refs/tags/{name}"),
+                                remote_branch_name: format!("refs/tags/{name}"),
+                                options: None,
+                                options_v2: None,
+                            })
+                            .await
+                            .map(|response| RemoteCommandOutput {
+                                stdout: response.stdout,
+                                stderr: response.stderr,
+                            })
+                    }
+                }
+            },
+        )
     }
 
     pub fn repair_worktrees(&mut self) -> oneshot::Receiver<Result<()>> {
@@ -8676,6 +8967,88 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[test]
+    fn test_push_options_from_legacy_proto() {
+        let mut push = proto::Push::default();
+        push.options = Some(proto::push::PushOptions::SetUpstream as i32);
+        assert_eq!(
+            push_options_from_proto(&push),
+            Some(PushOptions {
+                set_upstream: true,
+                push_mode: git::repository::PushMode::Normal,
+            })
+        );
+
+        push.options = Some(proto::push::PushOptions::Force as i32);
+        assert_eq!(
+            push_options_from_proto(&push),
+            Some(PushOptions {
+                set_upstream: false,
+                push_mode: git::repository::PushMode::ForceWithLease,
+            })
+        );
+    }
+
+    #[test]
+    fn test_push_options_v2_precedes_legacy_proto() {
+        let mut push = proto::Push::default();
+        push.options = Some(proto::push::PushOptions::SetUpstream as i32);
+        push.options_v2 = Some(proto::push::PushOptionsV2 {
+            set_upstream: false,
+            push_mode: proto::push::push_options_v2::PushMode::Force as i32,
+        });
+
+        assert_eq!(
+            push_options_from_proto(&push),
+            Some(PushOptions {
+                set_upstream: false,
+                push_mode: git::repository::PushMode::Force,
+            })
+        );
+    }
+
+    #[test]
+    fn test_push_options_to_proto_sets_v2_and_representable_legacy() {
+        let (legacy, options_v2) = push_options_to_proto(PushOptions {
+            set_upstream: true,
+            push_mode: git::repository::PushMode::Normal,
+        });
+        assert_eq!(legacy, Some(proto::push::PushOptions::SetUpstream));
+        assert_eq!(
+            options_v2,
+            Some(proto::push::PushOptionsV2 {
+                set_upstream: true,
+                push_mode: proto::push::push_options_v2::PushMode::Normal as i32,
+            })
+        );
+
+        let (legacy, options_v2) = push_options_to_proto(PushOptions {
+            set_upstream: false,
+            push_mode: git::repository::PushMode::ForceWithLease,
+        });
+        assert_eq!(legacy, Some(proto::push::PushOptions::Force));
+        assert_eq!(
+            options_v2,
+            Some(proto::push::PushOptionsV2 {
+                set_upstream: false,
+                push_mode: proto::push::push_options_v2::PushMode::ForceWithLease as i32,
+            })
+        );
+
+        let (legacy, options_v2) = push_options_to_proto(PushOptions {
+            set_upstream: true,
+            push_mode: git::repository::PushMode::Force,
+        });
+        assert_eq!(legacy, None);
+        assert_eq!(
+            options_v2,
+            Some(proto::push::PushOptionsV2 {
+                set_upstream: true,
+                push_mode: proto::push::push_options_v2::PushMode::Force as i32,
+            })
+        );
     }
 
     #[test]

@@ -530,6 +530,14 @@ pub enum ResetMode {
     /// Reset the branch pointer and index, leave worktree unchanged (this makes it look as though things that were
     /// committed are now unstaged).
     Mixed,
+    /// Reset the branch pointer, index, and worktree.
+    Hard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropCommitSupport {
+    pub can_drop: bool,
+    pub reason: Option<SharedString>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -782,6 +790,25 @@ pub trait GitRepository: Send + Sync {
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
+    fn create_branch_at(&self, sha: String, name: String) -> BoxFuture<'_, Result<()>>;
+    fn create_tag(
+        &self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>>;
+    fn checkout_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn cherry_pick(
+        &self,
+        sha: String,
+        record_origin: bool,
+        no_commit: bool,
+    ) -> BoxFuture<'_, Result<()>>;
+    fn revert_commit(&self, sha: String, no_commit: bool) -> BoxFuture<'_, Result<()>>;
+    fn drop_commit_support(&self, sha: String) -> BoxFuture<'_, Result<DropCommitSupport>>;
+    fn drop_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn merge_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn rebase_onto(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>>;
 
     fn delete_branch(
@@ -790,6 +817,15 @@ pub trait GitRepository: Send + Sync {
         name: String,
         force: bool,
     ) -> BoxFuture<'_, Result<()>>;
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>>;
+    fn push_tag(
+        &self,
+        name: String,
+        remote_name: String,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>>;
 
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>>;
 
@@ -1028,9 +1064,46 @@ pub enum DiffType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
-pub enum PushOptions {
-    SetUpstream,
+pub enum PushMode {
+    Normal,
+    ForceWithLease,
     Force,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+pub struct PushOptions {
+    pub set_upstream: bool,
+    pub push_mode: PushMode,
+}
+
+impl PushOptions {
+    pub fn command_args(self) -> Vec<&'static str> {
+        let mut args = Vec::new();
+
+        if self.set_upstream {
+            args.push("--set-upstream");
+        }
+
+        match self.push_mode {
+            PushMode::Normal => {}
+            PushMode::ForceWithLease => args.push("--force-with-lease"),
+            PushMode::Force => args.push("--force"),
+        }
+
+        args
+    }
+}
+
+fn revert_commit_command_args(sha: &str, parent_count: usize, no_commit: bool) -> Vec<String> {
+    let mut args = vec!["revert".into(), "--no-edit".into()];
+    if parent_count > 1 {
+        args.extend(["-m".into(), "1".into()]);
+    }
+    if no_commit {
+        args.push("--no-commit".into());
+    }
+    args.push(sha.into());
+    args
 }
 
 impl std::fmt::Debug for dyn GitRepository {
@@ -1135,6 +1208,79 @@ impl RealGitRepository {
                 let args = edit.into_args();
                 git.run(&args).await?;
                 Ok(())
+            })
+            .boxed()
+    }
+
+    fn simple_git_command(&self, args: Vec<String>) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+                git.run(&arg_refs).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn drop_commit_support_impl(&self, sha: String) -> BoxFuture<'_, Result<DropCommitSupport>> {
+        let git = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                let head_sha = git.run(&["rev-parse", "HEAD"]).await?;
+                let commit_line = git.run(&["rev-list", "--parents", "-n", "1", &sha]).await?;
+                let mut commit_parts = commit_line.split_whitespace();
+                let _commit_sha = commit_parts
+                    .next()
+                    .context("failed to parse commit metadata for drop preflight")?;
+                let parent_shas = commit_parts.collect::<Vec<_>>();
+
+                if parent_shas.is_empty() {
+                    return Ok(DropCommitSupport {
+                        can_drop: false,
+                        reason: Some("Cannot drop the root commit".into()),
+                    });
+                }
+
+                if parent_shas.len() > 1 {
+                    return Ok(DropCommitSupport {
+                        can_drop: false,
+                        reason: Some("Cannot drop merge commits".into()),
+                    });
+                }
+
+                let ancestry_output = git
+                    .build_command(&["merge-base", "--is-ancestor", &sha, "HEAD"])
+                    .output()
+                    .await?;
+                if !ancestry_output.status.success() {
+                    return Ok(DropCommitSupport {
+                        can_drop: false,
+                        reason: Some("Commit is not on the current branch".into()),
+                    });
+                }
+
+                if sha.trim() == head_sha.trim() {
+                    let status_output = git
+                        .run(&["status", "--porcelain=v1", "--untracked-files=no"])
+                        .await?;
+                    if !status_output.trim().is_empty() {
+                        return Ok(DropCommitSupport {
+                            can_drop: false,
+                            reason: Some(
+                                "Cannot drop HEAD while the working tree has uncommitted changes"
+                                    .into(),
+                            ),
+                        });
+                    }
+                }
+
+                Ok(DropCommitSupport {
+                    can_drop: true,
+                    reason: None,
+                })
             })
             .boxed()
     }
@@ -1400,6 +1546,7 @@ impl GitRepository for RealGitRepository {
             let mode_flag = match mode {
                 ResetMode::Mixed => "--mixed",
                 ResetMode::Soft => "--soft",
+                ResetMode::Hard => "--hard",
             };
 
             let git = git_binary?;
@@ -2034,6 +2181,185 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn create_branch_at(&self, sha: String, name: String) -> BoxFuture<'_, Result<()>> {
+        self.simple_git_command(vec!["branch".into(), name, sha])
+    }
+
+    fn create_tag(
+        &self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let mut args = vec!["tag".to_string()];
+        if let Some(message) = message.filter(|message| !message.trim().is_empty()) {
+            args.push("-a".into());
+            args.push(name);
+            args.push(sha);
+            args.push("-m".into());
+            args.push(message);
+        } else {
+            args.push(name);
+            args.push(sha);
+        }
+
+        self.simple_git_command(args)
+    }
+
+    fn checkout_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        self.simple_git_command(vec!["checkout".into(), "--detach".into(), sha])
+    }
+
+    fn cherry_pick(
+        &self,
+        sha: String,
+        record_origin: bool,
+        no_commit: bool,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                let commit_line = git.run(&["rev-list", "--parents", "-n", "1", &sha]).await?;
+                let parent_count = commit_line.split_whitespace().count().saturating_sub(1);
+
+                let mut args = vec!["cherry-pick"];
+                if parent_count > 1 {
+                    args.extend_from_slice(&["-m", "1"]);
+                }
+                if record_origin {
+                    args.push("-x");
+                }
+                if no_commit {
+                    args.push("--no-commit");
+                }
+                args.push(&sha);
+                git.run(&args).await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn revert_commit(&self, sha: String, no_commit: bool) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                let commit_line = git.run(&["rev-list", "--parents", "-n", "1", &sha]).await?;
+                let parent_count = commit_line.split_whitespace().count().saturating_sub(1);
+                git.run(&revert_commit_command_args(&sha, parent_count, no_commit))
+                    .await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn drop_commit_support(&self, sha: String) -> BoxFuture<'_, Result<DropCommitSupport>> {
+        self.drop_commit_support_impl(sha)
+    }
+
+    fn drop_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git = self.git_binary();
+
+        self.executor
+            .spawn(async move {
+                let support = {
+                    let commit_line = git.run(&["rev-list", "--parents", "-n", "1", &sha]).await?;
+                    let mut commit_parts = commit_line.split_whitespace();
+                    let _commit_sha = commit_parts
+                        .next()
+                        .context("failed to parse commit metadata while dropping commit")?;
+                    let parent_shas = commit_parts.collect::<Vec<_>>();
+
+                    if parent_shas.is_empty() {
+                        DropCommitSupport {
+                            can_drop: false,
+                            reason: Some("Cannot drop the root commit".into()),
+                        }
+                    } else if parent_shas.len() > 1 {
+                        DropCommitSupport {
+                            can_drop: false,
+                            reason: Some("Cannot drop merge commits".into()),
+                        }
+                    } else {
+                        let ancestry_output = git
+                            .build_command(&["merge-base", "--is-ancestor", &sha, "HEAD"])
+                            .output()
+                            .await?;
+                        if !ancestry_output.status.success() {
+                            DropCommitSupport {
+                                can_drop: false,
+                                reason: Some("Commit is not on the current branch".into()),
+                            }
+                        } else {
+                            let head_sha = git.run(&["rev-parse", "HEAD"]).await?;
+                            if sha.trim() == head_sha.trim() {
+                                let status_output = git
+                                    .run(&["status", "--porcelain=v1", "--untracked-files=no"])
+                                    .await?;
+                                if !status_output.trim().is_empty() {
+                                    DropCommitSupport {
+                                        can_drop: false,
+                                        reason: Some(
+                                            "Cannot drop HEAD while the working tree has uncommitted changes"
+                                                .into(),
+                                        ),
+                                    }
+                                } else {
+                                    DropCommitSupport {
+                                        can_drop: true,
+                                        reason: None,
+                                    }
+                                }
+                            } else {
+                                DropCommitSupport {
+                                    can_drop: true,
+                                    reason: None,
+                                }
+                            }
+                        }
+                    }
+                };
+
+                if !support.can_drop {
+                    bail!(
+                        "{}",
+                        support
+                            .reason
+                            .unwrap_or_else(|| "Commit cannot be dropped".into())
+                    );
+                }
+
+                let head_sha = git.run(&["rev-parse", "HEAD"]).await?;
+                if sha.trim() == head_sha.trim() {
+                    git.run(&["reset", "--hard", "HEAD^"]).await?;
+                    return Ok(());
+                }
+
+                let commit_line = git.run(&["rev-list", "--parents", "-n", "1", &sha]).await?;
+                let mut commit_parts = commit_line.split_whitespace();
+                let _commit_sha = commit_parts
+                    .next()
+                    .context("failed to parse commit metadata while dropping commit")?;
+                let parent_sha = commit_parts
+                    .next()
+                    .context("selected commit does not have a first parent")?;
+
+                git.run(&["rebase", "--onto", parent_sha, &sha, "HEAD"])
+                    .await?;
+                Ok(())
+            })
+            .boxed()
+    }
+
+    fn merge_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        self.simple_git_command(vec!["merge".into(), sha])
+    }
+
+    fn rebase_onto(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        self.simple_git_command(vec!["rebase".into(), sha])
+    }
+
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>> {
         let git_binary = self.git_binary_in_worktree();
 
@@ -2062,6 +2388,50 @@ impl GitRepository for RealGitRepository {
                 anyhow::Ok(())
             })
             .boxed()
+    }
+
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        self.simple_git_command(vec!["tag".into(), "-d".into(), name])
+    }
+
+    fn push_tag(
+        &self,
+        name: String,
+        remote_name: String,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>> {
+        let working_directory = self.working_directory();
+        let git_directory = self.path();
+        let executor = cx.background_executor().clone();
+        let git_binary_path = self.system_git_binary_path.clone();
+        let is_trusted = self.is_trusted();
+
+        async move {
+            let git_binary_path =
+                git_binary_path.context("git not found on $PATH, can't push tag")?;
+            let working_directory = working_directory?;
+            let git = GitBinary::new(
+                git_binary_path,
+                working_directory,
+                git_directory,
+                executor.clone(),
+                is_trusted,
+            );
+
+            let mut command = git.build_command(&["push"]);
+            command
+                .envs(env.iter())
+                .arg(remote_name)
+                .arg(format!("refs/tags/{name}"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            run_git_command(env, ask_pass, command, executor).await
+        }
+        .boxed()
     }
 
     fn blame(
@@ -2387,10 +2757,7 @@ impl GitRepository for RealGitRepository {
             let mut command = git.build_command(&["push"]);
             command
                 .envs(env.iter())
-                .args(options.map(|option| match option {
-                    PushOptions::SetUpstream => "--set-upstream",
-                    PushOptions::Force => "--force-with-lease",
-                }))
+                .args(options.into_iter().flat_map(PushOptions::command_args))
                 .arg(remote_name)
                 .arg(format!("{}:{}", branch_name, remote_branch_name))
                 .stdin(Stdio::null())
@@ -3676,6 +4043,62 @@ mod tests {
             std::env::set_var("GIT_CONFIG_GLOBAL", "");
             std::env::set_var("GIT_CONFIG_SYSTEM", "");
         }
+    }
+
+    #[test]
+    fn test_push_options_command_args() {
+        assert_eq!(
+            PushOptions {
+                set_upstream: false,
+                push_mode: PushMode::Normal,
+            }
+            .command_args(),
+            Vec::<&'static str>::new()
+        );
+        assert_eq!(
+            PushOptions {
+                set_upstream: true,
+                push_mode: PushMode::Normal,
+            }
+            .command_args(),
+            vec!["--set-upstream"]
+        );
+        assert_eq!(
+            PushOptions {
+                set_upstream: false,
+                push_mode: PushMode::ForceWithLease,
+            }
+            .command_args(),
+            vec!["--force-with-lease"]
+        );
+        assert_eq!(
+            PushOptions {
+                set_upstream: true,
+                push_mode: PushMode::Force,
+            }
+            .command_args(),
+            vec!["--set-upstream", "--force"]
+        );
+    }
+
+    #[test]
+    fn test_revert_commit_command_args() {
+        assert_eq!(
+            revert_commit_command_args("abc123", 1, false),
+            vec!["revert", "--no-edit", "abc123"]
+        );
+        assert_eq!(
+            revert_commit_command_args("abc123", 1, true),
+            vec!["revert", "--no-edit", "--no-commit", "abc123"]
+        );
+        assert_eq!(
+            revert_commit_command_args("abc123", 2, false),
+            vec!["revert", "--no-edit", "-m", "1", "abc123"]
+        );
+        assert_eq!(
+            revert_commit_command_args("abc123", 2, true),
+            vec!["revert", "--no-edit", "-m", "1", "--no-commit", "abc123"]
+        );
     }
 
     #[gpui::test]
