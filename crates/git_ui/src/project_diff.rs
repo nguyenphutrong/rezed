@@ -66,8 +66,6 @@ actions!(
         /// Opens a new agent thread with the branch diff for review.
         ReviewDiff,
         LeaderAndFollower,
-        /// Compare with a specific branch
-        CompareWithBranch,
     ]
 );
 
@@ -162,7 +160,7 @@ impl ProjectDiff {
 
     fn compare_with_branch(
         workspace: &mut Workspace,
-        _: &CompareWithBranch,
+        _: &git::CompareWithBranch,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
