@@ -3018,13 +3018,15 @@ mod tests {
             let active_item = workspace.active_item_as::<ProjectDiff>(cx).unwrap();
             let active_base_ref = match active_item.read(cx).diff_base(cx) {
                 DiffBase::Merge { base_ref } => base_ref.to_string(),
-                DiffBase::Head => panic!("expected active item to be a branch diff"),
+                DiffBase::Head | DiffBase::Compare { .. } => {
+                    panic!("expected active item to be a branch diff")
+                }
             };
             let base_refs = workspace
                 .items_of_type::<ProjectDiff>(cx)
                 .filter_map(|item| match item.read(cx).diff_base(cx) {
                     DiffBase::Merge { base_ref } => Some(base_ref.to_string()),
-                    DiffBase::Head => None,
+                    DiffBase::Head | DiffBase::Compare { .. } => None,
                 })
                 .collect::<Vec<_>>();
             (active_base_ref, base_refs)
