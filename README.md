@@ -3,31 +3,46 @@
 [![Rezed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/nguyenphutrong/rezed/rezed/assets/badge/v0.json)](https://github.com/nguyenphutrong/rezed)
 [![CI](https://github.com/nguyenphutrong/rezed/actions/workflows/run_tests.yml/badge.svg?branch=rezed)](https://github.com/nguyenphutrong/rezed/actions/workflows/run_tests.yml)
 
-Rezed is a fork of [Zed](https://github.com/zed-industries/zed), the high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+Rezed is a community-maintained fork of [zed-industries/zed](https://github.com/zed-industries/zed), focused on a Git-first editing experience for developers who live in branches, pull requests, diffs, history, and review workflows.
+
+The fork keeps Zed's performance-oriented editor foundation while giving community contributors room to experiment with deeper Git features and practical source-control ergonomics.
 
 ---
+
+### Focus
+
+Rezed prioritizes Git workflows that are useful inside the editor:
+
+- Faster navigation through commit history, branches, and changed files
+- Clearer diff and review surfaces for day-to-day development
+- Better workflows around branch comparison, pull request preparation, and repository state
+- Community-driven iteration on Git features that may be too experimental for upstream
+
+### Status
+
+Rezed is maintained by community contributors. The project is in an early fork setup phase: branding, CI, release packaging, and fork-specific documentation are being established incrementally.
+
+The internal Rust crate and binary names are still inherited from upstream Zed for now.
 
 ### Installation
 
 Rezed releases are published from this fork's [GitHub Releases](https://github.com/nguyenphutrong/rezed/releases) when tags are pushed.
 
-Until fork-specific installers are fully established, upstream Zed installation documentation remains useful for platform prerequisites:
+Until fork-specific installers are fully established, use the development setup below to build locally.
+
+### Developing Rezed
 
 - [Building on macOS](./docs/src/development/macos.md)
 - [Building on Linux](./docs/src/development/linux.md)
 - [Building on Windows](./docs/src/development/windows.md)
 
-Other platforms are not yet available:
-
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
-
-### Developing Rezed
-
-The internal Rust crate and binary names are still inherited from upstream Zed for now. Start with the upstream build commands documented above, then use the fork CI as the source of truth for supported checks.
+Use the fork CI as the source of truth for supported checks.
 
 ### Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for upstream contribution context. Fork-specific contribution and release rules will live in this README as they diverge.
+Contributions are welcome, especially around Git features, editor source-control workflows, fork packaging, and documentation.
+
+For inherited development practices, see [CONTRIBUTING.md](./CONTRIBUTING.md). Fork-specific contribution and release rules will live in this README as they diverge.
 
 ### Licensing
 
@@ -43,6 +58,6 @@ We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automati
 
 ## Relationship to Upstream
 
-Rezed is not affiliated with Zed Industries, Inc. Upstream Zed remains the base project and copyright holder for inherited code.
+Rezed is sourced from [zed-industries/zed](https://github.com/zed-industries/zed) and is not affiliated with Zed Industries, Inc. Upstream Zed remains the base project and copyright holder for inherited code.
 
 Fork-specific CI/CD intentionally avoids Zed Industries' private runners, secrets, deployment targets, Slack/Discord automation, Sentry project, and release publishing steps.
