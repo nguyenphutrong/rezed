@@ -52,19 +52,17 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Build release binaries
-        run: cargo build --locked --release --package zed --package cli --package remote_server
-      - name: Package binaries
-        run: |
-          mkdir -p release-artifacts/rezed-macos-arm64
-          cp target/release/zed release-artifacts/rezed-macos-arm64/rezed
-          cp target/release/cli release-artifacts/rezed-macos-arm64/zed
-          cp target/release/remote_server release-artifacts/rezed-macos-arm64/remote_server
-          tar -C release-artifacts -czf rezed-macos-arm64.tar.gz rezed-macos-arm64
+      - name: Build macOS DMG
+        run: ./script/bundle-mac aarch64-apple-darwin
       - uses: actions/upload-artifact@v4
         with:
-          name: rezed-macos-arm64
-          path: rezed-macos-arm64.tar.gz
+          name: Rezed-aarch64.dmg
+          path: target/aarch64-apple-darwin/release/Rezed-aarch64.dmg
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rezed-remote-server-macos-aarch64.gz
+          path: target/rezed-remote-server-macos-aarch64.gz
           if-no-files-found: error
 
   publish:
@@ -93,4 +91,5 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --draft --title "$TAG" --notes "Rezed release $TAG"
+          gh release delete-asset "$TAG" rezed-macos-arm64.tar.gz -y 2>/dev/null || true
           gh release upload "$TAG" release-artifacts/* --clobber
