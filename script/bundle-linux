@@ -91,33 +91,7 @@ if [[ "$remote_server_triple" == "$musl_triple" ]]; then
 fi
 cargo build --release --target "${remote_server_triple}" --package remote_server
 
-# Upload debug info to sentry.io
-if ! command -v sentry-cli >/dev/null 2>&1; then
-    echo "sentry-cli not found. skipping sentry upload."
-    echo "install with: 'curl -sL https://sentry.io/get-cli | bash'"
-else
-    if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
-        echo "Uploading zed debug symbols to sentry..."
-        # note: this uploads the unstripped binary which is needed because it contains
-        # .eh_frame data for stack unwinding. see https://github.com/getsentry/symbolic/issues/783
-        for attempt in 1 2 3; do
-            echo "Attempting sentry upload (attempt $attempt/3)..."
-            if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "${target_dir}/${target_triple}"/release/zed \
-                "${target_dir}/${remote_server_triple}"/release/remote_server; then
-                echo "Sentry upload successful on attempt $attempt"
-                break
-            else
-                echo "Sentry upload failed on attempt $attempt"
-                if [ $attempt -eq 3 ]; then
-                    echo "All sentry upload attempts failed"
-                fi
-            fi
-        done
-    else
-        echo "missing SENTRY_AUTH_TOKEN. skipping sentry upload."
-    fi
-fi
+echo "Skipping debug symbol upload for Rezed fork builds."
 
 # Strip debug symbols and save them for upload to DigitalOcean.
 # We use llvm-objcopy because GNU objcopy on older distros (e.g. Ubuntu 20.04)
@@ -175,17 +149,17 @@ export APP_CLI="zed"
 export APP_ICON="zed"
 export APP_ARGS="%U"
 if [[ "$channel" == "preview" ]]; then
-  export APP_NAME="Zed Preview"
-  APP_ID="dev.zed.Zed-Preview"
+  export APP_NAME="Rezed Preview"
+  APP_ID="dev.rezed.Rezed-Preview"
 elif [[ "$channel" == "nightly" ]]; then
-  export APP_NAME="Zed Nightly"
-  APP_ID="dev.zed.Zed-Nightly"
+  export APP_NAME="Rezed Nightly"
+  APP_ID="dev.rezed.Rezed-Nightly"
 elif [[ "$channel" == "dev" ]]; then
-  export APP_NAME="Zed Devel"
-  APP_ID="dev.zed.Zed-Dev"
+  export APP_NAME="Rezed Devel"
+  APP_ID="dev.rezed.Rezed-Dev"
 else
-  export APP_NAME="Zed"
-  APP_ID="dev.zed.Zed"
+  export APP_NAME="Rezed"
+  APP_ID="dev.rezed.Rezed"
 fi
 
 mkdir -p "${zed_dir}/share/applications"
@@ -197,11 +171,11 @@ cp "assets/licenses.md" "${zed_dir}/licenses.md"
 
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
-archive="zed-linux-${arch}.tar.gz"
+archive="rezed-linux-${arch}.tar.gz"
 
 rm -rf "${archive}"
-remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+remove_match="rezed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
 tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
 
-gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"
+gzip -f --stdout --best "${target_dir}/${remote_server_triple}/release/remote_server" > "${target_dir}/rezed-remote-server-linux-${arch}.gz"

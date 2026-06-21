@@ -245,7 +245,7 @@ function sign_app_binaries() {
     else
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
-        dmg_file_path="${dmg_target_directory}/Zed-${arch_suffix}.dmg"
+        dmg_file_path="${dmg_target_directory}/Rezed-${arch_suffix}.dmg"
         xcode_bin_dir_path="$(xcode-select -p)/usr/bin"
 
         rm -rf ${dmg_source_directory}
@@ -257,7 +257,7 @@ function sign_app_binaries() {
         ln -s /Applications ${dmg_source_directory}
 
         echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
-        hdiutil create -volname Zed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+        hdiutil create -volname Rezed -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
         # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
@@ -293,41 +293,7 @@ function sign_binary() {
 }
 
 function upload_debug_symbols() {
-    if [ "$local_install" = true ]; then
-        echo "local install; skipping sentry upload."
-    elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
-        echo "Uploading zed debug symbols to sentry..."
-        exe_path="target/${target_triple}/release/Zed"
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/zed" 2> target/dsymutil.log; then
-            echo "dsymutil failed"
-            cat target/dsymutil.log
-            exit 1
-        fi
-        if ! dsymutil --flat "target/${target_triple}/${target_dir}/remote_server" 2> target/dsymutil.log; then
-            echo "dsymutil failed"
-            cat target/dsymutil.log
-            exit 1
-        fi
-        # note: this uploads the unstripped binary which is needed because it contains
-        # .eh_frame data for stack unwinding. see https://github.com/getsentry/symbolic/issues/783
-        # Try uploading up to 3 times
-        for attempt in 1 2 3; do
-            echo "Sentry upload attempt $attempt..."
-            if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
-                "target/${target_triple}/${target_dir}/zed.dwarf" \
-                "target/${target_triple}/${target_dir}/remote_server.dwarf"; then
-                break
-            else
-                echo "Sentry upload failed on attempt $attempt"
-                if [ $attempt -eq 3 ]; then
-                    echo "All sentry upload attempts failed"
-                    exit 1
-                fi
-            fi
-        done
-    else
-        echo "missing SENTRY_AUTH_TOKEN. skipping sentry upload."
-    fi
+    echo "Skipping debug symbol upload for Rezed fork builds."
 }
 
 upload_debug_symbols
@@ -337,4 +303,4 @@ cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 sign_app_binaries
 
 sign_binary "target/$target_triple/release/remote_server"
-gzip -f --stdout --best target/$target_triple/release/remote_server > target/zed-remote-server-macos-$arch_suffix.gz
+gzip -f --stdout --best target/$target_triple/release/remote_server > target/rezed-remote-server-macos-$arch_suffix.gz
