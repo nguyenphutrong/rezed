@@ -754,9 +754,44 @@ pub enum LogSource {
     Branch(SharedString),
     Sha(Oid),
     Path(RepoPath),
+    Filtered {
+        source: Box<LogSource>,
+        options: GraphLogOptions,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GraphLogOptions {
+    pub show_stashes: bool,
+    pub show_tags: bool,
+    pub include_reflog_commits: bool,
+    pub first_parent_only: bool,
 }
 
 impl LogSource {
+    pub fn with_graph_options(self, options: GraphLogOptions) -> Self {
+        let source = match self {
+            LogSource::Filtered { source, .. } => *source,
+            source => source,
+        };
+
+        if options == GraphLogOptions::default() {
+            source
+        } else {
+            LogSource::Filtered {
+                source: Box::new(source),
+                options,
+            }
+        }
+    }
+
+    pub fn base_source(&self) -> &LogSource {
+        match self {
+            LogSource::Filtered { source, .. } => source.base_source(),
+            source => source,
+        }
+    }
+
     fn get_args(&self) -> Result<Vec<&str>> {
         match self {
             LogSource::All => Ok(vec![
@@ -764,6 +799,7 @@ impl LogSource {
                 "--branches",
                 "--remotes",
                 "--tags",
+                "refs/stash",
                 "HEAD",
             ]),
             LogSource::Branch(branch) => Ok(vec![branch.as_str()]),
@@ -771,7 +807,51 @@ impl LogSource {
                 str::from_utf8(oid.as_bytes()).context("Failed to build str from sha")?,
             ]),
             LogSource::Path(path) => Ok(vec!["--follow", "--", path.as_unix_str()]),
+            LogSource::Filtered { source, options } => options.get_args(source),
         }
+    }
+}
+
+impl Default for GraphLogOptions {
+    fn default() -> Self {
+        Self {
+            show_stashes: true,
+            show_tags: true,
+            include_reflog_commits: false,
+            first_parent_only: false,
+        }
+    }
+}
+
+impl GraphLogOptions {
+    fn get_args<'a>(&self, source: &'a LogSource) -> Result<Vec<&'a str>> {
+        let mut args = Vec::new();
+
+        if self.include_reflog_commits {
+            args.push("--reflog");
+        }
+
+        if self.first_parent_only {
+            args.push("--first-parent");
+        }
+
+        match source.base_source() {
+            LogSource::All => {
+                args.push("--ignore-missing");
+                args.push("--branches");
+                args.push("--remotes");
+                if self.show_tags {
+                    args.push("--tags");
+                }
+                if self.show_stashes {
+                    args.push("refs/stash");
+                }
+                args.push("HEAD");
+            }
+            source => args.extend(source.get_args()?),
+        }
+
+        Ok(args)
     }
 }
 
@@ -4227,6 +4307,43 @@ mod tests {
         };
 
         assert_eq!(commit.tag_names(), ["v1.0.0", "v1.1.0"]);
+    }
+
+    #[test]
+    fn test_graph_log_options_filter_all_source_args() {
+        let source = LogSource::All.with_graph_options(GraphLogOptions {
+            show_stashes: false,
+            show_tags: false,
+            include_reflog_commits: true,
+            first_parent_only: true,
+        });
+
+        assert_eq!(
+            source.get_args().unwrap(),
+            vec![
+                "--reflog",
+                "--first-parent",
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "HEAD",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_all_log_source_includes_stash_without_custom_refs() {
+        assert_eq!(
+            LogSource::All.get_args().unwrap(),
+            vec![
+                "--ignore-missing",
+                "--branches",
+                "--remotes",
+                "--tags",
+                "refs/stash",
+                "HEAD",
+            ]
+        );
     }
 
     #[test]

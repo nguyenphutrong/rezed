@@ -5103,7 +5103,7 @@ impl Repository {
             RepositoryEvent::StashEntriesChanged => {
                 if self.scan_id > 2 {
                     self.initial_graph_data
-                        .retain(|(log_source, _), _| *log_source != LogSource::All);
+                        .retain(|(log_source, _), _| log_source.base_source() != &LogSource::All);
                 }
             }
             _ => {}
@@ -9142,12 +9142,15 @@ fn deserialize_blame_buffer_response(
 }
 
 fn log_source_to_proto(log_source: &LogSource) -> proto::GitLogSource {
+    let log_source = log_source.base_source();
+
     proto::GitLogSource {
         source: Some(match log_source {
             LogSource::All => proto::git_log_source::Source::All(proto::GitLogSourceAll {}),
             LogSource::Branch(branch) => proto::git_log_source::Source::Branch(branch.to_string()),
             LogSource::Sha(sha) => proto::git_log_source::Source::Sha(sha.to_string()),
             LogSource::Path(path) => proto::git_log_source::Source::Path(path.to_proto()),
+            LogSource::Filtered { .. } => unreachable!(),
         }),
     }
 }
