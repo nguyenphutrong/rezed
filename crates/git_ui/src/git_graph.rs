@@ -1844,6 +1844,24 @@ impl GitGraph {
         true
     }
 
+    fn is_stash_ref_name(ref_name: &str) -> bool {
+        ref_name == "refs/stash" || ref_name == "stash" || ref_name.starts_with("stash@{")
+    }
+
+    fn display_ref_name(
+        ref_name: &SharedString,
+        sha: Oid,
+        stash_entries: &git::stash::GitStash,
+    ) -> SharedString {
+        if Self::is_stash_ref_name(ref_name)
+            && let Some(entry) = stash_entries.entries.iter().find(|entry| entry.oid == sha)
+        {
+            return format!("stash@{{{}}}", entry.index).into();
+        }
+
+        ref_name.clone()
+    }
+
     fn update_graph_settings(
         &mut self,
         update: impl FnOnce(&mut GraphSettings),
@@ -1899,13 +1917,31 @@ impl GitGraph {
         accent_color: gpui::Hsla,
         is_head: bool,
     ) -> impl IntoElement {
-        Chip::new(name.clone())
+        let is_tag = name.starts_with("tag: ");
+        let is_stash = Self::is_stash_ref_name(name);
+        let label = if is_tag {
+            name.trim_start_matches("tag: ").to_string().into()
+        } else if name.starts_with("HEAD -> ") {
+            name.trim_start_matches("HEAD -> ").to_string().into()
+        } else {
+            name.clone()
+        };
+
+        Chip::new(label)
             .label_size(LabelSize::Small)
             .truncate()
+            .icon(if is_head {
+                IconName::Check
+            } else if is_tag {
+                IconName::GitTag
+            } else if is_stash {
+                IconName::GitStash
+            } else {
+                IconName::GitBranch
+            })
             .map(|chip| {
                 if is_head {
-                    chip.icon(IconName::Check)
-                        .bg_color(accent_color.opacity(0.25))
+                    chip.bg_color(accent_color.opacity(0.25))
                         .border_color(accent_color.opacity(0.5))
                 } else {
                     chip.bg_color(accent_color.opacity(0.08))
@@ -1956,13 +1992,19 @@ impl GitGraph {
     ) -> Vec<Vec<AnyElement>> {
         let repository = self.get_repository(cx);
 
-        let head_branch_name: Option<SharedString> = repository.as_ref().and_then(|repo| {
-            repo.read(cx)
-                .snapshot()
-                .branch
-                .as_ref()
-                .map(|branch| SharedString::from(branch.name().to_string()))
-        });
+        let (head_branch_name, stash_entries) = repository
+            .as_ref()
+            .map(|repo| {
+                let snapshot = repo.read(cx).snapshot();
+                (
+                    snapshot
+                        .branch
+                        .as_ref()
+                        .map(|branch| SharedString::from(branch.name().to_string())),
+                    snapshot.stash_entries,
+                )
+            })
+            .unwrap_or_default();
 
         let row_height = Self::row_height(window, cx);
         let has_context_menu = self.has_context_menu();
@@ -2051,6 +2093,10 @@ impl GitGraph {
                     .ref_names
                     .iter()
                     .filter(|name| self.is_visible_ref_name(name))
+                    .collect::<Vec<_>>();
+                let display_ref_names = visible_ref_names
+                    .iter()
+                    .map(|name| Self::display_ref_name(name, commit.data.sha, &stash_entries))
                     .collect::<Vec<_>>();
 
                 let is_selected = self.selected_entry_idx == Some(idx);
@@ -2150,8 +2196,8 @@ impl GitGraph {
                             h_flex()
                                 .gap_2()
                                 .overflow_hidden()
-                                .children((!visible_ref_names.is_empty()).then(|| {
-                                    h_flex().gap_1().children(visible_ref_names.iter().map(
+                                .children((!display_ref_names.is_empty()).then(|| {
+                                    h_flex().gap_1().children(display_ref_names.iter().map(
                                         |name| {
                                             let is_head =
                                                 Self::is_head_ref(name.as_ref(), &head_branch_name);
@@ -3171,14 +3217,24 @@ impl GitGraph {
         });
 
         let full_sha: SharedString = commit_entry.data.sha.to_string().into();
-        let ref_names = commit_entry.data.ref_names.clone();
+        let ref_names = commit_entry
+            .data
+            .ref_names
+            .iter()
+            .filter(|name| self.is_visible_ref_name(name))
+            .cloned()
+            .collect::<Vec<_>>();
 
-        let head_branch_name: Option<SharedString> = repository
-            .read(cx)
-            .snapshot()
+        let repository_snapshot = repository.read(cx).snapshot();
+        let head_branch_name: Option<SharedString> = repository_snapshot
             .branch
             .as_ref()
             .map(|branch| SharedString::from(branch.name().to_string()));
+        let stash_entries = repository_snapshot.stash_entries;
+        let display_ref_names = ref_names
+            .iter()
+            .map(|name| Self::display_ref_name(name, commit_entry.data.sha, &stash_entries))
+            .collect::<Vec<_>>();
 
         let accent_colors = cx.theme().accents();
         let accent_color = accent_colors
@@ -3313,9 +3369,9 @@ impl GitGraph {
                                     ),
                             ),
                     )
-                    .children((!ref_names.is_empty()).then(|| {
+                    .children((!display_ref_names.is_empty()).then(|| {
                         h_flex().gap_1().flex_wrap().justify_center().children(
-                            ref_names.iter().map(|name| {
+                            display_ref_names.iter().map(|name| {
                                 let is_head = Self::is_head_ref(name.as_ref(), &head_branch_name);
                                 self.render_ref_chip(name, accent_color, is_head, selected_idx, cx)
                             }),
@@ -7471,5 +7527,34 @@ mod tests {
             Some("v1.0".into())
         );
         assert_eq!(GitGraph::ref_name_from_decoration("HEAD"), None);
+    }
+
+    #[test]
+    fn test_display_ref_name_uses_stash_index() {
+        let stash_oid = Oid::from_bytes(&[1; 20]).unwrap();
+        let other_oid = Oid::from_bytes(&[2; 20]).unwrap();
+        let stash_entries = git::stash::GitStash {
+            entries: vec![git::stash::StashEntry {
+                index: 3,
+                oid: stash_oid,
+                message: "WIP".to_string(),
+                branch: Some("main".to_string()),
+                timestamp: 0,
+            }]
+            .into(),
+        };
+
+        assert_eq!(
+            GitGraph::display_ref_name(&"refs/stash".into(), stash_oid, &stash_entries),
+            SharedString::from("stash@{3}")
+        );
+        assert_eq!(
+            GitGraph::display_ref_name(&"refs/stash".into(), other_oid, &stash_entries),
+            SharedString::from("refs/stash")
+        );
+        assert_eq!(
+            GitGraph::display_ref_name(&"tag: v1.0".into(), stash_oid, &stash_entries),
+            SharedString::from("tag: v1.0")
+        );
     }
 }

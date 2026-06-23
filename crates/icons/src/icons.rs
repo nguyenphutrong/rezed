@@ -159,6 +159,8 @@ pub enum IconName {
     GitBranchPlus,
     GitCommit,
     GitGraph,
+    GitStash,
+    GitTag,
     GitMergeConflict,
     GitWorktree,
     Gitea,
