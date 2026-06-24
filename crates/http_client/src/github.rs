@@ -321,6 +321,7 @@ async fn get_github_json_page<T: for<'de> Deserialize<'de>>(
 ) -> anyhow::Result<(T, Option<String>)> {
     let request = Request::get(url)
         .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .header("User-Agent", "Rezed")
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .when_some(token, |builder, token| {
@@ -790,6 +791,27 @@ mod tests {
                     .get("Authorization")
                     .and_then(|header| header.to_str().ok())
                     == Some("Bearer secret")
+            }));
+            assert!(requests.iter().all(|request| {
+                request
+                    .headers()
+                    .get("User-Agent")
+                    .and_then(|header| header.to_str().ok())
+                    == Some("Rezed")
+            }));
+            assert!(requests.iter().all(|request| {
+                request
+                    .headers()
+                    .get("Accept")
+                    .and_then(|header| header.to_str().ok())
+                    == Some("application/vnd.github+json")
+            }));
+            assert!(requests.iter().all(|request| {
+                request
+                    .headers()
+                    .get("X-GitHub-Api-Version")
+                    .and_then(|header| header.to_str().ok())
+                    == Some("2022-11-28")
             }));
         });
     }
