@@ -54,6 +54,15 @@ pub struct GitHubConnectedAccount {
     pub access_token: String,
 }
 
+impl GitHubConnectedAccount {
+    pub fn missing_required_scopes(&self) -> Vec<&'static str> {
+        ["repo", "read:user"]
+            .into_iter()
+            .filter(|required_scope| !self.scopes.iter().any(|scope| scope == required_scope))
+            .collect()
+    }
+}
+
 impl std::fmt::Debug for GitHubConnectedAccount {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -246,5 +255,27 @@ mod tests {
         assert!(formatted.contains("octo"));
         assert!(formatted.contains("<redacted>"));
         assert!(!formatted.contains("github-secret-token"));
+    }
+
+    #[test]
+    fn github_connected_account_reports_missing_required_scopes() {
+        let account = GitHubConnectedAccount {
+            login: "octo".to_string(),
+            scopes: vec!["repo".to_string(), "read:user".to_string()],
+            access_token: "github-secret-token".to_string(),
+        };
+        assert!(account.missing_required_scopes().is_empty());
+
+        let account = GitHubConnectedAccount {
+            scopes: vec!["read:user".to_string()],
+            ..account.clone()
+        };
+        assert_eq!(account.missing_required_scopes(), vec!["repo"]);
+
+        let account = GitHubConnectedAccount {
+            scopes: vec!["repo".to_string()],
+            ..account
+        };
+        assert_eq!(account.missing_required_scopes(), vec!["read:user"]);
     }
 }

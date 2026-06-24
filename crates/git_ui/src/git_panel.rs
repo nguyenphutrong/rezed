@@ -5889,19 +5889,28 @@ impl GitPanel {
     fn render_github_connection_status(&self) -> AnyElement {
         match &self.github_connection {
             GitHubConnectionState::Connected(account) => {
+                let missing_scopes = account.missing_required_scopes();
                 let scopes = if account.scopes.is_empty() {
                     String::new()
                 } else {
                     format!(" · scopes: {}", account.scopes.iter().join(", "))
                 };
+                let missing_scopes = if missing_scopes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · missing scopes: {}", missing_scopes.iter().join(", "))
+                };
                 h_flex()
                     .gap_1()
                     .child(Icon::new(IconName::Github).size(IconSize::Small))
                     .child(
-                        Label::new(format!("Connected as @{}{}", account.login, scopes))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
+                        Label::new(format!(
+                            "Connected as @{}{}{}",
+                            account.login, scopes, missing_scopes
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .truncate(),
                     )
                     .into_any_element()
             }
