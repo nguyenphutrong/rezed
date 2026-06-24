@@ -65,6 +65,7 @@ impl GitHubRepositoryActivity {
                 workflow_conclusion: None,
                 workflow_event: None,
                 workflow_head_branch: None,
+                workflow_head_sha: None,
             })
             .chain(
                 self.pull_requests
@@ -90,6 +91,7 @@ impl GitHubRepositoryActivity {
                         workflow_conclusion: None,
                         workflow_event: None,
                         workflow_head_branch: None,
+                        workflow_head_sha: None,
                     }),
             )
             .chain(self.workflow_runs.iter().map(|run| {
@@ -118,6 +120,7 @@ impl GitHubRepositoryActivity {
                     workflow_conclusion: run.conclusion.clone(),
                     workflow_event: Some(run.event.clone()),
                     workflow_head_branch: run.head_branch.clone(),
+                    workflow_head_sha: run.head_sha.clone(),
                 }
             }))
             .collect()
@@ -143,6 +146,7 @@ pub struct GitHubActivityItem {
     pub workflow_conclusion: Option<String>,
     pub workflow_event: Option<String>,
     pub workflow_head_branch: Option<String>,
+    pub workflow_head_sha: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +197,8 @@ pub struct GitHubWorkflowRun {
     pub status: Option<String>,
     pub conclusion: Option<String>,
     pub head_branch: Option<String>,
+    #[serde(default)]
+    pub head_sha: Option<String>,
     #[serde(default)]
     pub actor: Option<GitHubUser>,
     #[serde(default)]
@@ -547,6 +553,7 @@ mod tests {
                             "status": "completed",
                             "conclusion": "success",
                             "head_branch": "main",
+                            "head_sha": "1234567890abcdef",
                             "actor": { "login": "ci-user" },
                             "updated_at": "2026-06-24T12:00:00Z",
                             "event": "push"
@@ -605,6 +612,10 @@ mod tests {
             assert_eq!(items[2].workflow_conclusion.as_deref(), Some("success"));
             assert_eq!(items[2].workflow_event.as_deref(), Some("push"));
             assert_eq!(items[2].workflow_head_branch.as_deref(), Some("main"));
+            assert_eq!(
+                items[2].workflow_head_sha.as_deref(),
+                Some("1234567890abcdef")
+            );
 
             let requests = http.requests.lock();
             assert_eq!(requests.len(), 3);
@@ -656,6 +667,7 @@ mod tests {
             workflow_conclusion: Some("success".to_string()),
             workflow_event: Some("push".to_string()),
             workflow_head_branch: Some("main".to_string()),
+            workflow_head_sha: Some("1234567890abcdef".to_string()),
         };
 
         let json = serde_json::to_value(&item).expect("activity item should serialize");
@@ -678,7 +690,8 @@ mod tests {
                 "workflow_status": "completed",
                 "workflow_conclusion": "success",
                 "workflow_event": "push",
-                "workflow_head_branch": "main"
+                "workflow_head_branch": "main",
+                "workflow_head_sha": "1234567890abcdef"
             })
         );
 

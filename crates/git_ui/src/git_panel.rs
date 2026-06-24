@@ -6011,7 +6011,7 @@ impl GitPanel {
                     .unwrap_or_else(|| "Workflow run".to_string())
                     .into(),
                 meta: format!(
-                    "{} · {}{}{}",
+                    "{} · {}{}{}{}",
                     run.conclusion
                         .as_deref()
                         .or(run.status.as_deref())
@@ -6024,6 +6024,9 @@ impl GitPanel {
                     run.head_branch
                         .as_ref()
                         .map(|branch| format!(" · {branch}"))
+                        .unwrap_or_default(),
+                    Self::github_workflow_short_sha(run)
+                        .map(|sha| format!(" · {sha}"))
                         .unwrap_or_default()
                 )
                 .into(),
@@ -6031,6 +6034,10 @@ impl GitPanel {
             }),
             cx,
         )
+    }
+
+    fn github_workflow_short_sha(run: &GitHubWorkflowRun) -> Option<&str> {
+        run.head_sha.as_deref().map(|sha| &sha[..7.min(sha.len())])
     }
 
     fn render_github_section(
