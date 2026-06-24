@@ -40,6 +40,10 @@ pub fn router() -> Router {
             "/client/integrations/github/activity/sync",
             axum::routing::post(sync_repository_activity),
         )
+        .route(
+            "/client/integrations/github/repositories",
+            get(list_repositories),
+        )
         .route("/client/integrations/github/inbox", get(list_inbox_items))
         .layer(middleware::from_fn(auth::validate_header))
 }
@@ -224,6 +228,31 @@ async fn sync_repository_activity(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_repositories(
+    Extension(app): Extension<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<cloud_api_types::GitHubRepositoriesResponse>> {
+    let Principal::User(user) = principal;
+    let Some(account) = app
+        .db
+        .get_github_integration(user.id, &app.config.zed_cloud_internal_api_key)
+        .await?
+    else {
+        return Err(Error::http(
+            StatusCode::CONFLICT,
+            "GitHub is not connected".into(),
+        ));
+    };
+    let http_client = app
+        .http_client
+        .as_ref()
+        .context("HTTP client is unavailable")?;
+
+    Ok(Json(
+        fetch_github_repositories(http_client, &account.access_token).await?,
+    ))
+}
+
 async fn list_inbox_items(
     Extension(app): Extension<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
@@ -297,6 +326,14 @@ struct GitHubIssueItem {
 #[derive(Deserialize)]
 struct GitHubWorkflowRunsResponse {
     workflow_runs: Vec<GitHubWorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct GitHubRepositoryApiResponse {
+    full_name: String,
+    private: bool,
+    html_url: String,
+    updated_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -424,6 +461,33 @@ fn build_github_oauth_authorize_url(
         }
     }
     Ok(url)
+}
+
+async fn fetch_github_repositories(
+    http_client: &reqwest::Client,
+    access_token: &str,
+) -> Result<cloud_api_types::GitHubRepositoriesResponse> {
+    let repositories_url = "https://api.github.com/user/repos?affiliation=owner,collaborator,organization_member&per_page=100&sort=updated&direction=desc";
+    let repositories: Vec<GitHubRepositoryApiResponse> =
+        get_github_paginated_json(http_client, repositories_url, access_token).await?;
+
+    Ok(cloud_api_types::GitHubRepositoriesResponse {
+        repositories: repositories
+            .into_iter()
+            .map(github_repository_to_dto)
+            .collect(),
+    })
+}
+
+fn github_repository_to_dto(
+    repository: GitHubRepositoryApiResponse,
+) -> cloud_api_types::GitHubRepository {
+    cloud_api_types::GitHubRepository {
+        name_with_owner: repository.full_name,
+        private: repository.private,
+        url: repository.html_url,
+        updated_at: repository.updated_at,
+    }
 }
 
 async fn fetch_github_repository_activity(
@@ -581,6 +645,24 @@ mod tests {
         assert_eq!(
             parse_github_oauth_scopes("repo, read:user workflow"),
             vec!["repo", "read:user", "workflow"]
+        );
+    }
+
+    #[test]
+    fn github_repository_response_maps_to_dashboard_repository() {
+        let repository = github_repository_to_dto(GitHubRepositoryApiResponse {
+            full_name: "owner/repo".to_string(),
+            private: true,
+            html_url: "https://github.com/owner/repo".to_string(),
+            updated_at: Some("2026-06-25T00:00:00Z".to_string()),
+        });
+
+        assert_eq!(repository.name_with_owner, "owner/repo");
+        assert!(repository.private);
+        assert_eq!(repository.url, "https://github.com/owner/repo");
+        assert_eq!(
+            repository.updated_at.as_deref(),
+            Some("2026-06-25T00:00:00Z")
         );
     }
 }

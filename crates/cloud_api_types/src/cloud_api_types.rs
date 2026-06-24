@@ -104,6 +104,19 @@ pub struct GitHubOAuthAuthorizeUrlResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepositoriesResponse {
+    pub repositories: Vec<GitHubRepository>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubRepository {
+    pub name_with_owner: String,
+    pub private: bool,
+    pub url: String,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubActivitySyncBatch {
     pub repository_name_with_owner: String,
     pub items: Vec<GitHubActivityItem>,
@@ -355,7 +368,7 @@ mod tests {
     use super::{
         GITHUB_REQUIRED_OAUTH_SCOPES, GitHubActivityItem, GitHubActivityKind,
         GitHubActivitySyncBatch, GitHubConnectedAccount, GitHubInboxItem, GitHubInboxItemsResponse,
-        GitHubOAuthAuthorizeUrlResponse,
+        GitHubOAuthAuthorizeUrlResponse, GitHubRepositoriesResponse, GitHubRepository,
     };
 
     #[test]
@@ -414,6 +427,35 @@ mod tests {
         );
         assert_eq!(
             serde_json::from_value::<GitHubOAuthAuthorizeUrlResponse>(json).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn github_repositories_response_serializes_repository_metadata() {
+        let response = GitHubRepositoriesResponse {
+            repositories: vec![GitHubRepository {
+                name_with_owner: "owner/repo".to_string(),
+                private: true,
+                url: "https://github.com/owner/repo".to_string(),
+                updated_at: Some("2026-06-25T00:00:00Z".to_string()),
+            }],
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "repositories": [{
+                    "name_with_owner": "owner/repo",
+                    "private": true,
+                    "url": "https://github.com/owner/repo",
+                    "updated_at": "2026-06-25T00:00:00Z"
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<GitHubRepositoriesResponse>(json).unwrap(),
             response
         );
     }

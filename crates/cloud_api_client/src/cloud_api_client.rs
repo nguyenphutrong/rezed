@@ -200,6 +200,20 @@ impl CloudApiClient {
         self.send_authenticated_json_request(request).await
     }
 
+    pub async fn fetch_github_repositories(
+        &self,
+    ) -> Result<GitHubRepositoriesResponse, ClientApiError> {
+        let request_builder = Request::builder().method(Method::GET).uri(
+            self.http_client
+                .build_zed_cloud_url("/client/integrations/github/repositories")
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let request = self.build_request(request_builder, AsyncBody::default())?;
+        self.send_authenticated_json_request(request).await
+    }
+
     pub async fn fetch_github_integration_status(
         &self,
     ) -> Result<Option<GitHubIntegrationStatus>, ClientApiError> {
@@ -755,6 +769,53 @@ mod tests {
                 response.url,
                 "https://github.com/login/oauth/authorize?client_id=rezed"
             );
+        });
+    }
+
+    #[test]
+    fn test_fetch_github_repositories() {
+        futures::executor::block_on(async {
+            let http_client = FakeHttpClient::create(|request| async move {
+                assert_eq!(request.method(), Method::GET);
+                assert_eq!(
+                    request.uri().path(),
+                    "/client/integrations/github/repositories"
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|header| header.to_str().ok()),
+                    Some("42 rezed-token")
+                );
+
+                Ok(Response::builder()
+                    .status(200)
+                    .body(
+                        serde_json::json!({
+                            "repositories": [{
+                                "name_with_owner": "owner/repo",
+                                "private": true,
+                                "url": "https://github.com/owner/repo",
+                                "updated_at": "2026-06-25T00:00:00Z"
+                            }]
+                        })
+                        .to_string()
+                        .into(),
+                    )
+                    .unwrap())
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            let response = client
+                .fetch_github_repositories()
+                .await
+                .expect("request should succeed");
+
+            assert_eq!(response.repositories.len(), 1);
+            assert_eq!(response.repositories[0].name_with_owner, "owner/repo");
+            assert!(response.repositories[0].private);
         });
     }
 

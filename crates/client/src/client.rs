@@ -58,7 +58,7 @@ use util::{ConnectionResult, ResultExt};
 pub use cloud_api_types::{
     GitHubActivityItem, GitHubActivityKind, GitHubActivitySyncBatch, GitHubConnectedAccount,
     GitHubInboxItem, GitHubInboxItemsResponse, GitHubIntegrationStatus,
-    GitHubOAuthAuthorizeUrlResponse,
+    GitHubOAuthAuthorizeUrlResponse, GitHubRepositoriesResponse, GitHubRepository,
 };
 pub use llm_token::*;
 pub use rpc::*;
@@ -652,6 +652,20 @@ impl Client {
             .fetch_github_oauth_authorize_url(redirect_uri, state)
             .await
             .context("failed to fetch GitHub OAuth authorize URL")
+    }
+
+    pub async fn fetch_github_repositories(
+        &self,
+        cx: &AsyncApp,
+    ) -> Result<GitHubRepositoriesResponse> {
+        self.github_api_credentials(cx)
+            .await?
+            .context("missing credentials for GitHub repositories")?;
+
+        self.cloud_client
+            .fetch_github_repositories()
+            .await
+            .context("failed to fetch GitHub repositories")
     }
 
     pub async fn fetch_github_integration_status(
@@ -2658,6 +2672,59 @@ mod tests {
             response.url,
             "https://github.com/login/oauth/authorize?client_id=rezed"
         );
+    }
+
+    #[gpui::test]
+    async fn test_fetch_github_repositories(cx: &mut TestAppContext) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(
+                request.uri().path(),
+                "/client/integrations/github/repositories"
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("42 rezed-token")
+            );
+
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(
+                    serde_json::json!({
+                        "repositories": [{
+                            "name_with_owner": "owner/repo",
+                            "private": false,
+                            "url": "https://github.com/owner/repo",
+                            "updated_at": "2026-06-25T00:00:00Z"
+                        }]
+                    })
+                    .to_string()
+                    .into(),
+                )
+                .unwrap())
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let response = client
+            .fetch_github_repositories(&cx.to_async())
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.repositories.len(), 1);
+        assert_eq!(response.repositories[0].name_with_owner, "owner/repo");
+        assert!(!response.repositories[0].private);
     }
 
     #[gpui::test]
