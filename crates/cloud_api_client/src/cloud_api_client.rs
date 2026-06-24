@@ -14,6 +14,7 @@ use http_client::{
     AsyncBody, HttpClientWithUrl, HttpRequestExt, Json, Method, Request, Response, StatusCode,
 };
 use parking_lot::RwLock;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use yawc::WebSocket;
@@ -158,6 +159,55 @@ impl CloudApiClient {
         }
     }
 
+    pub async fn fetch_github_integration_status(
+        &self,
+    ) -> Result<Option<GitHubIntegrationStatus>, ClientApiError> {
+        let request_builder = Request::builder().method(Method::GET).uri(
+            self.http_client
+                .build_zed_cloud_url("/client/integrations/github")
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let request = self.build_request(request_builder, AsyncBody::default())?;
+        let host = self.cloud_host();
+        let mut response = self.http_client.send(request).await.map_err(|source| {
+            ClientApiError::ConnectionFailed {
+                host: host.clone(),
+                source,
+            }
+        })?;
+
+        match response.status() {
+            StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => Ok(None),
+            StatusCode::UNAUTHORIZED => Err(ClientApiError::Unauthorized),
+            status if status.is_success() => Self::read_response_json(&mut response).await,
+            status => {
+                let body = match Self::read_response_body(&mut response).await {
+                    Ok(body) => body,
+                    Err(error) => format!("failed to read response body: {error}"),
+                };
+                Err(ClientApiError::ServerError { host, status, body })
+            }
+        }
+    }
+
+    pub async fn fetch_github_inbox_items(
+        &self,
+        limit: usize,
+    ) -> Result<GitHubInboxItemsResponse, ClientApiError> {
+        let mut url = self
+            .http_client
+            .build_zed_cloud_url("/client/integrations/github/inbox")
+            .map_err(ClientApiError::RequestBuildFailed)?;
+        url.query_pairs_mut()
+            .append_pair("limit", &limit.to_string());
+        let request_builder = Request::builder().method(Method::GET).uri(url.as_ref());
+
+        let request = self.build_request(request_builder, AsyncBody::default())?;
+        self.send_authenticated_json_request(request).await
+    }
+
     pub async fn sync_github_activity(
         &self,
         batch: GitHubActivitySyncBatch,
@@ -170,6 +220,40 @@ impl CloudApiClient {
         );
 
         let request = self.build_request(request_builder, Json(batch))?;
+        self.send_authenticated_request(request).await?;
+        Ok(())
+    }
+
+    pub async fn sync_github_repository_activity(
+        &self,
+        repository_name_with_owner: String,
+    ) -> Result<(), ClientApiError> {
+        let request_builder = Request::builder().method(Method::POST).uri(
+            self.http_client
+                .build_zed_cloud_url("/client/integrations/github/activity/sync")
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let request = self.build_request(
+            request_builder,
+            Json(SyncGitHubRepositoryActivityRequest {
+                repository_name_with_owner,
+            }),
+        )?;
+        self.send_authenticated_request(request).await?;
+        Ok(())
+    }
+
+    pub async fn disconnect_github_integration(&self) -> Result<(), ClientApiError> {
+        let request_builder = Request::builder().method(Method::DELETE).uri(
+            self.http_client
+                .build_zed_cloud_url("/client/integrations/github")
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let request = self.build_request(request_builder, AsyncBody::default())?;
         self.send_authenticated_request(request).await?;
         Ok(())
     }
@@ -382,6 +466,11 @@ impl CloudApiClient {
     }
 }
 
+#[derive(Serialize)]
+struct SyncGitHubRepositoryActivityRequest {
+    repository_name_with_owner: String,
+}
+
 fn build_request(
     req: request::Builder,
     body: impl Into<AsyncBody>,
@@ -510,6 +599,126 @@ mod tests {
     }
 
     #[test]
+    fn test_fetch_github_integration_status() {
+        futures::executor::block_on(async {
+            let http_client = FakeHttpClient::create(|request| async move {
+                assert_eq!(request.method(), Method::GET);
+                assert_eq!(request.uri().path(), "/client/integrations/github");
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|header| header.to_str().ok()),
+                    Some("42 rezed-token")
+                );
+                Ok(Response::builder()
+                    .status(200)
+                    .body(
+                        serde_json::json!({
+                            "login": "octo",
+                            "scopes": ["repo", "read:user"],
+                            "missing_scopes": []
+                        })
+                        .to_string()
+                        .into(),
+                    )
+                    .unwrap())
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            let status = client
+                .fetch_github_integration_status()
+                .await
+                .expect("request should succeed")
+                .expect("account should be connected");
+
+            assert_eq!(status.login, "octo");
+            assert_eq!(status.scopes, vec!["repo", "read:user"]);
+            assert!(status.missing_scopes.is_empty());
+        });
+    }
+
+    #[test]
+    fn test_fetch_github_integration_status_returns_none_when_disconnected() {
+        futures::executor::block_on(async {
+            let http_client = FakeHttpClient::create(|request| async move {
+                assert_eq!(request.uri().path(), "/client/integrations/github");
+                Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Default::default())
+                    .unwrap())
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            let status = client
+                .fetch_github_integration_status()
+                .await
+                .expect("request should succeed");
+
+            assert_eq!(status, None);
+        });
+    }
+
+    #[test]
+    fn test_fetch_github_inbox_items() {
+        futures::executor::block_on(async {
+            let http_client = FakeHttpClient::create(|request| async move {
+                assert_eq!(request.method(), Method::GET);
+                assert_eq!(request.uri().path(), "/client/integrations/github/inbox");
+                assert_eq!(request.uri().query(), Some("limit=25"));
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|header| header.to_str().ok()),
+                    Some("42 rezed-token")
+                );
+                Ok(Response::builder()
+                    .status(200)
+                    .body(
+                        serde_json::json!({
+                            "items": [{
+                                "source_id": "github:owner/repo:issue:1",
+                                "kind": "issue",
+                                "repository_name_with_owner": "owner/repo",
+                                "title": "Issue",
+                                "body": null,
+                                "author_login": "octocat",
+                                "labels": ["bug"],
+                                "url": "https://github.com/owner/repo/issues/1",
+                                "number": 1,
+                                "state": "open",
+                                "draft": null,
+                                "updated_at": "2026-06-25T00:00:00Z",
+                                "workflow_run_id": null,
+                                "workflow_status": null,
+                                "workflow_conclusion": null,
+                                "workflow_event": null,
+                                "workflow_head_branch": null,
+                                "workflow_head_sha": null
+                            }]
+                        })
+                        .to_string()
+                        .into(),
+                    )
+                    .unwrap())
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            let response = client
+                .fetch_github_inbox_items(25)
+                .await
+                .expect("request should succeed");
+
+            assert_eq!(response.items.len(), 1);
+            assert_eq!(response.items[0].source_id, "github:owner/repo:issue:1");
+        });
+    }
+
+    #[test]
     fn test_sync_github_activity_posts_authenticated_batch() {
         futures::executor::block_on(async {
             let request_body = Arc::new(Mutex::new(None));
@@ -574,6 +783,81 @@ mod tests {
             assert_eq!(body["repository_name_with_owner"], "owner/repo");
             assert_eq!(body["items"][0]["kind"], "issue");
             assert_eq!(body["items"][0]["source_id"], "github:owner/repo:issue:1");
+        });
+    }
+
+    #[test]
+    fn test_sync_github_repository_activity_posts_authenticated_request() {
+        futures::executor::block_on(async {
+            let request_body = Arc::new(Mutex::new(None));
+            let http_client = FakeHttpClient::create({
+                let request_body = request_body.clone();
+                move |mut request| {
+                    let request_body = request_body.clone();
+                    async move {
+                        assert_eq!(request.method(), Method::POST);
+                        assert_eq!(
+                            request.uri().path(),
+                            "/client/integrations/github/activity/sync"
+                        );
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("Authorization")
+                                .and_then(|header| header.to_str().ok()),
+                            Some("42 rezed-token")
+                        );
+
+                        let mut body = String::new();
+                        request.body_mut().read_to_string(&mut body).await.unwrap();
+                        *request_body.lock() = Some(body);
+
+                        Ok(Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .body(Default::default())
+                            .unwrap())
+                    }
+                }
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            client
+                .sync_github_repository_activity("owner/repo".to_string())
+                .await
+                .expect("sync request should succeed");
+
+            let body: serde_json::Value =
+                serde_json::from_str(request_body.lock().as_deref().unwrap()).unwrap();
+            assert_eq!(body["repository_name_with_owner"], "owner/repo");
+        });
+    }
+
+    #[test]
+    fn test_disconnect_github_integration_posts_authenticated_request() {
+        futures::executor::block_on(async {
+            let http_client = FakeHttpClient::create(|request| async move {
+                assert_eq!(request.method(), Method::DELETE);
+                assert_eq!(request.uri().path(), "/client/integrations/github");
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|header| header.to_str().ok()),
+                    Some("42 rezed-token")
+                );
+                Ok(Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Default::default())
+                    .unwrap())
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            client
+                .disconnect_github_integration()
+                .await
+                .expect("disconnect request should succeed");
         });
     }
 }

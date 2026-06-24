@@ -57,7 +57,7 @@ use util::{ConnectionResult, ResultExt};
 
 pub use cloud_api_types::{
     GitHubActivityItem, GitHubActivityKind, GitHubActivitySyncBatch, GitHubConnectedAccount,
-    GitHubIntegrationStatus,
+    GitHubInboxItem, GitHubInboxItemsResponse, GitHubIntegrationStatus,
 };
 pub use llm_token::*;
 pub use rpc::*;
@@ -611,6 +611,87 @@ impl Client {
         &self,
         cx: &AsyncApp,
     ) -> Result<Option<GitHubConnectedAccount>> {
+        if self.github_api_credentials(cx).await?.is_none() {
+            return Ok(None);
+        }
+
+        self.cloud_client
+            .fetch_github_connected_account()
+            .await
+            .context("failed to fetch GitHub connected account")
+    }
+
+    pub async fn fetch_github_integration_status(
+        &self,
+        cx: &AsyncApp,
+    ) -> Result<Option<GitHubIntegrationStatus>> {
+        if self.github_api_credentials(cx).await?.is_none() {
+            return Ok(None);
+        }
+
+        self.cloud_client
+            .fetch_github_integration_status()
+            .await
+            .context("failed to fetch GitHub integration status")
+    }
+
+    pub async fn fetch_github_inbox_items(
+        &self,
+        limit: usize,
+        cx: &AsyncApp,
+    ) -> Result<GitHubInboxItemsResponse> {
+        self.github_api_credentials(cx)
+            .await?
+            .context("missing credentials for GitHub inbox")?;
+
+        self.cloud_client
+            .fetch_github_inbox_items(limit)
+            .await
+            .context("failed to fetch GitHub inbox items")
+    }
+
+    pub async fn sync_github_activity(
+        &self,
+        batch: GitHubActivitySyncBatch,
+        cx: &AsyncApp,
+    ) -> Result<()> {
+        if self.github_api_credentials(cx).await?.is_none() {
+            return Ok(());
+        }
+
+        self.cloud_client
+            .sync_github_activity(batch)
+            .await
+            .context("failed to sync GitHub activity")
+    }
+
+    pub async fn sync_github_repository_activity(
+        &self,
+        repository_name_with_owner: String,
+        cx: &AsyncApp,
+    ) -> Result<()> {
+        self.github_api_credentials(cx)
+            .await?
+            .context("missing credentials for GitHub repository activity sync")?;
+
+        self.cloud_client
+            .sync_github_repository_activity(repository_name_with_owner)
+            .await
+            .context("failed to sync GitHub repository activity")
+    }
+
+    pub async fn disconnect_github_integration(&self, cx: &AsyncApp) -> Result<()> {
+        self.github_api_credentials(cx)
+            .await?
+            .context("missing credentials for GitHub integration disconnect")?;
+
+        self.cloud_client
+            .disconnect_github_integration()
+            .await
+            .context("failed to disconnect GitHub integration")
+    }
+
+    async fn github_api_credentials(&self, cx: &AsyncApp) -> Result<Option<Credentials>> {
         let credentials = if let Some(credentials) = self.state.read().credentials.clone() {
             Some(credentials)
         } else {
@@ -626,36 +707,8 @@ impl Client {
             .context("user id exceeds GitHub integration API range")?;
         self.cloud_client
             .set_credentials(user_id, credentials.access_token.clone());
-        self.cloud_client
-            .fetch_github_connected_account()
-            .await
-            .context("failed to fetch GitHub connected account")
-    }
 
-    pub async fn sync_github_activity(
-        &self,
-        batch: GitHubActivitySyncBatch,
-        cx: &AsyncApp,
-    ) -> Result<()> {
-        let credentials = if let Some(credentials) = self.state.read().credentials.clone() {
-            Some(credentials)
-        } else {
-            self.credentials_provider.read_credentials(cx).await
-        };
-        let Some(credentials) = credentials else {
-            return Ok(());
-        };
-
-        let user_id = credentials
-            .user_id
-            .try_into()
-            .context("user id exceeds GitHub integration API range")?;
-        self.cloud_client
-            .set_credentials(user_id, credentials.access_token.clone());
-        self.cloud_client
-            .sync_github_activity(batch)
-            .await
-            .context("failed to sync GitHub activity")
+        Ok(Some(credentials))
     }
 
     pub fn cloud_client(&self) -> Arc<CloudApiClient> {
@@ -2448,6 +2501,146 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_fetch_github_integration_status(cx: &mut TestAppContext) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.uri().path(), "/client/integrations/github");
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("42 rezed-token")
+            );
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(
+                    serde_json::json!({
+                        "login": "octo",
+                        "scopes": ["repo", "read:user"],
+                        "missing_scopes": []
+                    })
+                    .to_string()
+                    .into(),
+                )
+                .unwrap())
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let status = client
+            .fetch_github_integration_status(&cx.to_async())
+            .await
+            .expect("request should succeed")
+            .expect("account should be connected");
+
+        assert_eq!(status.login, "octo");
+        assert_eq!(status.scopes, vec!["repo", "read:user"]);
+        assert!(status.missing_scopes.is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_fetch_github_integration_status_returns_none_without_credentials(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let request_count = Arc::new(Mutex::new(0));
+        let http_client = FakeHttpClient::create({
+            let request_count = request_count.clone();
+            move |_request| {
+                let request_count = request_count.clone();
+                async move {
+                    *request_count.lock() += 1;
+                    Ok(http_client::Response::builder()
+                        .status(500)
+                        .body("unexpected request".into())
+                        .unwrap())
+                }
+            }
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+
+        let status = client
+            .fetch_github_integration_status(&cx.to_async())
+            .await
+            .expect("missing credentials should not fail");
+
+        assert_eq!(status, None);
+        assert_eq!(*request_count.lock(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_fetch_github_inbox_items(cx: &mut TestAppContext) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.uri().path(), "/client/integrations/github/inbox");
+            assert_eq!(request.uri().query(), Some("limit=15"));
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("42 rezed-token")
+            );
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(
+                    serde_json::json!({
+                        "items": [{
+                            "source_id": "github:owner/repo:workflow_run:10",
+                            "kind": "workflow_run",
+                            "repository_name_with_owner": "owner/repo",
+                            "title": "CI",
+                            "body": null,
+                            "author_login": "octocat",
+                            "labels": [],
+                            "url": "https://github.com/owner/repo/actions/runs/10",
+                            "number": null,
+                            "state": null,
+                            "draft": null,
+                            "updated_at": "2026-06-25T00:00:00Z",
+                            "workflow_run_id": 10,
+                            "workflow_status": "completed",
+                            "workflow_conclusion": "success",
+                            "workflow_event": "push",
+                            "workflow_head_branch": "main",
+                            "workflow_head_sha": "abc123"
+                        }]
+                    })
+                    .to_string()
+                    .into(),
+                )
+                .unwrap())
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let response = client
+            .fetch_github_inbox_items(15, &cx.to_async())
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.items[0].workflow_run_id, Some(10));
+    }
+
+    #[gpui::test]
     async fn test_sync_github_activity(cx: &mut TestAppContext) {
         init_test(cx);
         let request_body = Arc::new(Mutex::new(None));
@@ -2522,6 +2715,95 @@ mod tests {
             serde_json::from_str(request_body.lock().as_deref().unwrap()).unwrap();
         assert_eq!(body["repository_name_with_owner"], "owner/repo");
         assert_eq!(body["items"][0]["source_id"], "github:owner/repo:issue:1");
+    }
+
+    #[gpui::test]
+    async fn test_sync_github_repository_activity(cx: &mut TestAppContext) {
+        init_test(cx);
+        let request_body = Arc::new(Mutex::new(None));
+        let http_client = FakeHttpClient::create({
+            let request_body = request_body.clone();
+            move |mut request| {
+                let request_body = request_body.clone();
+                async move {
+                    assert_eq!(request.method(), http::Method::POST);
+                    assert_eq!(
+                        request.uri().path(),
+                        "/client/integrations/github/activity/sync"
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("Authorization")
+                            .and_then(|header| header.to_str().ok()),
+                        Some("42 rezed-token")
+                    );
+
+                    let mut body = String::new();
+                    request.body_mut().read_to_string(&mut body).await.unwrap();
+                    *request_body.lock() = Some(body);
+
+                    Ok(http_client::Response::builder()
+                        .status(204)
+                        .body("".into())
+                        .unwrap())
+                }
+            }
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        client
+            .sync_github_repository_activity("owner/repo".to_string(), &cx.to_async())
+            .await
+            .expect("sync should succeed");
+
+        let body: serde_json::Value =
+            serde_json::from_str(request_body.lock().as_deref().unwrap()).unwrap();
+        assert_eq!(body["repository_name_with_owner"], "owner/repo");
+    }
+
+    #[gpui::test]
+    async fn test_disconnect_github_integration(cx: &mut TestAppContext) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.method(), http::Method::DELETE);
+            assert_eq!(request.uri().path(), "/client/integrations/github");
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("42 rezed-token")
+            );
+            Ok(http_client::Response::builder()
+                .status(204)
+                .body("".into())
+                .unwrap())
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        client
+            .disconnect_github_integration(&cx.to_async())
+            .await
+            .expect("disconnect should succeed");
     }
 
     #[gpui::test]
