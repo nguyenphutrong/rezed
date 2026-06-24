@@ -239,10 +239,10 @@ pub async fn repository_activity(
     http: Arc<dyn HttpClient>,
 ) -> anyhow::Result<GitHubRepositoryActivity> {
     let issues_url = format!(
-        "{GITHUB_API_URL}/repos/{repo_name_with_owner}/issues?state=open&per_page=25&sort=updated&direction=desc"
+        "{GITHUB_API_URL}/repos/{repo_name_with_owner}/issues?state=all&per_page=25&sort=updated&direction=desc"
     );
     let pulls_url = format!(
-        "{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls?state=open&per_page=25&sort=updated&direction=desc"
+        "{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls?state=all&per_page=25&sort=updated&direction=desc"
     );
     let workflow_runs_url = format!(
         "{GITHUB_API_URL}/repos/{repo_name_with_owner}/actions/runs?per_page=25&exclude_pull_requests=false"
@@ -607,13 +607,13 @@ mod tests {
                 requests[0]
                     .uri()
                     .to_string()
-                    .ends_with("/issues?state=open&per_page=25&sort=updated&direction=desc")
+                    .ends_with("/issues?state=all&per_page=25&sort=updated&direction=desc")
             );
             assert!(
                 requests[1]
                     .uri()
                     .to_string()
-                    .ends_with("/pulls?state=open&per_page=25&sort=updated&direction=desc")
+                    .ends_with("/pulls?state=all&per_page=25&sort=updated&direction=desc")
             );
             assert!(
                 requests[2]

@@ -5925,7 +5925,8 @@ impl GitPanel {
             issues.iter().map(|issue| GitHubActivityRow {
                 title: format!("#{} {}", issue.number, issue.title).into(),
                 meta: format!(
-                    "opened by {}{}",
+                    "{} by {}{}",
+                    issue.state,
                     issue.user.login,
                     if issue.labels.is_empty() {
                         String::new()
