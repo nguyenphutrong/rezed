@@ -106,7 +106,7 @@ impl GitHubRepositoryActivity {
                         .filter(|name| !name.is_empty())
                         .unwrap_or_else(|| "Workflow run".to_string()),
                     body: None,
-                    author_login: None,
+                    author_login: run.actor.as_ref().map(|actor| actor.login.clone()),
                     labels: Vec::new(),
                     url: run.html_url.clone(),
                     number: None,
@@ -193,6 +193,8 @@ pub struct GitHubWorkflowRun {
     pub status: Option<String>,
     pub conclusion: Option<String>,
     pub head_branch: Option<String>,
+    #[serde(default)]
+    pub actor: Option<GitHubUser>,
     #[serde(default)]
     pub updated_at: Option<String>,
     pub event: String,
@@ -545,6 +547,7 @@ mod tests {
                             "status": "completed",
                             "conclusion": "success",
                             "head_branch": "main",
+                            "actor": { "login": "ci-user" },
                             "updated_at": "2026-06-24T12:00:00Z",
                             "event": "push"
                         }
@@ -595,6 +598,7 @@ mod tests {
             assert_eq!(items[2].kind, GitHubActivityKind::WorkflowRun);
             assert_eq!(items[2].source_id, "github:owner/repo:workflow_run:42");
             assert_eq!(items[2].title, "CI");
+            assert_eq!(items[2].author_login.as_deref(), Some("ci-user"));
             assert_eq!(items[2].workflow_run_id, Some(42));
             assert_eq!(items[2].updated_at.as_deref(), Some("2026-06-24T12:00:00Z"));
             assert_eq!(items[2].workflow_status.as_deref(), Some("completed"));
