@@ -15,6 +15,15 @@ CREATE TABLE "users" (
 
 CREATE INDEX "index_users_on_email_address" ON "users" ("email_address");
 
+CREATE TABLE "github_integrations" (
+    "user_id" INTEGER NOT NULL PRIMARY KEY REFERENCES users (id) ON DELETE CASCADE,
+    "login" TEXT NOT NULL,
+    "scopes_json" TEXT NOT NULL,
+    "encrypted_access_token" TEXT NOT NULL,
+    "created_at" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_at" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE "contacts" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
     "user_id_a" INTEGER NOT NULL,

@@ -156,6 +156,15 @@ CREATE SEQUENCE public.contacts_id_seq
 
 ALTER SEQUENCE public.contacts_id_seq OWNED BY public.contacts.id;
 
+CREATE TABLE public.github_integrations (
+    user_id integer NOT NULL,
+    login text NOT NULL,
+    scopes_json text NOT NULL,
+    encrypted_access_token text NOT NULL,
+    created_at timestamp without time zone DEFAULT now() NOT NULL,
+    updated_at timestamp without time zone DEFAULT now() NOT NULL
+);
+
 CREATE TABLE public.contributors (
     user_id integer NOT NULL,
     signed_at timestamp without time zone DEFAULT now() NOT NULL
@@ -604,6 +613,9 @@ ALTER TABLE ONLY public.shared_threads
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
 
+ALTER TABLE ONLY public.github_integrations
+    ADD CONSTRAINT github_integrations_pkey PRIMARY KEY (user_id);
+
 ALTER TABLE ONLY public.worktree_diagnostic_summaries
     ADD CONSTRAINT worktree_diagnostic_summaries_pkey PRIMARY KEY (project_id, worktree_id, path);
 
@@ -760,6 +772,9 @@ ALTER TABLE ONLY public.contacts
 
 ALTER TABLE ONLY public.contributors
     ADD CONSTRAINT contributors_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.github_integrations
+    ADD CONSTRAINT github_integrations_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.extension_versions
     ADD CONSTRAINT extension_versions_extension_id_fkey FOREIGN KEY (extension_id) REFERENCES public.extensions(id);

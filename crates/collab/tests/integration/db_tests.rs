@@ -2,6 +2,7 @@ mod buffer_tests;
 mod channel_tests;
 mod db_tests;
 mod extension_tests;
+mod github_integration_tests;
 mod migrations;
 
 use std::sync::Arc;

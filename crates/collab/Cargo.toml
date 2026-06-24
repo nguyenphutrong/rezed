@@ -26,6 +26,7 @@ required-features = ["test-support"]
 path = "tests/integration/collab_tests.rs"
 
 [dependencies]
+aes-gcm.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 async-tungstenite = { workspace = true, features = ["tokio", "tokio-rustls-manual-roots" ] }
@@ -33,6 +34,7 @@ aws-config = { version = "1.1.5" }
 aws-sdk-kinesis = "1.51.0"
 aws-sdk-s3 = { version = "1.15.0" }
 axum = { version = "0.6", features = ["json", "headers", "ws"] }
+base64.workspace = true
 chrono.workspace = true
 clock.workspace = true
 cloud_api_types.workspace = true

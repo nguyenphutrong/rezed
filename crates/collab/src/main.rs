@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
                     app = app
                         .merge(collab::api::events::router())
                         .merge(collab::api::extensions::router())
+                        .merge(collab::api::github::router())
                 }
 
                 app = app.layer(Extension(state.clone()));
