@@ -39,6 +39,89 @@ pub struct GitHubRepositoryActivity {
     pub workflow_runs: Vec<GitHubWorkflowRun>,
 }
 
+impl GitHubRepositoryActivity {
+    pub fn to_activity_items(&self) -> Vec<GitHubActivityItem> {
+        self.issues
+            .iter()
+            .map(|issue| GitHubActivityItem {
+                kind: GitHubActivityKind::Issue,
+                repository_name_with_owner: self.repository_name_with_owner.clone(),
+                title: issue.title.clone(),
+                body: issue.body.clone(),
+                author_login: Some(issue.user.login.clone()),
+                labels: label_names(&issue.labels),
+                url: issue.html_url.clone(),
+                number: Some(issue.number),
+                workflow_status: None,
+                workflow_conclusion: None,
+                workflow_event: None,
+                workflow_head_branch: None,
+            })
+            .chain(
+                self.pull_requests
+                    .iter()
+                    .map(|pull_request| GitHubActivityItem {
+                        kind: GitHubActivityKind::PullRequest,
+                        repository_name_with_owner: self.repository_name_with_owner.clone(),
+                        title: pull_request.title.clone(),
+                        body: pull_request.body.clone(),
+                        author_login: Some(pull_request.user.login.clone()),
+                        labels: label_names(&pull_request.labels),
+                        url: pull_request.html_url.clone(),
+                        number: Some(pull_request.number),
+                        workflow_status: None,
+                        workflow_conclusion: None,
+                        workflow_event: None,
+                        workflow_head_branch: None,
+                    }),
+            )
+            .chain(self.workflow_runs.iter().map(|run| {
+                GitHubActivityItem {
+                    kind: GitHubActivityKind::WorkflowRun,
+                    repository_name_with_owner: self.repository_name_with_owner.clone(),
+                    title: run
+                        .name
+                        .clone()
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or_else(|| "Workflow run".to_string()),
+                    body: None,
+                    author_login: None,
+                    labels: Vec::new(),
+                    url: run.html_url.clone(),
+                    number: None,
+                    workflow_status: run.status.clone(),
+                    workflow_conclusion: run.conclusion.clone(),
+                    workflow_event: Some(run.event.clone()),
+                    workflow_head_branch: run.head_branch.clone(),
+                }
+            }))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitHubActivityItem {
+    pub kind: GitHubActivityKind,
+    pub repository_name_with_owner: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub author_login: Option<String>,
+    pub labels: Vec<String>,
+    pub url: String,
+    pub number: Option<u64>,
+    pub workflow_status: Option<String>,
+    pub workflow_conclusion: Option<String>,
+    pub workflow_event: Option<String>,
+    pub workflow_head_branch: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitHubActivityKind {
+    Issue,
+    PullRequest,
+    WorkflowRun,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct GitHubIssue {
     pub number: u64,
@@ -86,6 +169,10 @@ pub struct GitHubLabel {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct GitHubUser {
     pub login: String,
+}
+
+fn label_names(labels: &[GitHubLabel]) -> Vec<String> {
+    labels.iter().map(|label| label.name.clone()).collect()
 }
 
 #[derive(Deserialize)]
@@ -336,7 +423,7 @@ pub fn build_asset_url(repo_name_with_owner: &str, tag: &str, kind: AssetKind) -
 mod tests {
     use crate::{
         AsyncBody, HttpClient, RedirectPolicy, Response, StatusCode,
-        github::{AssetKind, build_asset_url, repository_activity},
+        github::{AssetKind, GitHubActivityKind, build_asset_url, repository_activity},
     };
     use anyhow::Result;
     use futures::future::BoxFuture;
@@ -438,6 +525,28 @@ mod tests {
             );
             assert_eq!(activity.workflow_runs.len(), 1);
             assert_eq!(activity.workflow_runs[0].id, 42);
+
+            let items = activity.to_activity_items();
+            assert_eq!(items.len(), 3);
+            assert_eq!(items[0].kind, GitHubActivityKind::Issue);
+            assert_eq!(items[0].repository_name_with_owner, "owner/repo");
+            assert_eq!(items[0].title, "Real issue");
+            assert_eq!(items[0].body.as_deref(), Some("issue body"));
+            assert_eq!(items[0].author_login.as_deref(), Some("octo"));
+            assert_eq!(items[0].labels, vec!["bug"]);
+            assert_eq!(items[0].number, Some(1));
+            assert_eq!(items[1].kind, GitHubActivityKind::PullRequest);
+            assert_eq!(items[1].title, "Improve graph");
+            assert_eq!(items[1].body.as_deref(), Some("pull request body"));
+            assert_eq!(items[1].author_login.as_deref(), Some("hubot"));
+            assert_eq!(items[1].labels, vec!["enhancement"]);
+            assert_eq!(items[1].number, Some(7));
+            assert_eq!(items[2].kind, GitHubActivityKind::WorkflowRun);
+            assert_eq!(items[2].title, "CI");
+            assert_eq!(items[2].workflow_status.as_deref(), Some("completed"));
+            assert_eq!(items[2].workflow_conclusion.as_deref(), Some("success"));
+            assert_eq!(items[2].workflow_event.as_deref(), Some("push"));
+            assert_eq!(items[2].workflow_head_branch.as_deref(), Some("main"));
 
             let requests = http.requests.lock();
             assert_eq!(requests.len(), 3);
