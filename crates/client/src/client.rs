@@ -2371,6 +2371,37 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_fetch_github_connected_account_returns_none_when_not_found(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.uri().path(), "/client/integrations/github/token");
+            Ok(http_client::Response::builder()
+                .status(404)
+                .body("".into())
+                .unwrap())
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 7,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let account = client
+            .fetch_github_connected_account(&cx.to_async())
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(account, None);
+    }
+
+    #[gpui::test]
     async fn test_sign_in_reports_connection_failure(cx: &mut TestAppContext) {
         init_test(cx);
         let http_client = FakeHttpClient::create(|_request| async move {
