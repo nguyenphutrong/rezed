@@ -125,6 +125,39 @@ impl CloudApiClient {
         self.send_authenticated_json_request(request).await
     }
 
+    pub async fn fetch_github_connected_account(
+        &self,
+    ) -> Result<Option<GitHubConnectedAccount>, ClientApiError> {
+        let request_builder = Request::builder().method(Method::GET).uri(
+            self.http_client
+                .build_zed_cloud_url("/client/integrations/github/token")
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let request = self.build_request(request_builder, AsyncBody::default())?;
+        let host = self.cloud_host();
+        let mut response = self.http_client.send(request).await.map_err(|source| {
+            ClientApiError::ConnectionFailed {
+                host: host.clone(),
+                source,
+            }
+        })?;
+
+        match response.status() {
+            StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => Ok(None),
+            StatusCode::UNAUTHORIZED => Err(ClientApiError::Unauthorized),
+            status if status.is_success() => Self::read_response_json(&mut response).await,
+            status => {
+                let body = match Self::read_response_body(&mut response).await {
+                    Ok(body) => body,
+                    Err(error) => format!("failed to read response body: {error}"),
+                };
+                Err(ClientApiError::ServerError { host, status, body })
+            }
+        }
+    }
+
     pub fn connect(&self, cx: &App) -> Result<Task<Result<Connection>>> {
         let mut connect_url = self
             .http_client

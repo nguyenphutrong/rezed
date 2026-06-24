@@ -617,29 +617,16 @@ impl Client {
             return Ok(None);
         };
 
-        let url = self
-            .http
-            .build_zed_cloud_url("/client/integrations/github/token")?;
-        let request = Request::get(url.as_str())
-            .header("Authorization", credentials.authorization_header())
-            .body(Default::default())?;
-        let mut response = self.http.send(request).await?;
-        let status = response.status();
-
-        if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-
-        let mut body = String::new();
-        response.body_mut().read_to_string(&mut body).await?;
-        anyhow::ensure!(
-            status.is_success(),
-            "GitHub integration request failed {} - {}",
-            status.as_u16(),
-            body
-        );
-
-        serde_json::from_str(&body).context("failed to parse GitHub integration response")
+        let user_id = credentials
+            .user_id
+            .try_into()
+            .context("user id exceeds GitHub integration API range")?;
+        self.cloud_client
+            .set_credentials(user_id, credentials.access_token.clone());
+        self.cloud_client
+            .fetch_github_connected_account()
+            .await
+            .context("failed to fetch GitHub connected account")
     }
 
     pub fn cloud_client(&self) -> Arc<CloudApiClient> {
