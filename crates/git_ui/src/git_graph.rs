@@ -562,6 +562,7 @@ struct SearchState {
 struct GraphSettings {
     show_stashes: bool,
     show_tags: bool,
+    show_remote_branches: bool,
     include_reflog_commits: bool,
     first_parent_only: bool,
 }
@@ -571,6 +572,7 @@ impl Default for GraphSettings {
         Self {
             show_stashes: true,
             show_tags: true,
+            show_remote_branches: true,
             include_reflog_commits: false,
             first_parent_only: false,
         }
@@ -582,6 +584,7 @@ impl From<GraphSettings> for GraphLogOptions {
         Self {
             show_stashes: settings.show_stashes,
             show_tags: settings.show_tags,
+            show_remote_branches: settings.show_remote_branches,
             include_reflog_commits: settings.include_reflog_commits,
             first_parent_only: settings.first_parent_only,
         }
@@ -694,6 +697,8 @@ actions!(
         ToggleShowStashes,
         /// Toggles whether tags are shown in the git graph.
         ToggleShowTags,
+        /// Toggles whether remote branches are shown in the git graph.
+        ToggleShowRemoteBranches,
         /// Toggles whether reflog commits are included in the git graph.
         ToggleReflogCommits,
         /// Toggles whether only first-parent history is shown in the git graph.
@@ -2097,6 +2102,12 @@ impl GitGraph {
             return false;
         }
 
+        if !self.settings_dropdown_state.settings.show_remote_branches
+            && Self::is_remote_branch_ref_name(ref_name)
+        {
+            return false;
+        }
+
         if !self.settings_dropdown_state.settings.show_stashes
             && (ref_name == "refs/stash"
                 || ref_name == "stash"
@@ -2111,6 +2122,10 @@ impl GitGraph {
 
     fn is_stash_ref_name(ref_name: &str) -> bool {
         ref_name == "refs/stash" || ref_name == "stash" || ref_name.starts_with("stash@{")
+    }
+
+    fn is_remote_branch_ref_name(ref_name: &str) -> bool {
+        ref_name.starts_with("refs/remotes/")
     }
 
     fn display_ref_name(
@@ -4382,6 +4397,16 @@ impl GitGraph {
                         render_setting("show-tags", "Show Tags", settings.show_tags),
                         |window, cx| {
                             window.dispatch_action(ToggleShowTags.boxed_clone(), cx);
+                        },
+                    )
+                    .custom_entry(
+                        render_setting(
+                            "show-remote-branches",
+                            "Show Remote Branches",
+                            settings.show_remote_branches,
+                        ),
+                        |window, cx| {
+                            window.dispatch_action(ToggleShowRemoteBranches.boxed_clone(), cx);
                         },
                     )
                     .custom_entry(
@@ -6746,6 +6771,14 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &ToggleShowTags, _window, cx| {
                 this.update_graph_settings(|settings| settings.show_tags ^= true, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &ToggleShowRemoteBranches, _window, cx| {
+                    this.update_graph_settings(
+                        |settings| settings.show_remote_branches ^= true,
+                        cx,
+                    );
+                }),
+            )
             .on_action(cx.listener(|this, _: &ToggleReflogCommits, _window, cx| {
                 this.update_graph_settings(|settings| settings.include_reflog_commits ^= true, cx);
             }))
@@ -9995,6 +10028,25 @@ mod tests {
             GitGraph::display_ref_name(&"tag: v1.0".into(), stash_oid, &stash_entries),
             SharedString::from("tag: v1.0")
         );
+    }
+
+    #[test]
+    fn test_remote_branch_ref_name_detection() {
+        assert!(GitGraph::is_remote_branch_ref_name(
+            "refs/remotes/origin/main"
+        ));
+        assert!(!GitGraph::is_remote_branch_ref_name("refs/heads/main"));
+        assert!(!GitGraph::is_remote_branch_ref_name("refs/tags/v1.0"));
+    }
+
+    #[test]
+    fn test_graph_settings_include_remote_branch_visibility() {
+        let mut settings = GraphSettings::default();
+        settings.show_remote_branches = false;
+
+        let options = GraphLogOptions::from(settings);
+
+        assert!(!options.show_remote_branches);
     }
 
     #[test]
