@@ -136,6 +136,8 @@ pub struct Config {
     pub kinesis_stream: Option<String>,
     pub kinesis_access_key: Option<String>,
     pub kinesis_secret_key: Option<String>,
+    pub github_oauth_client_id: Option<String>,
+    pub github_oauth_client_secret: Option<String>,
     pub zed_environment: Arc<str>,
     pub zed_cloud_internal_api_key: String,
     pub zed_client_checksum_seed: Option<String>,
@@ -186,6 +188,8 @@ impl Config {
             kinesis_access_key: None,
             kinesis_secret_key: None,
             kinesis_stream: None,
+            github_oauth_client_id: None,
+            github_oauth_client_secret: None,
         }
     }
 }

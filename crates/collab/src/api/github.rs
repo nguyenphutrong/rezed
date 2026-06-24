@@ -22,6 +22,10 @@ pub fn router() -> Router {
             get(get_token).put(upsert_token),
         )
         .route(
+            "/client/integrations/github/oauth",
+            axum::routing::post(exchange_oauth_code),
+        )
+        .route(
             "/client/integrations/github/activity",
             axum::routing::post(sync_activity),
         )
@@ -116,6 +120,43 @@ async fn sync_activity(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn exchange_oauth_code(
+    Extension(app): Extension<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<ExchangeGitHubOAuthCodeRequest>,
+) -> Result<Json<cloud_api_types::GitHubIntegrationStatus>> {
+    let Principal::User(user) = principal;
+    let http_client = app
+        .http_client
+        .as_ref()
+        .context("HTTP client is unavailable")?;
+    let client_id = app
+        .config
+        .github_oauth_client_id
+        .as_deref()
+        .context("GitHub OAuth client id is not configured")?;
+    let client_secret = app
+        .config
+        .github_oauth_client_secret
+        .as_deref()
+        .context("GitHub OAuth client secret is not configured")?;
+
+    let account =
+        exchange_github_oauth_code(http_client, client_id, client_secret, request).await?;
+    let status = account.to_status();
+    app.db
+        .upsert_github_integration(
+            user.id,
+            account.login,
+            account.scopes,
+            account.access_token,
+            &app.config.zed_cloud_internal_api_key,
+        )
+        .await?;
+
+    Ok(Json(status))
+}
+
 async fn sync_repository_activity(
     Extension(app): Extension<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
@@ -158,6 +199,12 @@ struct SetGitHubIntegrationRequest {
 }
 
 #[derive(Deserialize)]
+struct ExchangeGitHubOAuthCodeRequest {
+    code: String,
+    redirect_uri: String,
+}
+
+#[derive(Deserialize)]
 struct SyncGitHubRepositoryActivityRequest {
     repository_name_with_owner: String,
 }
@@ -194,6 +241,113 @@ struct GitHubIssueItem {
 #[derive(Deserialize)]
 struct GitHubWorkflowRunsResponse {
     workflow_runs: Vec<GitHubWorkflowRun>,
+}
+
+#[derive(Deserialize)]
+struct GitHubOAuthTokenResponse {
+    access_token: Option<String>,
+    scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GitHubOAuthUserResponse {
+    login: String,
+}
+
+async fn exchange_github_oauth_code(
+    http_client: &reqwest::Client,
+    client_id: &str,
+    client_secret: &str,
+    request: ExchangeGitHubOAuthCodeRequest,
+) -> Result<GitHubConnectedAccount> {
+    if request.code.trim().is_empty() || request.redirect_uri.trim().is_empty() {
+        return Err(Error::http(
+            StatusCode::BAD_REQUEST,
+            "GitHub OAuth code and redirect_uri are required".into(),
+        ));
+    }
+
+    let response = http_client
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", request.code.trim()),
+            ("redirect_uri", request.redirect_uri.trim()),
+        ])
+        .send()
+        .await
+        .context("failed to exchange GitHub OAuth code")?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read GitHub OAuth response")?;
+    if !status.is_success() {
+        return Err(Error::http(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub OAuth returned status {status}"),
+        ));
+    }
+    let token_response: GitHubOAuthTokenResponse =
+        serde_json::from_slice(&body).context("failed to deserialize GitHub OAuth response")?;
+    let access_token = token_response
+        .access_token
+        .filter(|token| !token.trim().is_empty())
+        .context("GitHub OAuth response did not include an access token")?;
+    let scopes = token_response
+        .scope
+        .map(|scopes| parse_github_oauth_scopes(&scopes))
+        .unwrap_or_default();
+
+    let response = http_client
+        .get("https://api.github.com/user")
+        .bearer_auth(&access_token)
+        .header("User-Agent", "Rezed")
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .context("failed to fetch GitHub OAuth user")?;
+    let status = response.status();
+    let scope_header = response
+        .headers()
+        .get("X-OAuth-Scopes")
+        .and_then(|header| header.to_str().ok())
+        .map(parse_github_oauth_scopes);
+    let body = response
+        .bytes()
+        .await
+        .context("failed to read GitHub OAuth user response")?;
+    if !status.is_success() {
+        return Err(Error::http(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub user API returned status {status}"),
+        ));
+    }
+    let user: GitHubOAuthUserResponse =
+        serde_json::from_slice(&body).context("failed to deserialize GitHub OAuth user")?;
+
+    Ok(GitHubConnectedAccount {
+        login: user.login,
+        scopes: scope_header.unwrap_or(scopes),
+        access_token,
+    })
+}
+
+fn parse_github_oauth_scopes(scopes: &str) -> Vec<String> {
+    scopes
+        .split([',', ' '])
+        .filter_map(|scope| {
+            let scope = scope.trim();
+            if scope.is_empty() {
+                None
+            } else {
+                Some(scope.to_string())
+            }
+        })
+        .collect()
 }
 
 async fn fetch_github_repository_activity(
