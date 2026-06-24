@@ -46,6 +46,14 @@ pub struct AuthenticatedUser {
     pub has_connected_to_collab_once: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubConnectedAccount {
+    pub login: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub access_token: String,
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize)]
 pub struct OrganizationId(pub Arc<str>);
 

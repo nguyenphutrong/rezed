@@ -17,7 +17,7 @@ use clock::SystemClock;
 use cloud_api_client::LlmApiToken;
 use cloud_api_client::websocket_protocol::MessageToClient;
 use cloud_api_client::{ClientApiError, CloudApiClient};
-use cloud_api_types::OrganizationId;
+use cloud_api_types::{GitHubConnectedAccount, OrganizationId};
 use credentials_provider::CredentialsProvider;
 use feature_flags::FeatureFlagAppExt as _;
 use futures::{
@@ -350,14 +350,6 @@ impl Credentials {
     pub fn authorization_header(&self) -> String {
         format!("{} {}", self.user_id, self.access_token)
     }
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct GitHubConnectedAccount {
-    pub login: String,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    pub access_token: String,
 }
 
 pub struct ClientCredentialsProvider {
