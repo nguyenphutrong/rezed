@@ -812,6 +812,58 @@ mod tests {
     }
 
     #[test]
+    fn test_repository_activity_omits_authorization_without_token() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: "[]",
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: "[]",
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"{"workflow_runs":[]}"#,
+                },
+            ]));
+
+            let activity = repository_activity("owner/repo", None, http.clone())
+                .await
+                .expect("activity should parse");
+
+            assert!(activity.issues.is_empty());
+            assert!(activity.pull_requests.is_empty());
+            assert!(activity.workflow_runs.is_empty());
+
+            let requests = http.requests.lock();
+            assert_eq!(requests.len(), 3);
+            assert!(requests.iter().all(|request| {
+                !request.headers().contains_key("Authorization")
+                    && request
+                        .headers()
+                        .get("User-Agent")
+                        .and_then(|header| header.to_str().ok())
+                        == Some("Rezed")
+                    && request
+                        .headers()
+                        .get("Accept")
+                        .and_then(|header| header.to_str().ok())
+                        == Some("application/vnd.github+json")
+                    && request
+                        .headers()
+                        .get("X-GitHub-Api-Version")
+                        .and_then(|header| header.to_str().ok())
+                        == Some("2022-11-28")
+            }));
+        });
+    }
+
+    #[test]
     fn test_activity_items_serialize_for_inbox_sync() {
         let item = super::GitHubActivityItem {
             kind: GitHubActivityKind::WorkflowRun,
