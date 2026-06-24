@@ -621,6 +621,22 @@ impl Client {
             .context("failed to fetch GitHub connected account")
     }
 
+    pub async fn exchange_github_oauth_code(
+        &self,
+        code: String,
+        redirect_uri: String,
+        cx: &AsyncApp,
+    ) -> Result<GitHubIntegrationStatus> {
+        self.github_api_credentials(cx)
+            .await?
+            .context("missing credentials for GitHub OAuth exchange")?;
+
+        self.cloud_client
+            .exchange_github_oauth_code(code, redirect_uri)
+            .await
+            .context("failed to exchange GitHub OAuth code")
+    }
+
     pub async fn fetch_github_integration_status(
         &self,
         cx: &AsyncApp,
@@ -2498,6 +2514,74 @@ mod tests {
 
         assert_eq!(account, None);
         assert_eq!(*request_count.lock(), 0);
+    }
+
+    #[gpui::test]
+    async fn test_exchange_github_oauth_code(cx: &mut TestAppContext) {
+        init_test(cx);
+        let request_body = Arc::new(Mutex::new(None));
+        let http_client = FakeHttpClient::create({
+            let request_body = request_body.clone();
+            move |mut request| {
+                let request_body = request_body.clone();
+                async move {
+                    assert_eq!(request.method(), http::Method::POST);
+                    assert_eq!(request.uri().path(), "/client/integrations/github/oauth");
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("Authorization")
+                            .and_then(|header| header.to_str().ok()),
+                        Some("42 rezed-token")
+                    );
+
+                    let mut body = String::new();
+                    request.body_mut().read_to_string(&mut body).await.unwrap();
+                    *request_body.lock() = Some(body);
+
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(
+                            serde_json::json!({
+                                "login": "octo",
+                                "scopes": ["repo", "read:user"],
+                                "missing_scopes": []
+                            })
+                            .to_string()
+                            .into(),
+                        )
+                        .unwrap())
+                }
+            }
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let status = client
+            .exchange_github_oauth_code(
+                "oauth-code".to_string(),
+                "https://rezed.dev/oauth/github/callback".to_string(),
+                &cx.to_async(),
+            )
+            .await
+            .expect("exchange should succeed");
+
+        let body: serde_json::Value =
+            serde_json::from_str(request_body.lock().as_deref().unwrap()).unwrap();
+        assert_eq!(body["code"], "oauth-code");
+        assert_eq!(
+            body["redirect_uri"],
+            "https://rezed.dev/oauth/github/callback"
+        );
+        assert_eq!(status.login, "octo");
     }
 
     #[gpui::test]

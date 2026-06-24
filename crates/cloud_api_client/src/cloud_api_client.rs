@@ -159,6 +159,25 @@ impl CloudApiClient {
         }
     }
 
+    pub async fn exchange_github_oauth_code(
+        &self,
+        code: String,
+        redirect_uri: String,
+    ) -> Result<GitHubIntegrationStatus, ClientApiError> {
+        let request_builder = Request::builder().method(Method::POST).uri(
+            self.http_client
+                .build_zed_cloud_url("/client/integrations/github/oauth")
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let request = self.build_request(
+            request_builder,
+            Json(ExchangeGitHubOAuthCodeRequest { code, redirect_uri }),
+        )?;
+        self.send_authenticated_json_request(request).await
+    }
+
     pub async fn fetch_github_integration_status(
         &self,
     ) -> Result<Option<GitHubIntegrationStatus>, ClientApiError> {
@@ -467,6 +486,12 @@ impl CloudApiClient {
 }
 
 #[derive(Serialize)]
+struct ExchangeGitHubOAuthCodeRequest {
+    code: String,
+    redirect_uri: String,
+}
+
+#[derive(Serialize)]
 struct SyncGitHubRepositoryActivityRequest {
     repository_name_with_owner: String,
 }
@@ -595,6 +620,67 @@ mod tests {
 
             assert!(matches!(error, ClientApiError::NotSignedIn));
             assert_eq!(*request_count.lock(), 0);
+        });
+    }
+
+    #[test]
+    fn test_exchange_github_oauth_code_posts_authenticated_request() {
+        futures::executor::block_on(async {
+            let request_body = Arc::new(Mutex::new(None));
+            let http_client = FakeHttpClient::create({
+                let request_body = request_body.clone();
+                move |mut request| {
+                    let request_body = request_body.clone();
+                    async move {
+                        assert_eq!(request.method(), Method::POST);
+                        assert_eq!(request.uri().path(), "/client/integrations/github/oauth");
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("Authorization")
+                                .and_then(|header| header.to_str().ok()),
+                            Some("42 rezed-token")
+                        );
+
+                        let mut body = String::new();
+                        request.body_mut().read_to_string(&mut body).await.unwrap();
+                        *request_body.lock() = Some(body);
+
+                        Ok(Response::builder()
+                            .status(200)
+                            .body(
+                                serde_json::json!({
+                                    "login": "octo",
+                                    "scopes": ["repo", "read:user"],
+                                    "missing_scopes": []
+                                })
+                                .to_string()
+                                .into(),
+                            )
+                            .unwrap())
+                    }
+                }
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            let status = client
+                .exchange_github_oauth_code(
+                    "oauth-code".to_string(),
+                    "https://rezed.dev/oauth/github/callback".to_string(),
+                )
+                .await
+                .expect("exchange request should succeed");
+
+            let body: serde_json::Value =
+                serde_json::from_str(request_body.lock().as_deref().unwrap()).unwrap();
+            assert_eq!(body["code"], "oauth-code");
+            assert_eq!(
+                body["redirect_uri"],
+                "https://rezed.dev/oauth/github/callback"
+            );
+            assert_eq!(status.login, "octo");
+            assert_eq!(status.scopes, vec!["repo", "read:user"]);
         });
     }
 
