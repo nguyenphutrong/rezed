@@ -11,8 +11,8 @@ use git::{
     commit::ParsedCommitMessage,
     parse_git_remote_url,
     repository::{
-        CommitDiff, CommitFile, GraphLogOptions, InitialGraphCommitData, LogOrder, LogSource,
-        RepoPath, ResetMode, SearchCommitArgs,
+        Branch, CommitDiff, CommitFile, GraphLogOptions, InitialGraphCommitData, LogOrder,
+        LogSource, RepoPath, ResetMode, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
@@ -760,6 +760,63 @@ impl ResetPromptMode {
             Self::Mixed => "Mixed",
             Self::Hard => "Hard",
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RefNameKind {
+    Branch {
+        display_name: SharedString,
+        lookup_name: SharedString,
+    },
+    Tag(SharedString),
+    Stash {
+        name: SharedString,
+        index: Option<usize>,
+    },
+}
+
+impl RefNameKind {
+    fn classify(ref_name: &SharedString, display_name: &SharedString) -> Self {
+        let name = ref_name.as_ref();
+        if GitGraph::is_stash_ref_name(name) || GitGraph::is_stash_ref_name(display_name) {
+            Self::Stash {
+                name: display_name.clone(),
+                index: Self::stash_index(display_name),
+            }
+        } else if name.starts_with("tag: ") || name.starts_with("refs/tags/") {
+            Self::Tag(
+                name.strip_prefix("tag: ")
+                    .or_else(|| name.strip_prefix("refs/tags/"))
+                    .unwrap_or(name)
+                    .to_string()
+                    .into(),
+            )
+        } else {
+            let display_name = display_name
+                .strip_prefix("HEAD -> ")
+                .unwrap_or(display_name)
+                .to_string()
+                .into();
+            let lookup_name = name
+                .strip_prefix("HEAD -> ")
+                .or_else(|| name.strip_prefix("refs/heads/"))
+                .or_else(|| name.strip_prefix("refs/remotes/"))
+                .unwrap_or(name)
+                .to_string()
+                .into();
+
+            Self::Branch {
+                display_name,
+                lookup_name,
+            }
+        }
+    }
+
+    fn stash_index(name: &str) -> Option<usize> {
+        let start = name.find("stash@{")?;
+        let rest = &name[start + 7..];
+        rest.strip_suffix('}')?.parse().ok()
     }
 }
 
@@ -2002,25 +2059,27 @@ impl GitGraph {
     /// against the clicked ref.
     fn render_ref_chip(
         &self,
-        name: &SharedString,
+        ref_name: &SharedString,
+        display_name: &SharedString,
         accent_color: gpui::Hsla,
         is_head: bool,
         commit_idx: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let chip = self.render_chip(name, accent_color, is_head);
-        let Some(ref_name) = Self::ref_name_from_decoration(name) else {
+        let chip = self.render_chip(display_name, accent_color, is_head);
+        if Self::ref_name_from_decoration(ref_name).is_none() {
             return chip.into_any_element();
-        };
+        }
+        let ref_kind = RefNameKind::classify(ref_name, display_name);
         div()
             .child(chip)
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    this.deploy_entry_context_menu(
+                    this.deploy_ref_context_menu(
                         event.position,
                         commit_idx,
-                        Some(ref_name.clone()),
+                        ref_kind.clone(),
                         window,
                         cx,
                     );
@@ -2243,19 +2302,24 @@ impl GitGraph {
                                 .gap_2()
                                 .overflow_hidden()
                                 .children((!display_ref_names.is_empty()).then(|| {
-                                    h_flex().gap_1().children(display_ref_names.iter().map(
-                                        |name| {
-                                            let is_head =
-                                                Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                            self.render_ref_chip(
-                                                name,
-                                                accent_color,
-                                                is_head,
-                                                idx,
-                                                cx,
-                                            )
-                                        },
-                                    ))
+                                    h_flex().gap_1().children(
+                                        visible_ref_names.iter().zip(display_ref_names.iter()).map(
+                                            |(ref_name, display_name)| {
+                                                let is_head = Self::is_head_ref(
+                                                    display_name.as_ref(),
+                                                    &head_branch_name,
+                                                );
+                                                self.render_ref_chip(
+                                                    ref_name,
+                                                    display_name,
+                                                    accent_color,
+                                                    is_head,
+                                                    idx,
+                                                    cx,
+                                                )
+                                            },
+                                        ),
+                                    )
                                 }))
                                 .child(subject_label),
                         )
@@ -2967,7 +3031,46 @@ impl GitGraph {
         let commit_sha = commit.data.sha.to_string().into();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                CreateBranchAtCommitModal::new(graph, repository, commit_sha, window, cx)
+                CreateBranchAtCommitModal::new(
+                    graph, repository, commit_sha, None, None, window, cx,
+                )
+            });
+        });
+    }
+
+    fn show_create_branch_from_ref_modal(
+        &mut self,
+        title: SharedString,
+        initial_name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.context_menu_entry_index() else {
+            return;
+        };
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let graph = cx.weak_entity();
+        let commit_sha = commit.data.sha.to_string().into();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                CreateBranchAtCommitModal::new(
+                    graph,
+                    repository,
+                    commit_sha,
+                    initial_name,
+                    Some(title),
+                    window,
+                    cx,
+                )
             });
         });
     }
@@ -2977,7 +3080,16 @@ impl GitGraph {
             return;
         };
 
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            format!("Delete tag {tag_name}?"),
+            None,
+            "Delete",
+            window,
+            cx,
+        );
         let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
             repository
                 .update(cx, |repository, _| repository.delete_tag(tag_name))
                 .await
@@ -2986,6 +3098,163 @@ impl GitGraph {
         });
 
         self.run_git_operation(operation, "Failed to delete tag", window, cx);
+    }
+
+    fn resolve_branch_from_snapshot(&self, branch_name: &str, cx: &App) -> Option<Branch> {
+        self.get_repository(cx).and_then(|repository| {
+            repository
+                .read(cx)
+                .snapshot()
+                .branch_list
+                .iter()
+                .find(|branch| branch.name() == branch_name)
+                .cloned()
+        })
+    }
+
+    fn checkout_branch(
+        &mut self,
+        branch_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let operation = cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| repository.change_branch(branch_name))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+        self.run_git_operation(operation, "Failed to checkout branch", window, cx);
+    }
+
+    fn rename_branch(&mut self, branch_name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let graph = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                RenameBranchModal::new(graph, repository, branch_name, window, cx)
+            });
+        });
+    }
+
+    fn delete_branch(
+        &mut self,
+        branch_name: String,
+        is_remote: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let prompt_message = if is_remote {
+            format!("Delete remote-tracking branch {branch_name}?")
+        } else {
+            format!("Delete branch {branch_name}?")
+        };
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            prompt_message,
+            Some("This cannot be undone."),
+            "Delete",
+            window,
+            cx,
+        );
+
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, _| {
+                    repository.delete_branch(is_remote, branch_name, false)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+        self.run_git_operation(operation, "Failed to delete branch", window, cx);
+    }
+
+    fn apply_stash(
+        &mut self,
+        stash_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let operation =
+            repository.update(cx, |repository, cx| repository.stash_apply(stash_index, cx));
+        self.run_git_operation(operation, "Failed to apply stash", window, cx);
+    }
+
+    fn pop_stash(
+        &mut self,
+        stash_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            "Pop stash? This will apply and remove the stash entry.".into(),
+            None,
+            "Pop",
+            window,
+            cx,
+        );
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, cx| repository.stash_pop(stash_index, cx))
+                .await?;
+            anyhow::Ok(())
+        });
+        self.run_git_operation(operation, "Failed to pop stash", window, cx);
+    }
+
+    fn drop_stash(
+        &mut self,
+        stash_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            "Drop stash? This will permanently remove the stash entry.".into(),
+            None,
+            "Drop",
+            window,
+            cx,
+        );
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, cx| repository.stash_drop(stash_index, cx))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+        self.run_git_operation(operation, "Failed to drop stash", window, cx);
     }
 
     fn checkout_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3212,6 +3481,281 @@ impl GitGraph {
             cx,
             |error, _, _| Some(error.to_string()),
         );
+    }
+
+    fn deploy_ref_context_menu(
+        &mut self,
+        position: Point<Pixels>,
+        index: usize,
+        ref_kind: RefNameKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let sha = commit.data.sha;
+        let git_tasks = self
+            .git_task_context(
+                sha,
+                match &ref_kind {
+                    RefNameKind::Branch { lookup_name, .. } => Some(lookup_name.as_ref()),
+                    RefNameKind::Tag(tag_name) => Some(tag_name.as_ref()),
+                    RefNameKind::Stash { name, .. } => Some(name.as_ref()),
+                },
+                cx,
+            )
+            .map(|task_context| self.git_context_menu_tasks(&task_context, cx))
+            .unwrap_or_default();
+        let branch = match &ref_kind {
+            RefNameKind::Branch { lookup_name, .. } => {
+                self.resolve_branch_from_snapshot(lookup_name.as_ref(), cx)
+            }
+            _ => None,
+        };
+
+        let focus_handle = self.focus_handle.clone();
+        let git_graph = cx.entity();
+        let context_menu = ContextMenu::build(window, cx, move |context_menu, window, _| {
+            let menu = match ref_kind.clone() {
+                RefNameKind::Branch {
+                    display_name,
+                    lookup_name,
+                } => {
+                    let branch = branch.clone();
+                    let is_remote = branch.as_ref().is_some_and(Branch::is_remote);
+                    let is_cached_branch = branch.is_some();
+                    let checkout_name = lookup_name.clone();
+                    let copy_name = display_name.clone();
+                    let rename_name = lookup_name.clone();
+                    let delete_name = lookup_name.clone();
+                    let menu = context_menu
+                        .context(focus_handle.clone())
+                        .header(format!("Branch {display_name}"))
+                        .entry("Checkout Branch", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.checkout_branch(checkout_name.to_string(), window, cx);
+                                });
+                            }
+                        });
+
+                    let menu = if is_remote || !is_cached_branch {
+                        menu
+                    } else {
+                        menu.entry("Rename Branch...", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.rename_branch(rename_name.to_string(), window, cx);
+                                });
+                            }
+                        })
+                    };
+
+                    let menu = if is_cached_branch {
+                        menu.entry(
+                            if is_remote {
+                                "Delete Remote-Tracking Branch..."
+                            } else {
+                                "Delete Branch..."
+                            },
+                            None,
+                            {
+                                let git_graph = git_graph.clone();
+                                move |window, cx| {
+                                    git_graph.update(cx, |this, cx| {
+                                        this.delete_branch(
+                                            delete_name.to_string(),
+                                            is_remote,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }
+                            },
+                        )
+                    } else {
+                        menu
+                    };
+
+                    menu.separator()
+                        .entry("Copy Branch HEAD SHA", Some(CopyCommitSha.boxed_clone()), {
+                            let git_graph = git_graph.clone();
+                            move |_window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.copy_commit_sha(index, cx);
+                                });
+                            }
+                        })
+                        .entry("Copy Branch Name", None, move |_window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_name.to_string()));
+                        })
+                }
+                RefNameKind::Tag(tag_name) => {
+                    let checkout_tag_name = tag_name.clone();
+                    let delete_tag_name = tag_name.clone();
+                    let copy_tag_name = tag_name.clone();
+                    context_menu
+                        .context(focus_handle.clone())
+                        .header(format!("Tag {tag_name}"))
+                        .entry("Checkout Tag...", Some(CheckoutCommit.boxed_clone()), {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.checkout_context_menu_commit(window, cx);
+                                });
+                            }
+                        })
+                        .separator()
+                        .entry("Delete Tag...", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.delete_tag(delete_tag_name.to_string(), window, cx);
+                                });
+                            }
+                        })
+                        .entry("Create Branch from Tag...", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.show_create_branch_from_ref_modal(
+                                        format!("Create Branch from {checkout_tag_name}").into(),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .separator()
+                        .entry(
+                            "Copy Tagged Commit SHA",
+                            Some(CopyCommitSha.boxed_clone()),
+                            {
+                                let git_graph = git_graph.clone();
+                                move |_window, cx| {
+                                    git_graph.update(cx, |this, cx| {
+                                        this.copy_commit_sha(index, cx);
+                                    });
+                                }
+                            },
+                        )
+                        .entry("Copy Tag Name", None, move |_window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                copy_tag_name.to_string(),
+                            ));
+                        })
+                }
+                RefNameKind::Stash {
+                    name,
+                    index: stash_index,
+                } => {
+                    let stash_name_for_copy = name.clone();
+                    let suggested_name = RefNameKind::stash_index(name.as_ref())
+                        .map(|index| format!("stash-{index}"))
+                        .unwrap_or_else(|| "stash-branch".to_string());
+                    context_menu
+                        .context(focus_handle.clone())
+                        .header(format!("Stash {name}"))
+                        .entry("Apply Stash", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.apply_stash(stash_index, window, cx);
+                                });
+                            }
+                        })
+                        .entry("Pop Stash...", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.pop_stash(stash_index, window, cx);
+                                });
+                            }
+                        })
+                        .entry("Drop Stash...", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.drop_stash(stash_index, window, cx);
+                                });
+                            }
+                        })
+                        .separator()
+                        .entry("Create Branch from Stash...", None, {
+                            let git_graph = git_graph.clone();
+                            move |window, cx| {
+                                git_graph.update(cx, |this, cx| {
+                                    this.show_create_branch_from_ref_modal(
+                                        "Create Branch from Stash".into(),
+                                        Some(suggested_name.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        })
+                        .separator()
+                        .entry(
+                            "Copy Stash Commit SHA",
+                            Some(CopyCommitSha.boxed_clone()),
+                            {
+                                let git_graph = git_graph.clone();
+                                move |_window, cx| {
+                                    git_graph.update(cx, |this, cx| {
+                                        this.copy_commit_sha(index, cx);
+                                    });
+                                }
+                            },
+                        )
+                        .entry("Copy Stash Name", None, move |_window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                stash_name_for_copy.to_string(),
+                            ));
+                        })
+                }
+            };
+
+            menu.map(|mut menu| {
+                menu = menu.separator().header("Custom Commands");
+
+                if git_tasks.is_empty() {
+                    return menu.item(
+                        ContextMenuEntry::new("Learn More")
+                            .icon(IconName::ArrowUpRight)
+                            .icon_color(Color::Muted)
+                            .icon_position(IconPosition::End)
+                            .handler(|_window, cx| {
+                                let docs_url =
+                                    release_channel::docs_url(CUSTOM_GIT_COMMANDS_DOCS_SLUG, cx);
+                                cx.open_url(&docs_url);
+                            }),
+                    );
+                }
+
+                for (task_source_kind, resolved_task) in git_tasks {
+                    let label = resolved_task.display_label().to_string();
+                    menu = menu.entry(
+                        label,
+                        None,
+                        window.handler_for(&git_graph, move |this, window, cx| {
+                            this.schedule_git_task(
+                                task_source_kind.clone(),
+                                resolved_task.clone(),
+                                window,
+                                cx,
+                            );
+                        }),
+                    );
+                }
+
+                menu
+            })
+        });
+        self.set_context_menu(context_menu, position, index, window, cx);
     }
 
     fn deploy_entry_context_menu(
@@ -3832,10 +4376,20 @@ impl GitGraph {
                     )
                     .children((!display_ref_names.is_empty()).then(|| {
                         h_flex().gap_1().flex_wrap().justify_center().children(
-                            display_ref_names.iter().map(|name| {
-                                let is_head = Self::is_head_ref(name.as_ref(), &head_branch_name);
-                                self.render_ref_chip(name, accent_color, is_head, selected_idx, cx)
-                            }),
+                            ref_names.iter().zip(display_ref_names.iter()).map(
+                                |(ref_name, display_name)| {
+                                    let is_head =
+                                        Self::is_head_ref(display_name.as_ref(), &head_branch_name);
+                                    self.render_ref_chip(
+                                        ref_name,
+                                        display_name,
+                                        accent_color,
+                                        is_head,
+                                        selected_idx,
+                                        cx,
+                                    )
+                                },
+                            ),
                         )
                     }))
                     .child(
@@ -4641,6 +5195,7 @@ struct CreateBranchAtCommitModal {
     graph: WeakEntity<GitGraph>,
     repository: Entity<Repository>,
     commit_sha: SharedString,
+    title: SharedString,
     editor: Entity<Editor>,
 }
 
@@ -4649,12 +5204,18 @@ impl CreateBranchAtCommitModal {
         graph: WeakEntity<GitGraph>,
         repository: Entity<Repository>,
         commit_sha: SharedString,
+        initial_name: Option<String>,
+        title: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Branch name", window, cx);
+            if let Some(initial_name) = initial_name {
+                editor.set_text(initial_name, window, cx);
+            } else {
+                editor.set_placeholder_text("Branch name", window, cx);
+            }
             editor
         });
 
@@ -4662,6 +5223,7 @@ impl CreateBranchAtCommitModal {
             graph,
             repository,
             commit_sha,
+            title: title.unwrap_or_else(|| "Create Branch at Commit".into()),
             editor,
         }
     }
@@ -4722,8 +5284,99 @@ impl Render for CreateBranchAtCommitModal {
                     .w_full()
                     .gap_1p5()
                     .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(Headline::new(self.title.clone()).size(HeadlineSize::XSmall)),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
+struct RenameBranchModal {
+    graph: WeakEntity<GitGraph>,
+    repository: Entity<Repository>,
+    branch_name: SharedString,
+    editor: Entity<Editor>,
+}
+
+impl RenameBranchModal {
+    fn new(
+        graph: WeakEntity<GitGraph>,
+        repository: Entity<Repository>,
+        branch_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(branch_name.clone(), window, cx);
+            editor
+        });
+
+        Self {
+            graph,
+            repository,
+            branch_name: branch_name.into(),
+            editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let new_name = self.editor.read(cx).text(cx).trim().to_string();
+        if new_name.is_empty() || new_name == self.branch_name.as_ref() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let repository = self.repository.clone();
+        let old_name = self.branch_name.to_string();
+        let operation = cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.rename_branch(old_name, new_name)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.graph
+            .update(cx, |graph, cx| {
+                graph.run_git_operation(operation, "Failed to rename branch", window, cx);
+            })
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for RenameBranchModal {}
+impl ModalView for RenameBranchModal {}
+impl Focusable for RenameBranchModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for RenameBranchModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("RenameBranchModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
                     .child(
-                        Headline::new(format!("Create Branch at {}", self.commit_sha))
+                        Headline::new(format!("Rename Branch ({})", self.branch_name))
                             .size(HeadlineSize::XSmall),
                     ),
             )
@@ -8367,6 +9020,35 @@ mod tests {
         assert_eq!(
             GitGraph::display_ref_name(&"tag: v1.0".into(), stash_oid, &stash_entries),
             SharedString::from("tag: v1.0")
+        );
+    }
+
+    #[test]
+    fn test_ref_name_kind_classifies_displayed_refs() {
+        assert_eq!(
+            RefNameKind::classify(&"HEAD -> main".into(), &"HEAD -> main".into()),
+            RefNameKind::Branch {
+                display_name: "main".into(),
+                lookup_name: "main".into(),
+            }
+        );
+        assert_eq!(
+            RefNameKind::classify(&"refs/remotes/origin/main".into(), &"origin/main".into()),
+            RefNameKind::Branch {
+                display_name: "origin/main".into(),
+                lookup_name: "origin/main".into(),
+            }
+        );
+        assert_eq!(
+            RefNameKind::classify(&"tag: v1.0".into(), &"tag: v1.0".into()),
+            RefNameKind::Tag("v1.0".into())
+        );
+        assert_eq!(
+            RefNameKind::classify(&"refs/stash".into(), &"stash@{2}".into()),
+            RefNameKind::Stash {
+                name: "stash@{2}".into(),
+                index: Some(2),
+            }
         );
     }
 }
