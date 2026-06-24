@@ -2,7 +2,7 @@ use crate::{AsyncBody, HttpClient, HttpRequestExt};
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::AsyncReadExt;
 use http::{Request, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use url::Url;
 
@@ -120,7 +120,7 @@ impl GitHubRepositoryActivity {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubActivityItem {
     pub kind: GitHubActivityKind,
     pub source_id: String,
@@ -140,7 +140,8 @@ pub struct GitHubActivityItem {
     pub workflow_head_branch: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GitHubActivityKind {
     Issue,
     PullRequest,
@@ -608,6 +609,55 @@ mod tests {
                     == Some("Bearer secret")
             }));
         });
+    }
+
+    #[test]
+    fn test_activity_items_serialize_for_inbox_sync() {
+        let item = super::GitHubActivityItem {
+            kind: GitHubActivityKind::WorkflowRun,
+            source_id: "github:owner/repo:workflow_run:42".to_string(),
+            repository_name_with_owner: "owner/repo".to_string(),
+            title: "CI".to_string(),
+            body: None,
+            author_login: None,
+            labels: Vec::new(),
+            url: "https://github.com/owner/repo/actions/runs/42".to_string(),
+            number: None,
+            state: None,
+            draft: None,
+            workflow_run_id: Some(42),
+            workflow_status: Some("completed".to_string()),
+            workflow_conclusion: Some("success".to_string()),
+            workflow_event: Some("push".to_string()),
+            workflow_head_branch: Some("main".to_string()),
+        };
+
+        let json = serde_json::to_value(&item).expect("activity item should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "workflow_run",
+                "source_id": "github:owner/repo:workflow_run:42",
+                "repository_name_with_owner": "owner/repo",
+                "title": "CI",
+                "body": null,
+                "author_login": null,
+                "labels": [],
+                "url": "https://github.com/owner/repo/actions/runs/42",
+                "number": null,
+                "state": null,
+                "draft": null,
+                "workflow_run_id": 42,
+                "workflow_status": "completed",
+                "workflow_conclusion": "success",
+                "workflow_event": "push",
+                "workflow_head_branch": "main"
+            })
+        );
+
+        let round_trip = serde_json::from_value::<super::GitHubActivityItem>(json)
+            .expect("activity item should deserialize");
+        assert_eq!(round_trip, item);
     }
 
     struct TestHttpClient {
