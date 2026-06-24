@@ -60,6 +60,7 @@ use ui::{
 use workspace::{
     ModalView, Workspace,
     item::{Item, ItemEvent, TabTooltipContent},
+    notifications::DetachAndPromptErr,
 };
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
@@ -695,6 +696,10 @@ actions!(
         ToggleReflogCommits,
         /// Toggles whether only first-parent history is shown in the git graph.
         ToggleFirstParentOnly,
+        /// Adds a tag at the selected commit.
+        AddTag,
+        /// Creates a branch at the selected commit.
+        CreateBranchAtCommit,
         /// Focuses the next git graph tab stop.
         FocusNextTabStop,
         /// Focuses the previous git graph tab stop.
@@ -2790,6 +2795,102 @@ impl GitGraph {
             .ok();
     }
 
+    fn reload_graph(&mut self, cx: &mut Context<Self>) {
+        self.pending_select_sha = None;
+        self.invalidate_state(cx);
+        self.fetch_initial_graph_data(cx);
+    }
+
+    fn run_git_operation(
+        &mut self,
+        operation: Task<anyhow::Result<()>>,
+        error_message: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = None;
+
+        cx.spawn(async move |this, cx| {
+            operation.await?;
+            this.update(cx, |this, cx| {
+                this.reload_graph(cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err(error_message, window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
+    }
+
+    fn context_menu_entry_index(&self) -> Option<usize> {
+        self.context_menu
+            .as_ref()
+            .map(|context_menu| context_menu.entry_idx)
+            .or(self.selected_entry_idx)
+    }
+
+    fn show_add_tag_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.context_menu_entry_index() else {
+            return;
+        };
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let graph = cx.weak_entity();
+        let commit_sha = commit.data.sha.to_string().into();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                AddTagModal::new(graph, repository, commit_sha, window, cx)
+            });
+        });
+    }
+
+    fn show_create_branch_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.context_menu_entry_index() else {
+            return;
+        };
+        let Some(commit) = self.graph_data.commits.get(index) else {
+            return;
+        };
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let graph = cx.weak_entity();
+        let commit_sha = commit.data.sha.to_string().into();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                CreateBranchAtCommitModal::new(graph, repository, commit_sha, window, cx)
+            });
+        });
+    }
+
+    fn delete_tag(&mut self, tag_name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+
+        let operation = cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| repository.delete_tag(tag_name))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.run_git_operation(operation, "Failed to delete tag", window, cx);
+    }
+
     fn deploy_entry_context_menu(
         &mut self,
         position: Point<Pixels>,
@@ -2812,6 +2913,13 @@ impl GitGraph {
             Some(ref_name) => format!("Ref {ref_name}"),
             None => format!("Commit {sha_short}"),
         };
+        let is_tag_ref = ref_name.as_ref().is_some_and(|ref_name| {
+            commit
+                .data
+                .tag_names()
+                .into_iter()
+                .any(|tag_name| tag_name == ref_name.as_ref())
+        });
 
         let focus_handle = self.focus_handle.clone();
         let git_graph = cx.entity();
@@ -2882,6 +2990,22 @@ impl GitGraph {
                                 }
                                 menu
                             }),
+                        }
+                    })
+                })
+                .when(ref_name.is_none(), |menu| {
+                    menu.separator()
+                        .action("Add Tag...", AddTag.boxed_clone())
+                        .action("Create Branch...", CreateBranchAtCommit.boxed_clone())
+                })
+                .when(is_tag_ref, |menu| {
+                    let tag_name = ref_name.clone().expect("tag ref should be present");
+                    menu.separator().entry("Delete Tag...", None, {
+                        let git_graph = git_graph.clone();
+                        move |window, cx| {
+                            git_graph.update(cx, |this, cx| {
+                                this.delete_tag(tag_name.to_string(), window, cx);
+                            });
                         }
                     })
                 })
@@ -4176,6 +4300,211 @@ impl GitGraph {
     }
 }
 
+struct CreateBranchAtCommitModal {
+    graph: WeakEntity<GitGraph>,
+    repository: Entity<Repository>,
+    commit_sha: SharedString,
+    editor: Entity<Editor>,
+}
+
+impl CreateBranchAtCommitModal {
+    fn new(
+        graph: WeakEntity<GitGraph>,
+        repository: Entity<Repository>,
+        commit_sha: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Branch name", window, cx);
+            editor
+        });
+
+        Self {
+            graph,
+            repository,
+            commit_sha,
+            editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let branch_name = self.editor.read(cx).text(cx).trim().to_string();
+        if branch_name.is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let repository = self.repository.clone();
+        let commit_sha = self.commit_sha.to_string();
+        let operation = cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.create_branch_at(commit_sha, branch_name)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.graph
+            .update(cx, |graph, cx| {
+                graph.run_git_operation(operation, "Failed to create branch", window, cx);
+            })
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for CreateBranchAtCommitModal {}
+impl ModalView for CreateBranchAtCommitModal {}
+impl Focusable for CreateBranchAtCommitModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for CreateBranchAtCommitModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("CreateBranchAtCommitModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!("Create Branch at {}", self.commit_sha))
+                            .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(div().px_3().pb_3().w_full().child(self.editor.clone()))
+    }
+}
+
+struct AddTagModal {
+    graph: WeakEntity<GitGraph>,
+    repository: Entity<Repository>,
+    commit_sha: SharedString,
+    name_editor: Entity<Editor>,
+    message_editor: Entity<Editor>,
+}
+
+impl AddTagModal {
+    fn new(
+        graph: WeakEntity<GitGraph>,
+        repository: Entity<Repository>,
+        commit_sha: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Tag name", window, cx);
+            editor
+        });
+        let message_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Optional annotation message", window, cx);
+            editor
+        });
+
+        Self {
+            graph,
+            repository,
+            commit_sha,
+            name_editor,
+            message_editor,
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let tag_name = self.name_editor.read(cx).text(cx).trim().to_string();
+        if tag_name.is_empty() {
+            cx.emit(DismissEvent);
+            return;
+        }
+
+        let message = self.message_editor.read(cx).text(cx).trim().to_string();
+        let message = (!message.is_empty()).then_some(message);
+        let repository = self.repository.clone();
+        let commit_sha = self.commit_sha.to_string();
+        let operation = cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.create_tag(commit_sha, tag_name, message)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.graph
+            .update(cx, |graph, cx| {
+                graph.run_git_operation(operation, "Failed to create tag", window, cx);
+            })
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for AddTagModal {}
+impl ModalView for AddTagModal {}
+impl Focusable for AddTagModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name_editor.focus_handle(cx)
+    }
+}
+
+impl Render for AddTagModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("AddTagModal")
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitTag).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!("Add Tag at {}", self.commit_sha))
+                            .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_3()
+                    .pb_3()
+                    .gap_2()
+                    .w_full()
+                    .child(self.name_editor.clone())
+                    .child(self.message_editor.clone()),
+            )
+    }
+}
+
 impl Render for GitGraph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // This happens when we changed branches, we should refresh our search as well
@@ -4515,6 +4844,12 @@ impl Render for GitGraph {
             }))
             .on_action(cx.listener(|this, _: &ToggleFirstParentOnly, _window, cx| {
                 this.update_graph_settings(|settings| settings.first_parent_only ^= true, cx);
+            }))
+            .on_action(cx.listener(|this, _: &AddTag, window, cx| {
+                this.show_add_tag_modal(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CreateBranchAtCommit, window, cx| {
+                this.show_create_branch_modal(window, cx);
             }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))

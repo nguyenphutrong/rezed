@@ -5680,6 +5680,78 @@ impl Repository {
         )
     }
 
+    pub fn create_branch_at(&mut self, sha: String, name: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job(
+            "create_branch_at",
+            None,
+            move |git_repo, mut cx| async move {
+                let result = match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.create_branch_at(sha, name).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("creating a branch at a commit is only supported locally")
+                    }
+                };
+                if result.is_ok() {
+                    this.update(&mut cx, |_this, cx| {
+                        cx.emit(RepositoryEvent::BranchListChanged);
+                    })
+                    .ok();
+                }
+                result
+            },
+        )
+    }
+
+    pub fn create_tag(
+        &mut self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job("create_tag", None, move |git_repo, mut cx| async move {
+            let result = match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.create_tag(sha, name, message).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("creating a tag is only supported locally")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |_this, cx| {
+                    cx.emit(RepositoryEvent::BranchListChanged);
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn delete_tag(&mut self, name: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job("delete_tag", None, move |git_repo, mut cx| async move {
+            let result = match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.delete_tag(name).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("deleting a tag is only supported locally")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |_this, cx| {
+                    cx.emit(RepositoryEvent::BranchListChanged);
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
     pub fn get_graph_data(
         &self,
         log_source: LogSource,
