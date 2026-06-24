@@ -32,7 +32,7 @@ pub struct GithubReleaseAsset {
     pub digest: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubRepositoryActivity {
     pub repository_name_with_owner: String,
     pub issues: Vec<GitHubIssue>,
@@ -157,7 +157,7 @@ pub enum GitHubActivityKind {
     WorkflowRun,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitHubIssue {
     pub number: u64,
     pub title: String,
@@ -172,7 +172,7 @@ pub struct GitHubIssue {
     pub body: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitHubPullRequest {
     pub number: u64,
     pub title: String,
@@ -189,7 +189,7 @@ pub struct GitHubPullRequest {
     pub body: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitHubWorkflowRun {
     pub id: u64,
     pub name: Option<String>,
@@ -206,12 +206,12 @@ pub struct GitHubWorkflowRun {
     pub event: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitHubLabel {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitHubUser {
     pub login: String,
 }
@@ -698,6 +698,64 @@ mod tests {
         let round_trip = serde_json::from_value::<super::GitHubActivityItem>(json)
             .expect("activity item should deserialize");
         assert_eq!(round_trip, item);
+    }
+
+    #[test]
+    fn test_repository_activity_serializes_for_sync_cache() {
+        let activity = super::GitHubRepositoryActivity {
+            repository_name_with_owner: "owner/repo".to_string(),
+            issues: vec![super::GitHubIssue {
+                number: 1,
+                title: "Issue".to_string(),
+                html_url: "https://github.com/owner/repo/issues/1".to_string(),
+                state: "open".to_string(),
+                user: super::GitHubUser {
+                    login: "octo".to_string(),
+                },
+                updated_at: Some("2026-06-24T10:00:00Z".to_string()),
+                labels: vec![super::GitHubLabel {
+                    name: "bug".to_string(),
+                }],
+                body: Some("body".to_string()),
+            }],
+            pull_requests: vec![super::GitHubPullRequest {
+                number: 7,
+                title: "PR".to_string(),
+                html_url: "https://github.com/owner/repo/pull/7".to_string(),
+                state: "open".to_string(),
+                user: super::GitHubUser {
+                    login: "hubot".to_string(),
+                },
+                draft: false,
+                updated_at: Some("2026-06-24T11:00:00Z".to_string()),
+                labels: Vec::new(),
+                body: None,
+            }],
+            workflow_runs: vec![super::GitHubWorkflowRun {
+                id: 42,
+                name: Some("CI".to_string()),
+                html_url: "https://github.com/owner/repo/actions/runs/42".to_string(),
+                status: Some("completed".to_string()),
+                conclusion: Some("success".to_string()),
+                head_branch: Some("main".to_string()),
+                head_sha: Some("1234567890abcdef".to_string()),
+                actor: Some(super::GitHubUser {
+                    login: "ci-user".to_string(),
+                }),
+                updated_at: Some("2026-06-24T12:00:00Z".to_string()),
+                event: "push".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_value(&activity).expect("activity should serialize");
+        assert_eq!(json["repository_name_with_owner"], "owner/repo");
+        assert_eq!(json["issues"][0]["labels"][0]["name"], "bug");
+        assert_eq!(json["pull_requests"][0]["number"], 7);
+        assert_eq!(json["workflow_runs"][0]["head_sha"], "1234567890abcdef");
+
+        let round_trip = serde_json::from_value::<super::GitHubRepositoryActivity>(json)
+            .expect("activity should deserialize");
+        assert_eq!(round_trip, activity);
     }
 
     struct TestHttpClient {
