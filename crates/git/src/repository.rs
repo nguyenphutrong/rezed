@@ -938,6 +938,13 @@ pub trait GitRepository: Send + Sync {
     fn change_branch(&self, name: String) -> BoxFuture<'_, Result<()>>;
     fn create_branch(&self, name: String, base_branch: Option<String>)
     -> BoxFuture<'_, Result<()>>;
+    fn create_branch_at(&self, sha: String, name: String) -> BoxFuture<'_, Result<()>>;
+    fn create_tag(
+        &self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>>;
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>>;
 
     fn delete_branch(
@@ -946,6 +953,7 @@ pub trait GitRepository: Send + Sync {
         name: String,
         force: bool,
     ) -> BoxFuture<'_, Result<()>>;
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>>;
 
     fn worktrees(&self) -> BoxFuture<'_, Result<Vec<Worktree>>>;
 
@@ -2260,6 +2268,41 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn create_branch_at(&self, sha: String, name: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["branch", &name, &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn create_tag(
+        &self,
+        sha: String,
+        name: String,
+        message: Option<String>,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                if let Some(message) = message.filter(|message| !message.trim().is_empty()) {
+                    git_binary
+                        .run(&["tag", "-a", &name, &sha, "-m", &message])
+                        .await?;
+                } else {
+                    git_binary.run(&["tag", &name, &sha]).await?;
+                }
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>> {
         let git_binary = self.git_binary_in_worktree();
 
@@ -2287,6 +2330,18 @@ impl GitRepository for RealGitRepository {
                 let git_binary = git_binary?;
                 let flag = delete_branch_flag(is_remote, force);
                 git_binary.run(&["branch", flag, &name]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn delete_tag(&self, name: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["tag", "-d", &name]).await?;
                 anyhow::Ok(())
             })
             .boxed()
