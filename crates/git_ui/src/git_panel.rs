@@ -5939,15 +5939,43 @@ impl GitPanel {
         activity: &GitHubRepositoryActivity,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.render_github_section(
-            "Activity",
-            IconName::Github,
-            activity
-                .to_activity_items()
-                .into_iter()
-                .map(|item| Self::github_activity_row(&item)),
-            cx,
-        )
+        let activity_items = activity.to_activity_items();
+        v_flex()
+            .gap_3()
+            .child(
+                self.render_github_section(
+                    "Pull Requests",
+                    IconName::PullRequest,
+                    activity_items
+                        .iter()
+                        .filter(|item| item.kind == GitHubActivityKind::PullRequest)
+                        .map(Self::github_activity_row),
+                    cx,
+                ),
+            )
+            .child(
+                self.render_github_section(
+                    "Issues",
+                    IconName::Circle,
+                    activity_items
+                        .iter()
+                        .filter(|item| item.kind == GitHubActivityKind::Issue)
+                        .map(Self::github_activity_row),
+                    cx,
+                ),
+            )
+            .child(
+                self.render_github_section(
+                    "Actions",
+                    IconName::PlayOutlined,
+                    activity_items
+                        .iter()
+                        .filter(|item| item.kind == GitHubActivityKind::WorkflowRun)
+                        .map(Self::github_activity_row),
+                    cx,
+                ),
+            )
+            .into_any_element()
     }
 
     fn github_activity_row(item: &GitHubActivityItem) -> GitHubActivityRow {
