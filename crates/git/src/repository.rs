@@ -772,6 +772,7 @@ pub enum LogSource {
 pub struct GraphLogOptions {
     pub show_stashes: bool,
     pub show_tags: bool,
+    pub show_remote_branches: bool,
     pub include_reflog_commits: bool,
     pub first_parent_only: bool,
 }
@@ -825,6 +826,7 @@ impl Default for GraphLogOptions {
         Self {
             show_stashes: true,
             show_tags: true,
+            show_remote_branches: true,
             include_reflog_commits: false,
             first_parent_only: false,
         }
@@ -847,7 +849,9 @@ impl GraphLogOptions {
             LogSource::All => {
                 args.push("--ignore-missing");
                 args.push("--branches");
-                args.push("--remotes");
+                if self.show_remote_branches {
+                    args.push("--remotes");
+                }
                 if self.show_tags {
                     args.push("--tags");
                 }
@@ -4759,6 +4763,7 @@ mod tests {
         let source = LogSource::All.with_graph_options(GraphLogOptions {
             show_stashes: false,
             show_tags: false,
+            show_remote_branches: false,
             include_reflog_commits: true,
             first_parent_only: true,
         });
@@ -4770,7 +4775,6 @@ mod tests {
                 "--first-parent",
                 "--ignore-missing",
                 "--branches",
-                "--remotes",
                 "HEAD",
             ]
         );
