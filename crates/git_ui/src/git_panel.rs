@@ -41,6 +41,9 @@ use gpui::{
     Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle,
     UniformListScrollHandle, WeakEntity, actions, anchored, deferred, point, size, uniform_list,
 };
+use http_client::github::{
+    GitHubIssue, GitHubPullRequest, GitHubRepositoryActivity, GitHubWorkflowRun,
+};
 use itertools::Itertools;
 use language::{Buffer, File};
 use language_model::{
@@ -132,6 +135,8 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the GitHub tab.
+        ActivateGitHubTab,
     ]
 );
 
@@ -335,6 +340,27 @@ struct SerializedGitPanel {
 enum GitPanelTab {
     Changes,
     History,
+    GitHub,
+}
+
+#[derive(Clone, Debug)]
+enum GitHubActivityState {
+    Idle,
+    Loading,
+    Loaded(GitHubRepositoryActivity),
+    Error(SharedString),
+    UnsupportedRemote,
+}
+
+struct GitHubActivityRow {
+    title: SharedString,
+    meta: SharedString,
+    url: String,
+}
+
+fn non_empty_token(token: String) -> Option<String> {
+    let token = token.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -737,6 +763,9 @@ pub struct GitPanel {
     commit_history_shas: Option<Vec<Oid>>,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
+    github_activity: GitHubActivityState,
+    github_activity_repo: Option<SharedString>,
+    github_activity_task: Option<Task<()>>,
     _repo_subscriptions: Vec<Subscription>,
 
     _settings_subscription: Subscription,
@@ -750,6 +779,7 @@ struct BulkStaging {
 }
 
 const MAX_PANEL_EDITOR_LINES: usize = 6;
+const GITHUB_TOKEN_KEYCHAIN_KEY: &str = "github:api-token";
 
 pub(crate) fn commit_message_editor(
     commit_message_buffer: Entity<Buffer>,
@@ -966,6 +996,9 @@ impl GitPanel {
                 commit_history_shas: None,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
+                github_activity: GitHubActivityState::Idle,
+                github_activity_repo: None,
+                github_activity_task: None,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
                 git_access: GitAccess::Yes,
@@ -5363,11 +5396,20 @@ impl GitPanel {
             .child(Divider::vertical().color(ui::DividerColor::BorderFaded))
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
+            ))
+            .child(Divider::vertical().color(ui::DividerColor::BorderFaded))
+            .child(tab(
+                ElementId::Name("github-tab".into()),
+                active_tab == GitPanelTab::GitHub,
+                false,
+                "GitHub".into(),
+                GitPanelTab::GitHub,
+                ActivateGitHubTab.boxed_clone(),
             ))
     }
 
@@ -5478,6 +5520,15 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    fn activate_github_tab(
+        &mut self,
+        _: &ActivateGitHubTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_tab(GitPanelTab::GitHub, window, cx);
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
@@ -5488,6 +5539,13 @@ impl GitPanel {
                 self.focus_handle.focus(window, cx);
                 self.load_commit_history(cx);
                 self.focused_history_entry = Some(0);
+            }
+            GitPanelTab::GitHub => {
+                self.focus_handle.focus(window, cx);
+                self.commit_history_shas.take();
+                self.focused_history_entry = None;
+                self._repo_subscriptions.clear();
+                self.load_github_activity(cx);
             }
             GitPanelTab::Changes => {
                 self.focus_handle.focus(window, cx);
@@ -5573,6 +5631,269 @@ impl GitPanel {
             owner: parsed.owner.into(),
             repo: parsed.repo.into(),
         })
+    }
+
+    fn load_github_activity(&mut self, cx: &mut Context<Self>) {
+        let Some(remote) = self.git_remote(cx) else {
+            self.github_activity = GitHubActivityState::Error("No remote configured".into());
+            self.github_activity_repo = None;
+            self.github_activity_task = None;
+            return;
+        };
+
+        if remote.host.name() != "GitHub" {
+            self.github_activity = GitHubActivityState::UnsupportedRemote;
+            self.github_activity_repo = None;
+            self.github_activity_task = None;
+            return;
+        }
+
+        let repo_name: SharedString = format!("{}/{}", remote.owner, remote.repo).into();
+        if self.github_activity_repo.as_ref() == Some(&repo_name)
+            && matches!(
+                self.github_activity,
+                GitHubActivityState::Loading | GitHubActivityState::Loaded(_)
+            )
+        {
+            return;
+        }
+
+        self.github_activity = GitHubActivityState::Loading;
+        self.github_activity_repo = Some(repo_name.clone());
+        let http_client = cx.http_client();
+        let repo_name_string = repo_name.to_string();
+
+        self.github_activity_task = Some(cx.spawn(async move |this, cx| {
+            let token = Self::github_token(cx).await;
+            let activity = http_client::github::repository_activity(
+                &repo_name_string,
+                token.as_deref(),
+                http_client,
+            )
+            .await;
+
+            this.update(cx, |this, cx| {
+                match activity {
+                    Ok(activity) => {
+                        this.github_activity = GitHubActivityState::Loaded(activity);
+                    }
+                    Err(err) => {
+                        this.github_activity = GitHubActivityState::Error(err.to_string().into());
+                    }
+                }
+                this.github_activity_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+
+        cx.notify();
+    }
+
+    async fn github_token(cx: &mut AsyncApp) -> Option<String> {
+        let keychain_token = cx
+            .update(|cx| cx.read_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|(_, password)| String::from_utf8(password).ok())
+            .and_then(non_empty_token);
+
+        keychain_token.or_else(|| std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token))
+    }
+
+    fn render_github_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .child(v_flex().min_h_full().p_2().gap_2().map(|this| {
+                match &self.github_activity {
+                    GitHubActivityState::Idle | GitHubActivityState::Loading => this.child(
+                        h_flex()
+                            .flex_1()
+                            .justify_center()
+                            .child(Label::new("Loading GitHub activity…").color(Color::Muted)),
+                    ),
+                    GitHubActivityState::UnsupportedRemote => this.child(
+                        h_flex().flex_1().justify_center().child(
+                            Label::new("GitHub activity is only available for GitHub remotes")
+                                .color(Color::Muted),
+                        ),
+                    ),
+                    GitHubActivityState::Error(error) => this.child(
+                        v_flex()
+                            .flex_1()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .child(Label::new("Unable to load GitHub activity").color(Color::Muted))
+                            .child(
+                                Label::new(error.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+                    GitHubActivityState::Loaded(activity) => {
+                        if activity.issues.is_empty()
+                            && activity.pull_requests.is_empty()
+                            && activity.workflow_runs.is_empty()
+                        {
+                            this.child(
+                                h_flex()
+                                    .flex_1()
+                                    .justify_center()
+                                    .child(Label::new("No GitHub activity").color(Color::Muted)),
+                            )
+                        } else {
+                            this.child(self.render_github_issues(&activity.issues, cx))
+                                .child(
+                                    self.render_github_pull_requests(&activity.pull_requests, cx),
+                                )
+                                .child(
+                                    self.render_github_workflow_runs(&activity.workflow_runs, cx),
+                                )
+                        }
+                    }
+                }
+            }))
+    }
+
+    fn render_github_issues(&self, issues: &[GitHubIssue], cx: &mut Context<Self>) -> AnyElement {
+        self.render_github_section(
+            "Issues",
+            IconName::ListTodo,
+            issues.iter().map(|issue| GitHubActivityRow {
+                title: format!("#{} {}", issue.number, issue.title).into(),
+                meta: format!(
+                    "opened by {}{}",
+                    issue.user.login,
+                    if issue.labels.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {}",
+                            issue
+                                .labels
+                                .iter()
+                                .map(|label| label.name.as_str())
+                                .join(", ")
+                        )
+                    }
+                )
+                .into(),
+                url: issue.html_url.clone(),
+            }),
+            cx,
+        )
+    }
+
+    fn render_github_pull_requests(
+        &self,
+        pull_requests: &[GitHubPullRequest],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_github_section(
+            "Pull Requests",
+            IconName::PullRequest,
+            pull_requests.iter().map(|pull_request| GitHubActivityRow {
+                title: format!("#{} {}", pull_request.number, pull_request.title).into(),
+                meta: format!(
+                    "{} by {}",
+                    if pull_request.draft {
+                        "draft"
+                    } else {
+                        pull_request.state.as_str()
+                    },
+                    pull_request.user.login
+                )
+                .into(),
+                url: pull_request.html_url.clone(),
+            }),
+            cx,
+        )
+    }
+
+    fn render_github_workflow_runs(
+        &self,
+        workflow_runs: &[GitHubWorkflowRun],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_github_section(
+            "Actions",
+            IconName::PlayOutlined,
+            workflow_runs.iter().map(|run| GitHubActivityRow {
+                title: run
+                    .name
+                    .clone()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "Workflow run".to_string())
+                    .into(),
+                meta: format!(
+                    "{} · {}{}",
+                    run.conclusion
+                        .as_deref()
+                        .or(run.status.as_deref())
+                        .unwrap_or("unknown"),
+                    run.event,
+                    run.head_branch
+                        .as_ref()
+                        .map(|branch| format!(" · {branch}"))
+                        .unwrap_or_default()
+                )
+                .into(),
+                url: run.html_url.clone(),
+            }),
+            cx,
+        )
+    }
+
+    fn render_github_section(
+        &self,
+        title: &'static str,
+        icon: IconName,
+        rows: impl Iterator<Item = GitHubActivityRow>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = rows.collect::<Vec<_>>();
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(Label::new(format!("{title} ({})", rows.len())).color(Color::Muted)),
+            )
+            .when(rows.is_empty(), |this| {
+                this.child(
+                    Label::new(format!("No {}", title.to_lowercase()))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .children(rows.into_iter().map(|row| self.render_github_row(row, cx)))
+            .into_any_element()
+    }
+
+    fn render_github_row(&self, row: GitHubActivityRow, cx: &mut Context<Self>) -> AnyElement {
+        let url = row.url.clone();
+        v_flex()
+            .id(ElementId::Name(row.url.into()))
+            .w_full()
+            .cursor_pointer()
+            .gap_0p5()
+            .p_1()
+            .rounded_sm()
+            .hover(|this| this.bg(cx.theme().colors().element_hover))
+            .child(Label::new(row.title).truncate())
+            .child(
+                Label::new(row.meta)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .on_click(move |_, _, cx| cx.open_url(&url))
+            .into_any_element()
     }
 
     fn render_commit_history(
@@ -7011,6 +7332,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_github_tab))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -7047,6 +7369,7 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::GitHub => this.child(self.render_github_tab(cx)),
                     })
                     .into_any_element(),
             )
