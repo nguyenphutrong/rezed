@@ -12,9 +12,9 @@ use git::{
     blame::Blame,
     repository::{
         AskPassDelegate, Branch, CommitData, CommitDataReader, CommitDetails, CommitOptions,
-        CreateWorktreeTarget, FetchOptions, FileHistoryChangedFileSets, GRAPH_CHUNK_SIZE,
-        GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder, LogSource,
-        PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
+        CreateWorktreeTarget, DropCommitSupport, FetchOptions, FileHistoryChangedFileSets,
+        GRAPH_CHUNK_SIZE, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, RefEdit, Remote, RepoPath, ResetMode, SearchCommitArgs, Worktree,
         commit_hash_search_query,
     },
     stash::GitStash,
@@ -948,6 +948,14 @@ impl GitRepository for FakeGitRepository {
 
     fn revert_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
         future::ready(Ok(())).boxed()
+    }
+
+    fn drop_commit_support(&self, _sha: String) -> BoxFuture<'_, Result<DropCommitSupport>> {
+        future::ready(Ok(DropCommitSupport {
+            can_drop: true,
+            reason: None,
+        }))
+        .boxed()
     }
 
     fn drop_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {

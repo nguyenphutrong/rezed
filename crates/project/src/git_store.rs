@@ -35,10 +35,11 @@ use git::{
     parse_git_remote_url,
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitDiff, CommitFile,
-        CommitOptions, CreateWorktreeTarget, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
-        LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
+        CommitOptions, CreateWorktreeTarget, DiffType, DropCommitSupport, FetchOptions,
+        FileHistoryChangedFileSets, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
+        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
+        delete_branch_flag,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -5827,6 +5828,26 @@ impl Repository {
             }
             result
         })
+    }
+
+    pub fn drop_commit_support(
+        &mut self,
+        sha: String,
+    ) -> oneshot::Receiver<Result<DropCommitSupport>> {
+        self.send_job(
+            "drop_commit_support",
+            None,
+            move |git_repo, _cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.drop_commit_support(sha).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("checking drop commit support is only supported locally")
+                    }
+                }
+            },
+        )
     }
 
     pub fn drop_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
