@@ -946,7 +946,7 @@ impl GitRepository for FakeGitRepository {
         future::ready(Ok(())).boxed()
     }
 
-    fn revert_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
+    fn revert_commit(&self, _sha: String, _no_commit: bool) -> BoxFuture<'_, Result<()>> {
         future::ready(Ok(())).boxed()
     }
 

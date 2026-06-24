@@ -960,7 +960,7 @@ pub trait GitRepository: Send + Sync {
         record_origin: bool,
         no_commit: bool,
     ) -> BoxFuture<'_, Result<()>>;
-    fn revert_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn revert_commit(&self, sha: String, no_commit: bool) -> BoxFuture<'_, Result<()>>;
     fn drop_commit_support(&self, sha: String) -> BoxFuture<'_, Result<DropCommitSupport>>;
     fn drop_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn merge_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
@@ -2452,13 +2452,18 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
-    fn revert_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+    fn revert_commit(&self, sha: String, no_commit: bool) -> BoxFuture<'_, Result<()>> {
         let git_binary = self.git_binary_in_worktree();
 
         self.executor
             .spawn(async move {
                 let git_binary = git_binary?;
-                git_binary.run(&["revert", "--no-edit", &sha]).await?;
+                let mut args = vec!["revert", "--no-edit"];
+                if no_commit {
+                    args.push("--no-commit");
+                }
+                args.push(&sha);
+                git_binary.run(&args).await?;
                 anyhow::Ok(())
             })
             .boxed()
@@ -4476,6 +4481,44 @@ mod tests {
         assert_eq!(
             support.reason.as_deref(),
             Some("Cannot drop HEAD while the working tree has uncommitted changes")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_revert_commit_supports_no_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        git_commit_file(repo_dir.path(), "file.txt", "initial\n", "initial");
+        let head_sha = git_commit_file(repo_dir.path(), "file.txt", "changed\n", "changed");
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        repository
+            .revert_commit(head_sha.clone(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git_output(repo_dir.path(), ["rev-parse", "HEAD"])
+                .trim()
+                .to_string(),
+            head_sha
+        );
+        assert_eq!(
+            git_output(repo_dir.path(), ["status", "--porcelain=v1"]).trim(),
+            "M  file.txt"
+        );
+        assert_eq!(
+            fs::read_to_string(repo_dir.path().join("file.txt")).unwrap(),
+            "initial\n"
         );
     }
 
