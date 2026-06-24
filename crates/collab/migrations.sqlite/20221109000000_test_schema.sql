@@ -24,6 +24,30 @@ CREATE TABLE "github_integrations" (
     "updated_at" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE "github_inbox_items" (
+    "user_id" INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    "source_id" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "repository_name_with_owner" TEXT NOT NULL,
+    "title" TEXT NOT NULL,
+    "body" TEXT,
+    "author_login" TEXT,
+    "labels_json" TEXT NOT NULL,
+    "url" TEXT NOT NULL,
+    "number" INTEGER,
+    "state" TEXT,
+    "draft" BOOLEAN,
+    "updated_at" TEXT,
+    "workflow_run_id" INTEGER,
+    "workflow_status" TEXT,
+    "workflow_conclusion" TEXT,
+    "workflow_event" TEXT,
+    "workflow_head_branch" TEXT,
+    "workflow_head_sha" TEXT,
+    "synced_at" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY ("user_id", "source_id")
+);
+
 CREATE TABLE "contacts" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
     "user_id_a" INTEGER NOT NULL,

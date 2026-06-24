@@ -165,6 +165,29 @@ CREATE TABLE public.github_integrations (
     updated_at timestamp without time zone DEFAULT now() NOT NULL
 );
 
+CREATE TABLE public.github_inbox_items (
+    user_id integer NOT NULL,
+    source_id text NOT NULL,
+    kind text NOT NULL,
+    repository_name_with_owner text NOT NULL,
+    title text NOT NULL,
+    body text,
+    author_login text,
+    labels_json text NOT NULL,
+    url text NOT NULL,
+    number bigint,
+    state text,
+    draft boolean,
+    updated_at text,
+    workflow_run_id bigint,
+    workflow_status text,
+    workflow_conclusion text,
+    workflow_event text,
+    workflow_head_branch text,
+    workflow_head_sha text,
+    synced_at timestamp without time zone DEFAULT now() NOT NULL
+);
+
 CREATE TABLE public.contributors (
     user_id integer NOT NULL,
     signed_at timestamp without time zone DEFAULT now() NOT NULL
@@ -616,6 +639,9 @@ ALTER TABLE ONLY public.users
 ALTER TABLE ONLY public.github_integrations
     ADD CONSTRAINT github_integrations_pkey PRIMARY KEY (user_id);
 
+ALTER TABLE ONLY public.github_inbox_items
+    ADD CONSTRAINT github_inbox_items_pkey PRIMARY KEY (user_id, source_id);
+
 ALTER TABLE ONLY public.worktree_diagnostic_summaries
     ADD CONSTRAINT worktree_diagnostic_summaries_pkey PRIMARY KEY (project_id, worktree_id, path);
 
@@ -775,6 +801,9 @@ ALTER TABLE ONLY public.contributors
 
 ALTER TABLE ONLY public.github_integrations
     ADD CONSTRAINT github_integrations_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.github_inbox_items
+    ADD CONSTRAINT github_inbox_items_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.extension_versions
     ADD CONSTRAINT extension_versions_extension_id_fkey FOREIGN KEY (extension_id) REFERENCES public.extensions(id);

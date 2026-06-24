@@ -2,7 +2,7 @@ use crate::{AppState, Error, Result, auth, rpc::Principal};
 use axum::{
     Extension, Json, Router, http::StatusCode, middleware, response::IntoResponse, routing::get,
 };
-use cloud_api_types::GitHubConnectedAccount;
+use cloud_api_types::{GitHubActivitySyncBatch, GitHubConnectedAccount};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -15,6 +15,10 @@ pub fn router() -> Router {
         .route(
             "/client/integrations/github/token",
             get(get_token).put(upsert_token),
+        )
+        .route(
+            "/client/integrations/github/activity",
+            axum::routing::post(sync_activity),
         )
         .layer(middleware::from_fn(auth::validate_header))
 }
@@ -87,6 +91,18 @@ async fn disconnect(
     let Principal::User(user) = principal;
 
     app.db.delete_github_integration(user.id).await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn sync_activity(
+    Extension(app): Extension<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Json(batch): Json<GitHubActivitySyncBatch>,
+) -> Result<StatusCode> {
+    let Principal::User(user) = principal;
+
+    app.db.sync_github_inbox_items(user.id, batch).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

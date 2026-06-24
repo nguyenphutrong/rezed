@@ -5,6 +5,7 @@ pub mod channels;
 pub mod contacts;
 pub mod contributors;
 pub mod extensions;
+pub mod github_inbox_items;
 pub mod github_integrations;
 pub mod notifications;
 pub mod projects;

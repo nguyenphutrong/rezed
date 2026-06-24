@@ -10,6 +10,7 @@ pub mod contributor;
 pub mod extension;
 pub mod extension_version;
 pub mod follower;
+pub mod github_inbox_item;
 pub mod github_integration;
 pub mod language_server;
 pub mod notification;
