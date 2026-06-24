@@ -3278,14 +3278,14 @@ impl GitPanel {
         let branch = branch.clone();
 
         let options = if force_push {
-            Some(PushOptions::Force)
+            Some(PushOptions::force_with_lease())
         } else {
             match branch.upstream {
                 Some(Upstream {
                     tracking: UpstreamTracking::Gone,
                     ..
                 })
-                | None => Some(PushOptions::SetUpstream),
+                | None => Some(PushOptions::set_upstream()),
                 _ => None,
             }
         };

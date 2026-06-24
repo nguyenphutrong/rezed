@@ -1248,9 +1248,39 @@ pub enum DiffType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
-pub enum PushOptions {
-    SetUpstream,
+pub struct PushOptions {
+    pub set_upstream: bool,
+    pub push_mode: PushMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+pub enum PushMode {
+    Normal,
+    ForceWithLease,
     Force,
+}
+
+impl PushOptions {
+    pub fn set_upstream() -> Self {
+        Self {
+            set_upstream: true,
+            push_mode: PushMode::Normal,
+        }
+    }
+
+    pub fn force_with_lease() -> Self {
+        Self {
+            set_upstream: false,
+            push_mode: PushMode::ForceWithLease,
+        }
+    }
+
+    pub fn force() -> Self {
+        Self {
+            set_upstream: false,
+            push_mode: PushMode::Force,
+        }
+    }
 }
 
 impl std::fmt::Debug for dyn GitRepository {
@@ -2914,12 +2944,22 @@ impl GitRepository for RealGitRepository {
                 is_trusted,
             );
             let mut command = git.build_command(&["push"]);
+            if let Some(options) = options {
+                if options.set_upstream {
+                    command.arg("--set-upstream");
+                }
+                match options.push_mode {
+                    PushMode::Normal => {}
+                    PushMode::ForceWithLease => {
+                        command.arg("--force-with-lease");
+                    }
+                    PushMode::Force => {
+                        command.arg("--force");
+                    }
+                }
+            }
             command
                 .envs(env.iter())
-                .args(options.map(|option| match option {
-                    PushOptions::SetUpstream => "--set-upstream",
-                    PushOptions::Force => "--force-with-lease",
-                }))
                 .arg(remote_name)
                 .arg(format!("{}:{}", branch_name, remote_branch_name))
                 .stdin(Stdio::null())
