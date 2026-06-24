@@ -41,6 +41,13 @@ pub struct GitHubRepositoryActivity {
 }
 
 impl GitHubRepositoryActivity {
+    pub fn to_sync_batch(&self) -> GitHubActivitySyncBatch {
+        GitHubActivitySyncBatch {
+            repository_name_with_owner: self.repository_name_with_owner.clone(),
+            items: self.to_activity_items(),
+        }
+    }
+
     pub fn to_activity_items(&self) -> Vec<GitHubActivityItem> {
         let mut items: Vec<_> = self
             .issues
@@ -134,6 +141,12 @@ impl GitHubRepositoryActivity {
         });
         items
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubActivitySyncBatch {
+    pub repository_name_with_owner: String,
+    pub items: Vec<GitHubActivityItem>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -677,6 +690,23 @@ mod tests {
             assert_eq!(activity.workflow_runs[0].id, 42);
             assert_eq!(activity.workflow_runs[1].id, 43);
 
+            let sync_batch = activity.to_sync_batch();
+            assert_eq!(sync_batch.repository_name_with_owner, "owner/repo");
+            assert_eq!(
+                sync_batch
+                    .items
+                    .iter()
+                    .map(|item| item.source_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "github:owner/repo:workflow_run:43",
+                    "github:owner/repo:workflow_run:42",
+                    "github:owner/repo:pull_request:7",
+                    "github:owner/repo:issue:1",
+                    "github:owner/repo:issue:3",
+                ]
+            );
+
             let items = activity.to_activity_items();
             assert_eq!(items.len(), 5);
             assert_eq!(
@@ -867,6 +897,67 @@ mod tests {
         let round_trip = serde_json::from_value::<super::GitHubActivityItem>(json)
             .expect("activity item should deserialize");
         assert_eq!(round_trip, item);
+    }
+
+    #[test]
+    fn test_activity_sync_batch_serializes_for_inbox_sync() {
+        let batch = super::GitHubActivitySyncBatch {
+            repository_name_with_owner: "owner/repo".to_string(),
+            items: vec![super::GitHubActivityItem {
+                kind: GitHubActivityKind::Issue,
+                source_id: "github:owner/repo:issue:1".to_string(),
+                repository_name_with_owner: "owner/repo".to_string(),
+                title: "Issue".to_string(),
+                body: Some("body".to_string()),
+                author_login: Some("octo".to_string()),
+                labels: vec!["bug".to_string()],
+                url: "https://github.com/owner/repo/issues/1".to_string(),
+                number: Some(1),
+                state: Some("open".to_string()),
+                draft: None,
+                updated_at: Some("2026-06-24T10:00:00Z".to_string()),
+                workflow_run_id: None,
+                workflow_status: None,
+                workflow_conclusion: None,
+                workflow_event: None,
+                workflow_head_branch: None,
+                workflow_head_sha: None,
+            }],
+        };
+
+        let json = serde_json::to_value(&batch).expect("sync batch should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "repository_name_with_owner": "owner/repo",
+                "items": [
+                    {
+                        "kind": "issue",
+                        "source_id": "github:owner/repo:issue:1",
+                        "repository_name_with_owner": "owner/repo",
+                        "title": "Issue",
+                        "body": "body",
+                        "author_login": "octo",
+                        "labels": ["bug"],
+                        "url": "https://github.com/owner/repo/issues/1",
+                        "number": 1,
+                        "state": "open",
+                        "draft": null,
+                        "updated_at": "2026-06-24T10:00:00Z",
+                        "workflow_run_id": null,
+                        "workflow_status": null,
+                        "workflow_conclusion": null,
+                        "workflow_event": null,
+                        "workflow_head_branch": null,
+                        "workflow_head_sha": null
+                    }
+                ]
+            })
+        );
+
+        let round_trip = serde_json::from_value::<super::GitHubActivitySyncBatch>(json)
+            .expect("sync batch should deserialize");
+        assert_eq!(round_trip, batch);
     }
 
     #[test]
