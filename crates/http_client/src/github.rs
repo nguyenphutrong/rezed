@@ -42,7 +42,8 @@ pub struct GitHubRepositoryActivity {
 
 impl GitHubRepositoryActivity {
     pub fn to_activity_items(&self) -> Vec<GitHubActivityItem> {
-        self.issues
+        let mut items: Vec<_> = self
+            .issues
             .iter()
             .map(|issue| GitHubActivityItem {
                 kind: GitHubActivityKind::Issue,
@@ -123,7 +124,15 @@ impl GitHubRepositoryActivity {
                     workflow_head_sha: run.head_sha.clone(),
                 }
             }))
-            .collect()
+            .collect();
+
+        items.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.source_id.cmp(&right.source_id))
+        });
+        items
     }
 }
 
@@ -669,45 +678,84 @@ mod tests {
 
             let items = activity.to_activity_items();
             assert_eq!(items.len(), 5);
-            assert_eq!(items[0].kind, GitHubActivityKind::Issue);
-            assert_eq!(items[0].source_id, "github:owner/repo:issue:1");
-            assert_eq!(items[0].repository_name_with_owner, "owner/repo");
-            assert_eq!(items[0].title, "Real issue");
-            assert_eq!(items[0].body.as_deref(), Some("issue body"));
-            assert_eq!(items[0].author_login.as_deref(), Some("octo"));
-            assert_eq!(items[0].labels, vec!["bug"]);
-            assert_eq!(items[0].number, Some(1));
-            assert_eq!(items[0].state.as_deref(), Some("open"));
-            assert_eq!(items[0].updated_at.as_deref(), Some("2026-06-24T10:00:00Z"));
-            assert_eq!(items[1].kind, GitHubActivityKind::Issue);
-            assert_eq!(items[1].source_id, "github:owner/repo:issue:3");
-            assert_eq!(items[1].state.as_deref(), Some("closed"));
-            assert_eq!(items[2].kind, GitHubActivityKind::PullRequest);
-            assert_eq!(items[2].source_id, "github:owner/repo:pull_request:7");
-            assert_eq!(items[2].title, "Improve graph");
-            assert_eq!(items[2].body.as_deref(), Some("pull request body"));
-            assert_eq!(items[2].author_login.as_deref(), Some("hubot"));
-            assert_eq!(items[2].labels, vec!["enhancement"]);
-            assert_eq!(items[2].number, Some(7));
-            assert_eq!(items[2].state.as_deref(), Some("open"));
-            assert_eq!(items[2].draft, Some(true));
-            assert_eq!(items[2].updated_at.as_deref(), Some("2026-06-24T11:00:00Z"));
-            assert_eq!(items[3].kind, GitHubActivityKind::WorkflowRun);
-            assert_eq!(items[3].source_id, "github:owner/repo:workflow_run:42");
-            assert_eq!(items[3].title, "CI");
-            assert_eq!(items[3].author_login.as_deref(), Some("ci-user"));
-            assert_eq!(items[3].workflow_run_id, Some(42));
-            assert_eq!(items[3].updated_at.as_deref(), Some("2026-06-24T12:00:00Z"));
-            assert_eq!(items[3].workflow_status.as_deref(), Some("completed"));
-            assert_eq!(items[3].workflow_conclusion.as_deref(), Some("success"));
-            assert_eq!(items[3].workflow_event.as_deref(), Some("push"));
-            assert_eq!(items[3].workflow_head_branch.as_deref(), Some("main"));
             assert_eq!(
-                items[3].workflow_head_sha.as_deref(),
+                items
+                    .iter()
+                    .map(|item| item.source_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![
+                    "github:owner/repo:workflow_run:43",
+                    "github:owner/repo:workflow_run:42",
+                    "github:owner/repo:pull_request:7",
+                    "github:owner/repo:issue:1",
+                    "github:owner/repo:issue:3",
+                ]
+            );
+
+            let issue = items
+                .iter()
+                .find(|item| item.source_id == "github:owner/repo:issue:1")
+                .expect("issue item should exist");
+            assert_eq!(issue.kind, GitHubActivityKind::Issue);
+            assert_eq!(issue.repository_name_with_owner, "owner/repo");
+            assert_eq!(issue.title, "Real issue");
+            assert_eq!(issue.body.as_deref(), Some("issue body"));
+            assert_eq!(issue.author_login.as_deref(), Some("octo"));
+            assert_eq!(issue.labels, vec!["bug"]);
+            assert_eq!(issue.number, Some(1));
+            assert_eq!(issue.state.as_deref(), Some("open"));
+            assert_eq!(issue.updated_at.as_deref(), Some("2026-06-24T10:00:00Z"));
+
+            let closed_issue = items
+                .iter()
+                .find(|item| item.source_id == "github:owner/repo:issue:3")
+                .expect("closed issue item should exist");
+            assert_eq!(closed_issue.kind, GitHubActivityKind::Issue);
+            assert_eq!(closed_issue.state.as_deref(), Some("closed"));
+
+            let pull_request = items
+                .iter()
+                .find(|item| item.source_id == "github:owner/repo:pull_request:7")
+                .expect("pull request item should exist");
+            assert_eq!(pull_request.kind, GitHubActivityKind::PullRequest);
+            assert_eq!(pull_request.title, "Improve graph");
+            assert_eq!(pull_request.body.as_deref(), Some("pull request body"));
+            assert_eq!(pull_request.author_login.as_deref(), Some("hubot"));
+            assert_eq!(pull_request.labels, vec!["enhancement"]);
+            assert_eq!(pull_request.number, Some(7));
+            assert_eq!(pull_request.state.as_deref(), Some("open"));
+            assert_eq!(pull_request.draft, Some(true));
+            assert_eq!(
+                pull_request.updated_at.as_deref(),
+                Some("2026-06-24T11:00:00Z")
+            );
+
+            let workflow_run = items
+                .iter()
+                .find(|item| item.source_id == "github:owner/repo:workflow_run:42")
+                .expect("workflow run item should exist");
+            assert_eq!(workflow_run.kind, GitHubActivityKind::WorkflowRun);
+            assert_eq!(workflow_run.title, "CI");
+            assert_eq!(workflow_run.author_login.as_deref(), Some("ci-user"));
+            assert_eq!(workflow_run.workflow_run_id, Some(42));
+            assert_eq!(
+                workflow_run.updated_at.as_deref(),
+                Some("2026-06-24T12:00:00Z")
+            );
+            assert_eq!(workflow_run.workflow_status.as_deref(), Some("completed"));
+            assert_eq!(workflow_run.workflow_conclusion.as_deref(), Some("success"));
+            assert_eq!(workflow_run.workflow_event.as_deref(), Some("push"));
+            assert_eq!(workflow_run.workflow_head_branch.as_deref(), Some("main"));
+            assert_eq!(
+                workflow_run.workflow_head_sha.as_deref(),
                 Some("1234567890abcdef")
             );
-            assert_eq!(items[4].source_id, "github:owner/repo:workflow_run:43");
-            assert_eq!(items[4].workflow_conclusion.as_deref(), Some("failure"));
+
+            let deploy_run = items
+                .iter()
+                .find(|item| item.source_id == "github:owner/repo:workflow_run:43")
+                .expect("deploy workflow run item should exist");
+            assert_eq!(deploy_run.workflow_conclusion.as_deref(), Some("failure"));
 
             let requests = http.requests.lock();
             assert_eq!(requests.len(), 5);
