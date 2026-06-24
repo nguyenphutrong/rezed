@@ -5694,6 +5694,35 @@ impl GitPanel {
     }
 
     async fn github_token(cx: &mut AsyncApp) -> Option<String> {
+        let client = cx.update(|cx| client::Client::global(cx));
+        match client.fetch_github_connected_account(cx).await {
+            Ok(Some(account)) => {
+                if let Some(token) = non_empty_token(account.access_token) {
+                    cx.update(|cx| {
+                        cx.write_credentials(
+                            GITHUB_TOKEN_KEYCHAIN_KEY,
+                            &account.login,
+                            token.as_bytes(),
+                        )
+                    })
+                    .await
+                    .log_err();
+                    telemetry::event!("GitHub Token Synced");
+                    return Some(token);
+                }
+            }
+            Ok(None) => {
+                cx.update(|cx| cx.delete_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
+                    .await
+                    .log_err();
+                telemetry::event!("GitHub Integration Disconnected");
+                return None;
+            }
+            Err(error) => {
+                log::debug!("failed to sync GitHub integration from Rezed: {error:?}");
+            }
+        }
+
         let keychain_token = cx
             .update(|cx| cx.read_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
             .await
@@ -5704,18 +5733,6 @@ impl GitPanel {
 
         if keychain_token.is_some() {
             return keychain_token;
-        }
-
-        let client = cx.update(|cx| client::Client::global(cx));
-        if let Ok(Some(account)) = client.fetch_github_connected_account(cx).await
-            && let Some(token) = non_empty_token(account.access_token)
-        {
-            cx.update(|cx| {
-                cx.write_credentials(GITHUB_TOKEN_KEYCHAIN_KEY, &account.login, token.as_bytes())
-            })
-            .await
-            .log_err();
-            return Some(token);
         }
 
         std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token)
