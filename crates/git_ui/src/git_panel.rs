@@ -13,7 +13,7 @@ use crate::{
 use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::{Context as _, anyhow};
 use askpass::AskPassDelegate;
-use client::GitHubConnectedAccount;
+use client::GitHubIntegrationStatus;
 use collections::{BTreeMap, HashMap, HashSet};
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorElement, EditorMode, MultiBuffer, MultiBufferOffset, SizingBehavior};
@@ -356,7 +356,7 @@ enum GitHubActivityState {
 #[derive(Clone, Debug)]
 enum GitHubConnectionState {
     Unknown,
-    Connected(GitHubConnectedAccount),
+    Connected(GitHubIntegrationStatus),
     Disconnected,
 }
 
@@ -5729,6 +5729,7 @@ impl GitPanel {
         match client.fetch_github_connected_account(cx).await {
             Ok(Some(account)) => {
                 let token = non_empty_token(account.access_token.clone());
+                let status = account.to_status();
                 if let Some(token) = token.as_ref() {
                     cx.update(|cx| {
                         cx.write_credentials(
@@ -5747,7 +5748,7 @@ impl GitPanel {
                 }
                 return GitHubTokenSync {
                     token,
-                    connection: GitHubConnectionState::Connected(account),
+                    connection: GitHubConnectionState::Connected(status),
                 };
             }
             Ok(None) => {
@@ -5875,16 +5876,18 @@ impl GitPanel {
     fn render_github_connection_status(&self) -> AnyElement {
         match &self.github_connection {
             GitHubConnectionState::Connected(account) => {
-                let missing_scopes = account.missing_required_scopes();
                 let scopes = if account.scopes.is_empty() {
                     String::new()
                 } else {
                     format!(" · scopes: {}", account.scopes.iter().join(", "))
                 };
-                let missing_scopes = if missing_scopes.is_empty() {
+                let missing_scopes = if account.missing_scopes.is_empty() {
                     String::new()
                 } else {
-                    format!(" · missing scopes: {}", missing_scopes.iter().join(", "))
+                    format!(
+                        " · missing scopes: {}",
+                        account.missing_scopes.iter().join(", ")
+                    )
                 };
                 h_flex()
                     .gap_1()
@@ -8337,6 +8340,21 @@ mod tests {
             workflow_run_row.meta.as_ref(),
             "success · by octo · push · main · 1234567 · updated 2026-06-24T10:00:00Z"
         );
+    }
+
+    #[test]
+    fn test_github_connection_state_excludes_token() {
+        let account = client::GitHubConnectedAccount {
+            login: "octo".to_string(),
+            scopes: vec!["repo".to_string(), "read:user".to_string()],
+            access_token: "github-secret-token".to_string(),
+        };
+
+        let state = GitHubConnectionState::Connected(account.to_status());
+        let formatted = format!("{state:?}");
+
+        assert!(formatted.contains("octo"));
+        assert!(!formatted.contains("github-secret-token"));
     }
 
     async fn await_git_panel_entries(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) {

@@ -55,7 +55,7 @@ use tokio::net::TcpStream;
 use url::Url;
 use util::{ConnectionResult, ResultExt};
 
-pub use cloud_api_types::GitHubConnectedAccount;
+pub use cloud_api_types::{GitHubConnectedAccount, GitHubIntegrationStatus};
 pub use llm_token::*;
 pub use rpc::*;
 pub use telemetry_events::Event;
