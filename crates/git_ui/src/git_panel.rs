@@ -6011,12 +6011,16 @@ impl GitPanel {
                     .unwrap_or_else(|| "Workflow run".to_string())
                     .into(),
                 meta: format!(
-                    "{} · {}{}",
+                    "{} · {}{}{}",
                     run.conclusion
                         .as_deref()
                         .or(run.status.as_deref())
                         .unwrap_or("unknown"),
                     run.event,
+                    run.actor
+                        .as_ref()
+                        .map(|actor| format!(" · {}", actor.login))
+                        .unwrap_or_default(),
                     run.head_branch
                         .as_ref()
                         .map(|branch| format!(" · {branch}"))
