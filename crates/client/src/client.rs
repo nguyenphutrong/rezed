@@ -352,6 +352,14 @@ impl Credentials {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GitHubConnectedAccount {
+    pub login: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub access_token: String,
+}
+
 pub struct ClientCredentialsProvider {
     provider: Arc<dyn CredentialsProvider>,
 }
@@ -601,6 +609,44 @@ impl Client {
 
     pub fn credentials_provider(&self) -> Arc<dyn CredentialsProvider> {
         self.credentials_provider.provider.clone()
+    }
+
+    pub async fn fetch_github_connected_account(
+        &self,
+        cx: &AsyncApp,
+    ) -> Result<Option<GitHubConnectedAccount>> {
+        let credentials = if let Some(credentials) = self.state.read().credentials.clone() {
+            Some(credentials)
+        } else {
+            self.credentials_provider.read_credentials(cx).await
+        };
+        let Some(credentials) = credentials else {
+            return Ok(None);
+        };
+
+        let url = self
+            .http
+            .build_zed_cloud_url("/client/integrations/github/token")?;
+        let request = Request::get(url.as_str())
+            .header("Authorization", credentials.authorization_header())
+            .body(Default::default())?;
+        let mut response = self.http.send(request).await?;
+        let status = response.status();
+
+        if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let mut body = String::new();
+        response.body_mut().read_to_string(&mut body).await?;
+        anyhow::ensure!(
+            status.is_success(),
+            "GitHub integration request failed {} - {}",
+            status.as_u16(),
+            body
+        );
+
+        serde_json::from_str(&body).context("failed to parse GitHub integration response")
     }
 
     pub fn cloud_client(&self) -> Arc<CloudApiClient> {
@@ -2240,6 +2286,95 @@ mod tests {
         let credentials = client.sign_in(false, &cx.to_async()).await.unwrap();
         assert_eq!(*auth_count.lock(), 2);
         assert_eq!(credentials.access_token, "2");
+    }
+
+    #[gpui::test]
+    async fn test_fetch_github_connected_account(cx: &mut TestAppContext) {
+        init_test(cx);
+        let authorization_headers = Arc::new(Mutex::new(Vec::new()));
+        let http_client = FakeHttpClient::create({
+            let authorization_headers = authorization_headers.clone();
+            move |request| {
+                let authorization_headers = authorization_headers.clone();
+                async move {
+                    assert_eq!(request.uri().path(), "/client/integrations/github/token");
+                    authorization_headers.lock().push(
+                        request
+                            .headers()
+                            .get("Authorization")
+                            .and_then(|header| header.to_str().ok())
+                            .map(ToString::to_string),
+                    );
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(
+                            serde_json::json!({
+                                "login": "octo",
+                                "scopes": ["repo", "read:user"],
+                                "access_token": "github-token"
+                            })
+                            .to_string()
+                            .into(),
+                        )
+                        .unwrap())
+                }
+            }
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let account = client
+            .fetch_github_connected_account(&cx.to_async())
+            .await
+            .expect("request should succeed")
+            .expect("account should be connected");
+
+        assert_eq!(account.login, "octo");
+        assert_eq!(account.scopes, vec!["repo", "read:user"]);
+        assert_eq!(account.access_token, "github-token");
+        assert_eq!(
+            authorization_headers.lock().as_slice(),
+            &[Some("42 rezed-token".to_string())]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fetch_github_connected_account_returns_none_when_disconnected(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.uri().path(), "/client/integrations/github/token");
+            Ok(http_client::Response::builder()
+                .status(204)
+                .body("".into())
+                .unwrap())
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 7,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let account = client
+            .fetch_github_connected_account(&cx.to_async())
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(account, None);
     }
 
     #[gpui::test]

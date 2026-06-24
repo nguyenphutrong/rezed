@@ -5699,7 +5699,23 @@ impl GitPanel {
             .and_then(|(_, password)| String::from_utf8(password).ok())
             .and_then(non_empty_token);
 
-        keychain_token.or_else(|| std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token))
+        if keychain_token.is_some() {
+            return keychain_token;
+        }
+
+        let client = cx.update(|cx| client::Client::global(cx));
+        if let Ok(Some(account)) = client.fetch_github_connected_account(cx).await
+            && let Some(token) = non_empty_token(account.access_token)
+        {
+            cx.update(|cx| {
+                cx.write_credentials(GITHUB_TOKEN_KEYCHAIN_KEY, &account.login, token.as_bytes())
+            })
+            .await
+            .log_err();
+            return Some(token);
+        }
+
+        std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token)
     }
 
     fn render_github_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
