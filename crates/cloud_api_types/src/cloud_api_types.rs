@@ -105,6 +105,33 @@ pub struct GitHubActivitySyncBatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubInboxItemsResponse {
+    pub items: Vec<GitHubInboxItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubInboxItem {
+    pub source_id: String,
+    pub kind: GitHubActivityKind,
+    pub repository_name_with_owner: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub author_login: Option<String>,
+    pub labels: Vec<String>,
+    pub url: String,
+    pub number: Option<u64>,
+    pub state: Option<String>,
+    pub draft: Option<bool>,
+    pub updated_at: Option<String>,
+    pub workflow_run_id: Option<u64>,
+    pub workflow_status: Option<String>,
+    pub workflow_conclusion: Option<String>,
+    pub workflow_event: Option<String>,
+    pub workflow_head_branch: Option<String>,
+    pub workflow_head_sha: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubActivityItem {
     pub kind: GitHubActivityKind,
     pub source_id: String,
@@ -322,7 +349,7 @@ pub struct EditPredictionSettledKeptChars {
 mod tests {
     use super::{
         GITHUB_REQUIRED_OAUTH_SCOPES, GitHubActivityItem, GitHubActivityKind,
-        GitHubActivitySyncBatch, GitHubConnectedAccount,
+        GitHubActivitySyncBatch, GitHubConnectedAccount, GitHubInboxItem, GitHubInboxItemsResponse,
     };
 
     #[test]
@@ -491,5 +518,41 @@ mod tests {
         let round_trip = serde_json::from_value::<GitHubActivitySyncBatch>(json)
             .expect("sync batch should deserialize");
         assert_eq!(round_trip, batch);
+    }
+
+    #[test]
+    fn github_inbox_items_response_serializes_synced_items() {
+        let response = GitHubInboxItemsResponse {
+            items: vec![GitHubInboxItem {
+                source_id: "github:owner/repo:workflow_run:42".to_string(),
+                kind: GitHubActivityKind::WorkflowRun,
+                repository_name_with_owner: "owner/repo".to_string(),
+                title: "CI".to_string(),
+                body: None,
+                author_login: Some("octo".to_string()),
+                labels: Vec::new(),
+                url: "https://github.com/owner/repo/actions/runs/42".to_string(),
+                number: None,
+                state: None,
+                draft: None,
+                updated_at: Some("2026-06-25T00:00:00Z".to_string()),
+                workflow_run_id: Some(42),
+                workflow_status: Some("completed".to_string()),
+                workflow_conclusion: Some("success".to_string()),
+                workflow_event: Some("push".to_string()),
+                workflow_head_branch: Some("main".to_string()),
+                workflow_head_sha: Some("0123456789abcdef".to_string()),
+            }],
+        };
+
+        let json = serde_json::to_value(&response).expect("response should serialize");
+        assert_eq!(json["items"][0]["kind"], "workflow_run");
+        assert_eq!(
+            json["items"][0]["source_id"],
+            "github:owner/repo:workflow_run:42"
+        );
+        let round_trip = serde_json::from_value::<GitHubInboxItemsResponse>(json)
+            .expect("response should deserialize");
+        assert_eq!(round_trip, response);
     }
 }

@@ -600,6 +600,8 @@ impl TestServer {
                 kinesis_stream: None,
                 kinesis_access_key: None,
                 kinesis_secret_key: None,
+                github_oauth_client_id: None,
+                github_oauth_client_secret: None,
             },
         })
     }

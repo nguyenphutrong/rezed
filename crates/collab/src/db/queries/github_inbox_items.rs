@@ -1,6 +1,8 @@
 use super::*;
-use anyhow::Context as _;
-use cloud_api_types::{GitHubActivityKind, GitHubActivitySyncBatch};
+use anyhow::{Context as _, anyhow};
+use cloud_api_types::{
+    GitHubActivityKind, GitHubActivitySyncBatch, GitHubInboxItem, GitHubInboxItemsResponse,
+};
 
 impl Database {
     pub async fn sync_github_inbox_items(
@@ -110,6 +112,29 @@ impl Database {
         })
         .await
     }
+
+    pub async fn get_github_inbox_items(
+        &self,
+        user_id: UserId,
+        limit: usize,
+    ) -> Result<GitHubInboxItemsResponse> {
+        self.transaction(|tx| async move {
+            let rows = github_inbox_item::Entity::find()
+                .filter(github_inbox_item::Column::UserId.eq(user_id))
+                .order_by_desc(github_inbox_item::Column::UpdatedAt)
+                .order_by_desc(github_inbox_item::Column::SourceId)
+                .limit(limit as u64)
+                .all(&*tx)
+                .await?;
+            let items = rows
+                .into_iter()
+                .map(github_inbox_item_to_dto)
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(GitHubInboxItemsResponse { items })
+        })
+        .await
+    }
 }
 
 fn github_activity_kind(kind: &GitHubActivityKind) -> &'static str {
@@ -118,4 +143,49 @@ fn github_activity_kind(kind: &GitHubActivityKind) -> &'static str {
         GitHubActivityKind::PullRequest => "pull_request",
         GitHubActivityKind::WorkflowRun => "workflow_run",
     }
+}
+
+fn github_activity_kind_from_db(kind: &str) -> Result<GitHubActivityKind> {
+    match kind {
+        "issue" => Ok(GitHubActivityKind::Issue),
+        "pull_request" => Ok(GitHubActivityKind::PullRequest),
+        "workflow_run" => Ok(GitHubActivityKind::WorkflowRun),
+        other => Err(anyhow!("unknown GitHub inbox item kind: {other}").into()),
+    }
+}
+
+fn github_inbox_item_to_dto(row: github_inbox_item::Model) -> Result<GitHubInboxItem> {
+    let labels = serde_json::from_str(&row.labels_json)
+        .context("failed to parse GitHub inbox item labels")?;
+    let number = row
+        .number
+        .map(u64::try_from)
+        .transpose()
+        .context("GitHub inbox item number is negative")?;
+    let workflow_run_id = row
+        .workflow_run_id
+        .map(u64::try_from)
+        .transpose()
+        .context("GitHub inbox workflow run id is negative")?;
+
+    Ok(GitHubInboxItem {
+        source_id: row.source_id,
+        kind: github_activity_kind_from_db(&row.kind)?,
+        repository_name_with_owner: row.repository_name_with_owner,
+        title: row.title,
+        body: row.body,
+        author_login: row.author_login,
+        labels,
+        url: row.url,
+        number,
+        state: row.state,
+        draft: row.draft,
+        updated_at: row.updated_at,
+        workflow_run_id,
+        workflow_status: row.workflow_status,
+        workflow_conclusion: row.workflow_conclusion,
+        workflow_event: row.workflow_event,
+        workflow_head_branch: row.workflow_head_branch,
+        workflow_head_sha: row.workflow_head_sha,
+    })
 }

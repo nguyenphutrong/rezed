@@ -110,6 +110,24 @@ async fn test_github_inbox_activity_sync(db: &Arc<Database>) {
     assert_eq!(items.len(), 2);
     assert_eq!(items[0].title, "Updated issue");
     assert_eq!(items[0].state.as_deref(), Some("closed"));
+
+    let response = db.get_github_inbox_items(user.user_id, 10).await.unwrap();
+    assert_eq!(response.items.len(), 2);
+    let issue = response
+        .items
+        .iter()
+        .find(|item| item.source_id == "github:owner/repo:issue:1")
+        .unwrap();
+    assert_eq!(issue.kind, GitHubActivityKind::Issue);
+    assert_eq!(issue.labels, &["bug"]);
+
+    let workflow_run = response
+        .items
+        .iter()
+        .find(|item| item.source_id == "github:owner/repo:workflow_run:42")
+        .unwrap();
+    assert_eq!(workflow_run.kind, GitHubActivityKind::WorkflowRun);
+    assert_eq!(workflow_run.workflow_run_id, Some(42));
 }
 
 fn github_activity_item(kind: GitHubActivityKind, source_id: &str) -> GitHubActivityItem {

@@ -1,7 +1,8 @@
 use crate::{AppState, Error, Result, auth, rpc::Principal};
 use anyhow::{Context as _, anyhow};
 use axum::{
-    Extension, Json, Router, http::StatusCode, middleware, response::IntoResponse, routing::get,
+    Extension, Json, Router, extract::Query, http::StatusCode, middleware, response::IntoResponse,
+    routing::get,
 };
 use cloud_api_types::{GitHubActivitySyncBatch, GitHubConnectedAccount};
 use http_client::github::{
@@ -33,6 +34,7 @@ pub fn router() -> Router {
             "/client/integrations/github/activity/sync",
             axum::routing::post(sync_repository_activity),
         )
+        .route("/client/integrations/github/inbox", get(list_inbox_items))
         .layer(middleware::from_fn(auth::validate_header))
 }
 
@@ -191,6 +193,18 @@ async fn sync_repository_activity(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_inbox_items(
+    Extension(app): Extension<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<ListGitHubInboxItemsQuery>,
+) -> Result<Json<cloud_api_types::GitHubInboxItemsResponse>> {
+    let Principal::User(user) = principal;
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let response = app.db.get_github_inbox_items(user.id, limit).await?;
+
+    Ok(Json(response))
+}
+
 #[derive(Deserialize)]
 struct SetGitHubIntegrationRequest {
     login: String,
@@ -207,6 +221,11 @@ struct ExchangeGitHubOAuthCodeRequest {
 #[derive(Deserialize)]
 struct SyncGitHubRepositoryActivityRequest {
     repository_name_with_owner: String,
+}
+
+#[derive(Deserialize)]
+struct ListGitHubInboxItemsQuery {
+    limit: Option<usize>,
 }
 
 impl SetGitHubIntegrationRequest {
