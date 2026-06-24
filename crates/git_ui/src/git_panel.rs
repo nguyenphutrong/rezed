@@ -11,7 +11,7 @@ use crate::{
     git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
 };
 use agent_settings::{AgentSettings, UserAgentsMd};
-use anyhow::Context as _;
+use anyhow::{Context as _, anyhow};
 use askpass::AskPassDelegate;
 use client::GitHubConnectedAccount;
 use collections::{BTreeMap, HashMap, HashSet};
@@ -352,6 +352,7 @@ enum GitHubActivityState {
     Loaded(GitHubRepositoryActivity),
     Error(SharedString),
     UnsupportedRemote,
+    Disconnected,
 }
 
 #[derive(Clone, Debug)]
@@ -5687,20 +5688,27 @@ impl GitPanel {
         self.github_activity_task = Some(cx.spawn(async move |this, cx| {
             let token_sync = Self::github_token(cx).await;
             let token = token_sync.token;
-            let activity = http_client::github::repository_activity(
-                &repo_name_string,
-                token.as_deref(),
-                http_client,
-            )
-            .await;
+            let activity = match (&token_sync.connection, token.as_deref()) {
+                (GitHubConnectionState::Disconnected, _) => None,
+                (GitHubConnectionState::Connected(_), None) => {
+                    Some(Err(anyhow!("GitHub token is unavailable")))
+                }
+                (_, token) => Some(
+                    http_client::github::repository_activity(&repo_name_string, token, http_client)
+                        .await,
+                ),
+            };
 
             this.update(cx, |this, cx| {
                 this.github_connection = token_sync.connection;
                 match activity {
-                    Ok(activity) => {
+                    None => {
+                        this.github_activity = GitHubActivityState::Disconnected;
+                    }
+                    Some(Ok(activity)) => {
                         this.github_activity = GitHubActivityState::Loaded(activity);
                     }
-                    Err(err) => {
+                    Some(Err(err)) => {
                         this.github_activity = GitHubActivityState::Error(err.to_string().into());
                     }
                 }
@@ -5794,6 +5802,12 @@ impl GitPanel {
                         GitHubActivityState::UnsupportedRemote => this.child(
                             h_flex().flex_1().justify_center().child(
                                 Label::new("GitHub activity is only available for GitHub remotes")
+                                    .color(Color::Muted),
+                            ),
+                        ),
+                        GitHubActivityState::Disconnected => this.child(
+                            h_flex().flex_1().justify_center().child(
+                                Label::new("Connect GitHub in Dashboard > Integrations")
                                     .color(Color::Muted),
                             ),
                         ),
