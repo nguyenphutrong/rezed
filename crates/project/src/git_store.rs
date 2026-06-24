@@ -5575,6 +5575,10 @@ impl Repository {
                     ..
                 }) => backend.reset(commit, reset_mode, environment).await,
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    if matches!(reset_mode, ResetMode::Hard) {
+                        anyhow::bail!("hard reset is only supported locally");
+                    }
+
                     client
                         .request(proto::GitReset {
                             project_id: project_id.0,
@@ -5583,6 +5587,7 @@ impl Repository {
                             mode: match reset_mode {
                                 ResetMode::Soft => git_reset::ResetMode::Soft.into(),
                                 ResetMode::Mixed => git_reset::ResetMode::Mixed.into(),
+                                ResetMode::Hard => unreachable!("hard reset is handled above"),
                             },
                         })
                         .await?;
@@ -5812,6 +5817,27 @@ impl Repository {
                 }
                 RepositoryState::Remote(_) => {
                     anyhow::bail!("reverting a commit is only supported locally")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |_this, cx| {
+                    cx.emit(RepositoryEvent::HeadChanged);
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn drop_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job("drop_commit", None, move |git_repo, mut cx| async move {
+            let result = match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.drop_commit(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("dropping a commit is only supported locally")
                 }
             };
             if result.is_ok() {

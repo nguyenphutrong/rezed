@@ -583,6 +583,8 @@ pub enum ResetMode {
     /// Reset the branch pointer and index, leave worktree unchanged (this makes it look as though things that were
     /// committed are now unstaged).
     Mixed,
+    /// Reset the branch pointer, index, and worktree.
+    Hard,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -953,6 +955,7 @@ pub trait GitRepository: Send + Sync {
         no_commit: bool,
     ) -> BoxFuture<'_, Result<()>>;
     fn revert_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn drop_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn merge_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn rebase_onto(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>>;
@@ -1637,6 +1640,7 @@ impl GitRepository for RealGitRepository {
             let mode_flag = match mode {
                 ResetMode::Mixed => "--mixed",
                 ResetMode::Soft => "--soft",
+                ResetMode::Hard => "--hard",
             };
 
             let output = git
@@ -2365,6 +2369,60 @@ impl GitRepository for RealGitRepository {
             .spawn(async move {
                 let git_binary = git_binary?;
                 git_binary.run(&["revert", "--no-edit", &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn drop_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                let commit_line = git_binary
+                    .run(&["rev-list", "--parents", "-n", "1", &sha])
+                    .await?;
+                let mut commit_parts = commit_line.split_whitespace();
+                let _commit_sha = commit_parts
+                    .next()
+                    .context("failed to parse commit metadata while dropping commit")?;
+                let parent_shas = commit_parts.collect::<Vec<_>>();
+
+                if parent_shas.is_empty() {
+                    bail!("Cannot drop the root commit");
+                }
+                if parent_shas.len() > 1 {
+                    bail!("Cannot drop merge commits");
+                }
+
+                let ancestry_output = git_binary
+                    .build_command(&["merge-base", "--is-ancestor", &sha, "HEAD"])
+                    .output()
+                    .await?;
+                if !ancestry_output.status.success() {
+                    bail!("Commit is not on the current branch");
+                }
+
+                let head_sha = git_binary.run(&["rev-parse", "HEAD"]).await?;
+                if sha.trim() == head_sha.trim() {
+                    let status_output = git_binary
+                        .run(&["status", "--porcelain=v1", "--untracked-files=no"])
+                        .await?;
+                    if !status_output.trim().is_empty() {
+                        bail!("Cannot drop HEAD while the working tree has uncommitted changes");
+                    }
+
+                    git_binary.run(&["reset", "--hard", "HEAD^"]).await?;
+                    return anyhow::Ok(());
+                }
+
+                let parent_sha = parent_shas
+                    .first()
+                    .context("selected commit does not have a first parent")?;
+                git_binary
+                    .run(&["rebase", "--onto", parent_sha, &sha, "HEAD"])
+                    .await?;
                 anyhow::Ok(())
             })
             .boxed()

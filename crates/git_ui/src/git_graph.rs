@@ -1,7 +1,7 @@
 use crate::{
     commit_tooltip::{CommitAvatar, CommitDetails, CommitTooltip},
     commit_view::CommitView,
-    git_status_icon,
+    git_status_icon, picker_prompt,
 };
 use collections::{BTreeMap, HashMap, IndexSet};
 use editor::Editor;
@@ -12,7 +12,7 @@ use git::{
     parse_git_remote_url,
     repository::{
         CommitDiff, CommitFile, GraphLogOptions, InitialGraphCommitData, LogOrder, LogSource,
-        RepoPath, SearchCommitArgs,
+        RepoPath, ResetMode, SearchCommitArgs,
     },
     status::{FileStatus, StatusCode, TrackedStatus},
 };
@@ -706,10 +706,14 @@ actions!(
         CherryPickCommit,
         /// Reverts the selected commit.
         RevertCommit,
+        /// Drops the selected commit from the current branch.
+        DropCommit,
         /// Merges the selected commit into the current branch.
         MergeCommit,
         /// Rebases the current branch onto the selected commit.
         RebaseOntoCommit,
+        /// Resets the current branch to the selected commit.
+        ResetCommit,
         /// Focuses the next git graph tab stop.
         FocusNextTabStop,
         /// Focuses the previous git graph tab stop.
@@ -730,6 +734,33 @@ actions!(
 #[action(namespace = git_graph)]
 pub struct OpenAtCommit {
     pub sha: String,
+}
+
+#[derive(Clone, Copy)]
+enum ResetPromptMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+impl ResetPromptMode {
+    const ALL: [Self; 3] = [Self::Soft, Self::Mixed, Self::Hard];
+
+    fn to_reset_mode(self) -> ResetMode {
+        match self {
+            Self::Soft => ResetMode::Soft,
+            Self::Mixed => ResetMode::Mixed,
+            Self::Hard => ResetMode::Hard,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Soft => "Soft",
+            Self::Mixed => "Mixed",
+            Self::Hard => "Hard",
+        }
+    }
 }
 
 fn timestamp_format() -> &'static [BorrowedFormatItem<'static>] {
@@ -2866,6 +2897,35 @@ impl GitGraph {
         })
     }
 
+    fn prompt_reset_mode(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<ResetPromptMode>> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Task::ready(None);
+        };
+
+        let options = ResetPromptMode::ALL
+            .into_iter()
+            .map(|mode| SharedString::from(mode.label()))
+            .collect::<Vec<_>>();
+
+        let picker = picker_prompt::prompt(
+            "Select reset mode...",
+            options,
+            workspace.downgrade(),
+            window,
+            cx,
+        );
+
+        window.spawn(cx, async move |_| {
+            picker
+                .await
+                .and_then(|index| ResetPromptMode::ALL.get(index).copied())
+        })
+    }
+
     fn show_add_tag_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.context_menu_entry_index() else {
             return;
@@ -3003,6 +3063,34 @@ impl GitGraph {
         self.run_git_operation(operation, "Failed to revert commit", window, cx);
     }
 
+    fn drop_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(commit_sha) = self.context_menu_commit_sha() else {
+            return;
+        };
+
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            format!("Drop commit {commit_sha}?"),
+            Some("This rewrites history on the current branch.".into()),
+            "Drop Commit",
+            window,
+            cx,
+        );
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, _| repository.drop_commit(commit_sha))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.run_git_operation(operation, "Failed to drop commit", window, cx);
+    }
+
     fn merge_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(repository) = self.get_repository(cx) else {
             return;
@@ -3057,6 +3145,73 @@ impl GitGraph {
         });
 
         self.run_git_operation(operation, "Failed to rebase current branch", window, cx);
+    }
+
+    fn reset_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(commit_sha) = self.context_menu_commit_sha() else {
+            return;
+        };
+
+        let reset_mode_prompt = self.prompt_reset_mode(window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let Some(prompt_mode) = reset_mode_prompt.await else {
+                return anyhow::Ok(());
+            };
+
+            let confirm = this.update_in(cx, |this, window, cx| {
+                let detail = match prompt_mode {
+                    ResetPromptMode::Hard => {
+                        Some("Hard reset will discard working tree and index changes.")
+                    }
+                    ResetPromptMode::Soft => {
+                        Some("Soft reset moves the branch pointer and keeps changes staged.")
+                    }
+                    ResetPromptMode::Mixed => {
+                        Some("Mixed reset moves the branch pointer and keeps changes unstaged.")
+                    }
+                };
+
+                this.prompt_confirmation(
+                    PromptLevel::Warning,
+                    format!(
+                        "Reset the current branch to {commit_sha} using {} mode?",
+                        prompt_mode.label()
+                    ),
+                    detail,
+                    "Reset",
+                    window,
+                    cx,
+                )
+            })?;
+
+            confirm.await?;
+
+            this.update_in(cx, |this, window, cx| {
+                let repository = repository.clone();
+                let commit_sha = commit_sha.clone();
+                let operation = cx.spawn(async move |_, cx| {
+                    repository
+                        .update(cx, |repository, cx| {
+                            repository.reset(commit_sha, prompt_mode.to_reset_mode(), cx)
+                        })
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+                    anyhow::Ok(())
+                });
+                this.run_git_operation(operation, "Failed to reset current branch", window, cx);
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err(
+            "Failed to reset current branch",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
     }
 
     fn deploy_entry_context_menu(
@@ -3169,10 +3324,15 @@ impl GitGraph {
                         .action("Checkout...", CheckoutCommit.boxed_clone())
                         .action("Cherry Pick...", CherryPickCommit.boxed_clone())
                         .action("Revert...", RevertCommit.boxed_clone())
+                        .action("Drop...", DropCommit.boxed_clone())
                         .action("Merge into current branch...", MergeCommit.boxed_clone())
                         .action(
                             "Rebase current branch on this Commit...",
                             RebaseOntoCommit.boxed_clone(),
+                        )
+                        .action(
+                            "Reset current branch to this Commit...",
+                            ResetCommit.boxed_clone(),
                         )
                 })
                 .when(is_tag_ref, |menu| {
@@ -5156,11 +5316,17 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &RevertCommit, window, cx| {
                 this.revert_context_menu_commit(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DropCommit, window, cx| {
+                this.drop_context_menu_commit(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &MergeCommit, window, cx| {
                 this.merge_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RebaseOntoCommit, window, cx| {
                 this.rebase_context_menu_commit(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResetCommit, window, cx| {
+                this.reset_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))

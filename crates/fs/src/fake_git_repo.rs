@@ -314,7 +314,7 @@ impl GitRepository for FakeGitRepository {
                 ResetMode::Soft => {
                     state.head_contents = snapshot.head_contents;
                 }
-                ResetMode::Mixed => {
+                ResetMode::Mixed | ResetMode::Hard => {
                     state.head_contents = snapshot.head_contents;
                     state.index_contents = state.head_contents.clone();
                 }
@@ -947,6 +947,10 @@ impl GitRepository for FakeGitRepository {
     }
 
     fn revert_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
+        future::ready(Ok(())).boxed()
+    }
+
+    fn drop_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
         future::ready(Ok(())).boxed()
     }
 
