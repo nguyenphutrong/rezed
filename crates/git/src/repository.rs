@@ -760,6 +760,7 @@ pub enum LogSource {
     #[default]
     All,
     Branch(SharedString),
+    Branches(Vec<SharedString>),
     Sha(Oid),
     Path(RepoPath),
     Filtered {
@@ -812,6 +813,13 @@ impl LogSource {
                 "HEAD",
             ]),
             LogSource::Branch(branch) => Ok(vec![branch.as_str()]),
+            LogSource::Branches(branches) => {
+                if branches.is_empty() {
+                    Ok(vec!["--max-count=0", "HEAD"])
+                } else {
+                    Ok(branches.iter().map(|branch| branch.as_ref()).collect())
+                }
+            }
             LogSource::Sha(oid) => Ok(vec![
                 str::from_utf8(oid.as_bytes()).context("Failed to build str from sha")?,
             ]),
@@ -4792,6 +4800,24 @@ mod tests {
                 "refs/stash",
                 "HEAD",
             ]
+        );
+    }
+
+    #[test]
+    fn test_branches_log_source_uses_selected_refs() {
+        assert_eq!(
+            LogSource::Branches(vec![
+                "refs/heads/main".into(),
+                "refs/remotes/origin/main".into()
+            ])
+            .get_args()
+            .unwrap(),
+            vec!["refs/heads/main", "refs/remotes/origin/main"]
+        );
+
+        assert_eq!(
+            LogSource::Branches(Vec::new()).get_args().unwrap(),
+            vec!["--max-count=0", "HEAD"]
         );
     }
 
