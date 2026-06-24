@@ -1,5 +1,6 @@
 use crate::{AsyncBody, HttpClient, HttpRequestExt};
 use anyhow::{Context as _, Result, anyhow, bail};
+pub use cloud_api_types::{GitHubActivityItem, GitHubActivityKind, GitHubActivitySyncBatch};
 use futures::AsyncReadExt;
 use http::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -141,42 +142,6 @@ impl GitHubRepositoryActivity {
         });
         items
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitHubActivitySyncBatch {
-    pub repository_name_with_owner: String,
-    pub items: Vec<GitHubActivityItem>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitHubActivityItem {
-    pub kind: GitHubActivityKind,
-    pub source_id: String,
-    pub repository_name_with_owner: String,
-    pub title: String,
-    pub body: Option<String>,
-    pub author_login: Option<String>,
-    pub labels: Vec<String>,
-    pub url: String,
-    pub number: Option<u64>,
-    pub state: Option<String>,
-    pub draft: Option<bool>,
-    pub updated_at: Option<String>,
-    pub workflow_run_id: Option<u64>,
-    pub workflow_status: Option<String>,
-    pub workflow_conclusion: Option<String>,
-    pub workflow_event: Option<String>,
-    pub workflow_head_branch: Option<String>,
-    pub workflow_head_sha: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GitHubActivityKind {
-    Issue,
-    PullRequest,
-    WorkflowRun,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

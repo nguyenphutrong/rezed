@@ -27,6 +27,7 @@ doctest = true
 anyhow.workspace = true
 async-compression.workspace = true
 bytes.workspace = true
+cloud_api_types.workspace = true
 derive_more.workspace = true
 futures.workspace = true
 http-body.workspace = true

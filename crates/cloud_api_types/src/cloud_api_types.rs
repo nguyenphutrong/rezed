@@ -74,6 +74,42 @@ impl std::fmt::Debug for GitHubConnectedAccount {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubActivitySyncBatch {
+    pub repository_name_with_owner: String,
+    pub items: Vec<GitHubActivityItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubActivityItem {
+    pub kind: GitHubActivityKind,
+    pub source_id: String,
+    pub repository_name_with_owner: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub author_login: Option<String>,
+    pub labels: Vec<String>,
+    pub url: String,
+    pub number: Option<u64>,
+    pub state: Option<String>,
+    pub draft: Option<bool>,
+    pub updated_at: Option<String>,
+    pub workflow_run_id: Option<u64>,
+    pub workflow_status: Option<String>,
+    pub workflow_conclusion: Option<String>,
+    pub workflow_event: Option<String>,
+    pub workflow_head_branch: Option<String>,
+    pub workflow_head_sha: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitHubActivityKind {
+    Issue,
+    PullRequest,
+    WorkflowRun,
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize)]
 pub struct OrganizationId(pub Arc<str>);
 
@@ -241,7 +277,9 @@ pub struct EditPredictionSettledKeptChars {
 
 #[cfg(test)]
 mod tests {
-    use super::GitHubConnectedAccount;
+    use super::{
+        GitHubActivityItem, GitHubActivityKind, GitHubActivitySyncBatch, GitHubConnectedAccount,
+    };
 
     #[test]
     fn github_connected_account_debug_redacts_token() {
@@ -277,5 +315,66 @@ mod tests {
             ..account
         };
         assert_eq!(account.missing_required_scopes(), vec!["read:user"]);
+    }
+
+    #[test]
+    fn github_activity_sync_batch_serializes_for_inbox_sync() {
+        let batch = GitHubActivitySyncBatch {
+            repository_name_with_owner: "owner/repo".to_string(),
+            items: vec![GitHubActivityItem {
+                kind: GitHubActivityKind::PullRequest,
+                source_id: "github:owner/repo:pull_request:7".to_string(),
+                repository_name_with_owner: "owner/repo".to_string(),
+                title: "Improve graph".to_string(),
+                body: Some("body".to_string()),
+                author_login: Some("octo".to_string()),
+                labels: vec!["enhancement".to_string()],
+                url: "https://github.com/owner/repo/pull/7".to_string(),
+                number: Some(7),
+                state: Some("open".to_string()),
+                draft: Some(false),
+                updated_at: Some("2026-06-24T11:00:00Z".to_string()),
+                workflow_run_id: None,
+                workflow_status: None,
+                workflow_conclusion: None,
+                workflow_event: None,
+                workflow_head_branch: None,
+                workflow_head_sha: None,
+            }],
+        };
+
+        let json = serde_json::to_value(&batch).expect("sync batch should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "repository_name_with_owner": "owner/repo",
+                "items": [
+                    {
+                        "kind": "pull_request",
+                        "source_id": "github:owner/repo:pull_request:7",
+                        "repository_name_with_owner": "owner/repo",
+                        "title": "Improve graph",
+                        "body": "body",
+                        "author_login": "octo",
+                        "labels": ["enhancement"],
+                        "url": "https://github.com/owner/repo/pull/7",
+                        "number": 7,
+                        "state": "open",
+                        "draft": false,
+                        "updated_at": "2026-06-24T11:00:00Z",
+                        "workflow_run_id": null,
+                        "workflow_status": null,
+                        "workflow_conclusion": null,
+                        "workflow_event": null,
+                        "workflow_head_branch": null,
+                        "workflow_head_sha": null
+                    }
+                ]
+            })
+        );
+
+        let round_trip = serde_json::from_value::<GitHubActivitySyncBatch>(json)
+            .expect("sync batch should deserialize");
+        assert_eq!(round_trip, batch);
     }
 }
