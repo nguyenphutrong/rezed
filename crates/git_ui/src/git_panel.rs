@@ -5934,7 +5934,7 @@ impl GitPanel {
 
     fn github_activity_row(item: &GitHubActivityItem) -> GitHubActivityRow {
         let number = item
-            .number
+            .issue_or_pull_request_number()
             .map(|number| format!(" #{number}"))
             .unwrap_or_default();
         let labels = if item.labels.is_empty() {
@@ -5963,13 +5963,9 @@ impl GitPanel {
                     item.state.as_deref().unwrap_or("unknown")
                 },
             ),
-            GitHubActivityKind::WorkflowRun => (
-                "Action",
-                item.workflow_conclusion
-                    .as_deref()
-                    .or(item.workflow_status.as_deref())
-                    .unwrap_or("unknown"),
-            ),
+            GitHubActivityKind::WorkflowRun => {
+                ("Action", item.workflow_state().unwrap_or("unknown"))
+            }
         };
 
         let action_details = if item.kind == GitHubActivityKind::WorkflowRun {
