@@ -126,6 +126,25 @@ pub struct GitHubActivityItem {
     pub workflow_head_sha: Option<String>,
 }
 
+impl GitHubActivityItem {
+    pub fn issue_or_pull_request_number(&self) -> Option<u64> {
+        match self.kind {
+            GitHubActivityKind::Issue | GitHubActivityKind::PullRequest => self.number,
+            GitHubActivityKind::WorkflowRun => None,
+        }
+    }
+
+    pub fn workflow_state(&self) -> Option<&str> {
+        if self.kind != GitHubActivityKind::WorkflowRun {
+            return None;
+        }
+
+        self.workflow_conclusion
+            .as_deref()
+            .or(self.workflow_status.as_deref())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GitHubActivityKind {
@@ -370,6 +389,47 @@ mod tests {
             })
         );
         assert!(!json.to_string().contains("github-secret-token"));
+    }
+
+    fn github_activity_item(kind: GitHubActivityKind) -> GitHubActivityItem {
+        GitHubActivityItem {
+            kind,
+            source_id: "github:owner/repo:item:1".to_string(),
+            repository_name_with_owner: "owner/repo".to_string(),
+            title: "Activity".to_string(),
+            body: None,
+            author_login: Some("octo".to_string()),
+            labels: Vec::new(),
+            url: "https://github.com/owner/repo/issues/1".to_string(),
+            number: Some(1),
+            state: Some("open".to_string()),
+            draft: None,
+            updated_at: Some("2026-06-24T10:00:00Z".to_string()),
+            workflow_run_id: None,
+            workflow_status: None,
+            workflow_conclusion: None,
+            workflow_event: None,
+            workflow_head_branch: None,
+            workflow_head_sha: None,
+        }
+    }
+
+    #[test]
+    fn github_activity_item_helpers_expose_sync_fields_by_kind() {
+        let issue = github_activity_item(GitHubActivityKind::Issue);
+        assert_eq!(issue.issue_or_pull_request_number(), Some(1));
+        assert_eq!(issue.workflow_state(), None);
+
+        let pull_request = github_activity_item(GitHubActivityKind::PullRequest);
+        assert_eq!(pull_request.issue_or_pull_request_number(), Some(1));
+        assert_eq!(pull_request.workflow_state(), None);
+
+        let mut workflow_run = github_activity_item(GitHubActivityKind::WorkflowRun);
+        workflow_run.number = None;
+        workflow_run.workflow_status = Some("completed".to_string());
+        workflow_run.workflow_conclusion = Some("success".to_string());
+        assert_eq!(workflow_run.issue_or_pull_request_number(), None);
+        assert_eq!(workflow_run.workflow_state(), Some("success"));
     }
 
     #[test]
