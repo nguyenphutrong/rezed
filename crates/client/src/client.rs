@@ -2402,6 +2402,36 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_fetch_github_connected_account_returns_none_without_credentials(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let request_count = Arc::new(Mutex::new(0));
+        let http_client = FakeHttpClient::create({
+            let request_count = request_count.clone();
+            move |_request| {
+                let request_count = request_count.clone();
+                async move {
+                    *request_count.lock() += 1;
+                    Ok(http_client::Response::builder()
+                        .status(500)
+                        .body("unexpected request".into())
+                        .unwrap())
+                }
+            }
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+
+        let account = client
+            .fetch_github_connected_account(&cx.to_async())
+            .await
+            .expect("missing credentials should not fail");
+
+        assert_eq!(account, None);
+        assert_eq!(*request_count.lock(), 0);
+    }
+
+    #[gpui::test]
     async fn test_sign_in_reports_connection_failure(cx: &mut TestAppContext) {
         init_test(cx);
         let http_client = FakeHttpClient::create(|_request| async move {
