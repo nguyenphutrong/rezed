@@ -58,6 +58,7 @@ impl GitHubRepositoryActivity {
                 number: Some(issue.number),
                 state: Some(issue.state.clone()),
                 draft: None,
+                updated_at: issue.updated_at.clone(),
                 workflow_run_id: None,
                 workflow_status: None,
                 workflow_conclusion: None,
@@ -82,6 +83,7 @@ impl GitHubRepositoryActivity {
                         number: Some(pull_request.number),
                         state: Some(pull_request.state.clone()),
                         draft: Some(pull_request.draft),
+                        updated_at: pull_request.updated_at.clone(),
                         workflow_run_id: None,
                         workflow_status: None,
                         workflow_conclusion: None,
@@ -109,6 +111,7 @@ impl GitHubRepositoryActivity {
                     number: None,
                     state: None,
                     draft: None,
+                    updated_at: run.updated_at.clone(),
                     workflow_run_id: Some(run.id),
                     workflow_status: run.status.clone(),
                     workflow_conclusion: run.conclusion.clone(),
@@ -133,6 +136,7 @@ pub struct GitHubActivityItem {
     pub number: Option<u64>,
     pub state: Option<String>,
     pub draft: Option<bool>,
+    pub updated_at: Option<String>,
     pub workflow_run_id: Option<u64>,
     pub workflow_status: Option<String>,
     pub workflow_conclusion: Option<String>,
@@ -156,6 +160,8 @@ pub struct GitHubIssue {
     pub state: String,
     pub user: GitHubUser,
     #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
     pub labels: Vec<GitHubLabel>,
     #[serde(default)]
     pub body: Option<String>,
@@ -171,6 +177,8 @@ pub struct GitHubPullRequest {
     #[serde(default)]
     pub draft: bool,
     #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
     pub labels: Vec<GitHubLabel>,
     #[serde(default)]
     pub body: Option<String>,
@@ -184,6 +192,8 @@ pub struct GitHubWorkflowRun {
     pub status: Option<String>,
     pub conclusion: Option<String>,
     pub head_branch: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
     pub event: String,
 }
 
@@ -208,6 +218,8 @@ struct GitHubIssueItem {
     html_url: String,
     state: String,
     user: GitHubUser,
+    #[serde(default)]
+    updated_at: Option<String>,
     #[serde(default)]
     labels: Vec<GitHubLabel>,
     #[serde(default)]
@@ -253,6 +265,7 @@ pub async fn repository_activity(
                 html_url: issue.html_url,
                 state: issue.state,
                 user: issue.user,
+                updated_at: issue.updated_at,
                 labels: issue.labels,
                 body: issue.body,
             })
@@ -490,6 +503,7 @@ mod tests {
                         "html_url": "https://github.com/owner/repo/issues/1",
                         "state": "open",
                         "user": { "login": "octo" },
+                        "updated_at": "2026-06-24T10:00:00Z",
                         "labels": [{ "name": "bug" }],
                         "body": "issue body"
                     },
@@ -513,6 +527,7 @@ mod tests {
                         "state": "open",
                         "user": { "login": "hubot" },
                         "draft": true,
+                        "updated_at": "2026-06-24T11:00:00Z",
                         "labels": [{ "name": "enhancement" }],
                         "body": "pull request body"
                     }
@@ -529,6 +544,7 @@ mod tests {
                             "status": "completed",
                             "conclusion": "success",
                             "head_branch": "main",
+                            "updated_at": "2026-06-24T12:00:00Z",
                             "event": "push"
                         }
                     ]
@@ -564,6 +580,7 @@ mod tests {
             assert_eq!(items[0].labels, vec!["bug"]);
             assert_eq!(items[0].number, Some(1));
             assert_eq!(items[0].state.as_deref(), Some("open"));
+            assert_eq!(items[0].updated_at.as_deref(), Some("2026-06-24T10:00:00Z"));
             assert_eq!(items[1].kind, GitHubActivityKind::PullRequest);
             assert_eq!(items[1].source_id, "github:owner/repo:pull_request:7");
             assert_eq!(items[1].title, "Improve graph");
@@ -573,10 +590,12 @@ mod tests {
             assert_eq!(items[1].number, Some(7));
             assert_eq!(items[1].state.as_deref(), Some("open"));
             assert_eq!(items[1].draft, Some(true));
+            assert_eq!(items[1].updated_at.as_deref(), Some("2026-06-24T11:00:00Z"));
             assert_eq!(items[2].kind, GitHubActivityKind::WorkflowRun);
             assert_eq!(items[2].source_id, "github:owner/repo:workflow_run:42");
             assert_eq!(items[2].title, "CI");
             assert_eq!(items[2].workflow_run_id, Some(42));
+            assert_eq!(items[2].updated_at.as_deref(), Some("2026-06-24T12:00:00Z"));
             assert_eq!(items[2].workflow_status.as_deref(), Some("completed"));
             assert_eq!(items[2].workflow_conclusion.as_deref(), Some("success"));
             assert_eq!(items[2].workflow_event.as_deref(), Some("push"));
@@ -626,6 +645,7 @@ mod tests {
             number: None,
             state: None,
             draft: None,
+            updated_at: Some("2026-06-24T12:00:00Z".to_string()),
             workflow_run_id: Some(42),
             workflow_status: Some("completed".to_string()),
             workflow_conclusion: Some("success".to_string()),
@@ -648,6 +668,7 @@ mod tests {
                 "number": null,
                 "state": null,
                 "draft": null,
+                "updated_at": "2026-06-24T12:00:00Z",
                 "workflow_run_id": 42,
                 "workflow_status": "completed",
                 "workflow_conclusion": "success",
