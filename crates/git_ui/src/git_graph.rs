@@ -3641,25 +3641,16 @@ impl GitGraph {
         let Some(commit_sha) = self.context_menu_commit_sha() else {
             return;
         };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
 
-        let confirm = self.prompt_confirmation(
-            PromptLevel::Warning,
-            format!("Revert commit {commit_sha}?"),
-            None,
-            "Revert",
-            window,
-            cx,
-        );
-        let operation = cx.spawn(async move |_, cx| {
-            confirm.await?;
-            repository
-                .update(cx, |repository, _| repository.revert_commit(commit_sha))
-                .await
-                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
-            anyhow::Ok(())
+        let graph = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                RevertCommitModal::new(graph, repository, commit_sha.into(), window, cx)
+            });
         });
-
-        self.run_git_operation(operation, "Failed to revert commit", window, cx);
     }
 
     fn drop_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6193,6 +6184,114 @@ impl Render for CherryPickModal {
                     )
                     .child(
                         Button::new("cherry-pick-confirm", "Cherry Pick")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&menu::Confirm, window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+struct RevertCommitModal {
+    graph: WeakEntity<GitGraph>,
+    repository: Entity<Repository>,
+    commit_sha: SharedString,
+    no_commit: bool,
+    focus_handle: FocusHandle,
+}
+
+impl RevertCommitModal {
+    fn new(
+        graph: WeakEntity<GitGraph>,
+        repository: Entity<Repository>,
+        commit_sha: SharedString,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            graph,
+            repository,
+            commit_sha,
+            no_commit: false,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self.repository.clone();
+        let commit_sha = self.commit_sha.to_string();
+        let no_commit = self.no_commit;
+        let operation = cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.revert_commit(commit_sha, no_commit)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.graph
+            .update(cx, |graph, cx| {
+                graph.run_git_operation(operation, "Failed to revert commit", window, cx);
+            })
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for RevertCommitModal {}
+impl ModalView for RevertCommitModal {}
+impl Focusable for RevertCommitModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for RevertCommitModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("RevertCommitModal")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitCommit).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!("Revert {}", self.commit_sha))
+                            .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_3()
+                    .pb_3()
+                    .gap_2()
+                    .w_full()
+                    .track_focus(&self.focus_handle)
+                    .child(
+                        Checkbox::new("revert-no-commit", self.no_commit.into())
+                            .label("Apply without committing")
+                            .on_click(cx.listener(|this, state, _window, cx| {
+                                this.no_commit = matches!(state, ToggleState::Selected);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("revert-confirm", "Revert")
                             .style(ButtonStyle::Filled)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.confirm(&menu::Confirm, window, cx);

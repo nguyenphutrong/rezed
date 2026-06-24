@@ -5809,12 +5809,12 @@ impl Repository {
         })
     }
 
-    pub fn revert_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+    pub fn revert_commit(&mut self, sha: String, no_commit: bool) -> oneshot::Receiver<Result<()>> {
         let this = self.this.clone();
         self.send_job("revert_commit", None, move |git_repo, mut cx| async move {
             let result = match git_repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.revert_commit(sha).await
+                    backend.revert_commit(sha, no_commit).await
                 }
                 RepositoryState::Remote(_) => {
                     anyhow::bail!("reverting a commit is only supported locally")
