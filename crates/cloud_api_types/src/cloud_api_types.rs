@@ -54,10 +54,13 @@ pub struct GitHubConnectedAccount {
     pub access_token: String,
 }
 
+pub const GITHUB_REQUIRED_OAUTH_SCOPES: &[&str] = &["repo", "read:user"];
+
 impl GitHubConnectedAccount {
     pub fn missing_required_scopes(&self) -> Vec<&'static str> {
-        ["repo", "read:user"]
-            .into_iter()
+        GITHUB_REQUIRED_OAUTH_SCOPES
+            .iter()
+            .copied()
             .filter(|required_scope| !self.scopes.iter().any(|scope| scope == required_scope))
             .collect()
     }
@@ -278,7 +281,8 @@ pub struct EditPredictionSettledKeptChars {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubActivityItem, GitHubActivityKind, GitHubActivitySyncBatch, GitHubConnectedAccount,
+        GITHUB_REQUIRED_OAUTH_SCOPES, GitHubActivityItem, GitHubActivityKind,
+        GitHubActivitySyncBatch, GitHubConnectedAccount,
     };
 
     #[test]
@@ -315,6 +319,11 @@ mod tests {
             ..account
         };
         assert_eq!(account.missing_required_scopes(), vec!["read:user"]);
+    }
+
+    #[test]
+    fn github_required_oauth_scopes_match_integration_contract() {
+        assert_eq!(GITHUB_REQUIRED_OAUTH_SCOPES, &["repo", "read:user"]);
     }
 
     #[test]
