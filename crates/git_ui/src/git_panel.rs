@@ -5721,6 +5721,11 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn refresh_github_activity(&mut self, cx: &mut Context<Self>) {
+        self.github_activity_repo = None;
+        self.load_github_activity(cx);
+    }
+
     async fn github_token(cx: &mut AsyncApp) -> GitHubTokenSync {
         let client = cx.update(|cx| client::Client::global(cx));
         match client.fetch_github_connected_account(cx).await {
@@ -5791,7 +5796,26 @@ impl GitPanel {
                     .min_h_full()
                     .p_2()
                     .gap_2()
-                    .child(self.render_github_connection_status())
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .gap_2()
+                            .child(self.render_github_connection_status())
+                            .child(
+                                IconButton::new("refresh-github-activity", IconName::RotateCw)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Refresh GitHub Activity"))
+                                    .aria_label("Refresh GitHub Activity")
+                                    .disabled(matches!(
+                                        self.github_activity,
+                                        GitHubActivityState::Loading
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_github_activity(cx);
+                                    })),
+                            ),
+                    )
                     .map(|this| match &self.github_activity {
                         GitHubActivityState::Idle | GitHubActivityState::Loading => this.child(
                             h_flex()
