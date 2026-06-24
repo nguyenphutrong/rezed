@@ -258,10 +258,16 @@ pub async fn repository_activity(
     );
 
     let issue_items: Vec<GitHubIssueItem> =
-        get_github_json(http.clone(), &issues_url, token).await?;
-    let pull_requests = get_github_json(http.clone(), &pulls_url, token).await?;
-    let workflow_runs: GitHubWorkflowRunsResponse =
-        get_github_json(http, &workflow_runs_url, token).await?;
+        get_github_paginated_json(http.clone(), &issues_url, token).await?;
+    let pull_requests = get_github_paginated_json(http.clone(), &pulls_url, token).await?;
+    let mut workflow_runs = Vec::new();
+    let mut next_url = Some(workflow_runs_url);
+    while let Some(url) = next_url {
+        let (response, next) =
+            get_github_json_page::<GitHubWorkflowRunsResponse>(http.clone(), &url, token).await?;
+        workflow_runs.extend(response.workflow_runs);
+        next_url = next;
+    }
 
     Ok(GitHubRepositoryActivity {
         repository_name_with_owner: repo_name_with_owner.to_string(),
@@ -280,15 +286,30 @@ pub async fn repository_activity(
             })
             .collect(),
         pull_requests,
-        workflow_runs: workflow_runs.workflow_runs,
+        workflow_runs,
     })
 }
 
-async fn get_github_json<T: for<'de> Deserialize<'de>>(
+async fn get_github_paginated_json<T: for<'de> Deserialize<'de>>(
     http: Arc<dyn HttpClient>,
     url: &str,
     token: Option<&str>,
-) -> anyhow::Result<T> {
+) -> anyhow::Result<Vec<T>> {
+    let mut items = Vec::new();
+    let mut next_url = Some(url.to_string());
+    while let Some(url) = next_url {
+        let (mut page, next) = get_github_json_page::<Vec<T>>(http.clone(), &url, token).await?;
+        items.append(&mut page);
+        next_url = next;
+    }
+    Ok(items)
+}
+
+async fn get_github_json_page<T: for<'de> Deserialize<'de>>(
+    http: Arc<dyn HttpClient>,
+    url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<(T, Option<String>)> {
     let request = Request::get(url)
         .follow_redirects(crate::RedirectPolicy::FollowAll)
         .header("Accept", "application/vnd.github+json")
@@ -300,6 +321,11 @@ async fn get_github_json<T: for<'de> Deserialize<'de>>(
 
     let mut response = http.send(request).await?;
     let status = response.status();
+    let next_url = response
+        .headers()
+        .get("link")
+        .and_then(|link| link.to_str().ok())
+        .and_then(github_next_link);
     let mut body = Vec::new();
     response
         .body_mut()
@@ -311,13 +337,27 @@ async fn get_github_json<T: for<'de> Deserialize<'de>>(
         return Err(github_status_error(status, &body));
     }
 
-    serde_json::from_slice(&body).map_err(|err| {
+    let value = serde_json::from_slice(&body).map_err(|err| {
         log::error!("Error deserializing GitHub API response: {err:?}");
         log::error!(
             "GitHub API response text: {:?}",
             String::from_utf8_lossy(body.as_slice())
         );
         anyhow!("error deserializing GitHub API response: {err:?}")
+    })?;
+    Ok((value, next_url))
+}
+
+fn github_next_link(link_header: &str) -> Option<String> {
+    link_header.split(',').find_map(|link| {
+        let (url, params) = link.split_once(';')?;
+        let is_next = params
+            .split(';')
+            .any(|param| param.trim() == r#"rel="next""#);
+        if !is_next {
+            return None;
+        }
+        Some(url.trim().strip_prefix('<')?.strip_suffix('>')?.to_string())
     })
 }
 
@@ -502,10 +542,14 @@ mod tests {
     #[test]
     fn test_repository_activity_fetches_issues_pull_requests_and_runs() {
         futures::executor::block_on(async {
-            let http = Arc::new(TestHttpClient::new(vec![
-                (
-                    200,
-                    r#"[
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![
+                TestResponse {
+                    status: 200,
+                    headers: vec![(
+                        "link",
+                        r#"<https://api.github.com/repos/owner/repo/issues?page=2>; rel="next""#,
+                    )],
+                    body: r#"[
                     {
                         "number": 1,
                         "title": "Real issue",
@@ -525,10 +569,27 @@ mod tests {
                         "pull_request": {}
                     }
                 ]"#,
-                ),
-                (
-                    200,
-                    r#"[
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"[
+                    {
+                        "number": 3,
+                        "title": "Closed issue",
+                        "html_url": "https://github.com/owner/repo/issues/3",
+                        "state": "closed",
+                        "user": { "login": "octo" },
+                        "updated_at": "2026-06-24T09:00:00Z",
+                        "labels": [],
+                        "body": null
+                    }
+                ]"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"[
                     {
                         "number": 7,
                         "title": "Improve graph",
@@ -541,10 +602,14 @@ mod tests {
                         "body": "pull request body"
                     }
                 ]"#,
-                ),
-                (
-                    200,
-                    r#"{
+                },
+                TestResponse {
+                    status: 200,
+                    headers: vec![(
+                        "link",
+                        r#"<https://api.github.com/repos/owner/repo/actions/runs?page=2>; rel="next""#,
+                    )],
+                    body: r#"{
                     "workflow_runs": [
                         {
                             "id": 42,
@@ -560,7 +625,27 @@ mod tests {
                         }
                     ]
                 }"#,
-                ),
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"{
+                    "workflow_runs": [
+                        {
+                            "id": 43,
+                            "name": "Deploy",
+                            "html_url": "https://github.com/owner/repo/actions/runs/43",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "head_branch": "main",
+                            "head_sha": "abcdef1234567890",
+                            "actor": { "login": "deploy-user" },
+                            "updated_at": "2026-06-24T13:00:00Z",
+                            "event": "workflow_dispatch"
+                        }
+                    ]
+                }"#,
+                },
             ]));
 
             let activity = repository_activity("owner/repo", Some("secret"), http.clone())
@@ -568,8 +653,9 @@ mod tests {
                 .expect("activity should parse");
 
             assert_eq!(activity.repository_name_with_owner, "owner/repo");
-            assert_eq!(activity.issues.len(), 1);
+            assert_eq!(activity.issues.len(), 2);
             assert_eq!(activity.issues[0].number, 1);
+            assert_eq!(activity.issues[1].number, 3);
             assert_eq!(activity.pull_requests.len(), 1);
             assert_eq!(activity.pull_requests[0].number, 7);
             assert_eq!(activity.pull_requests[0].labels[0].name, "enhancement");
@@ -577,11 +663,12 @@ mod tests {
                 activity.pull_requests[0].body.as_deref(),
                 Some("pull request body")
             );
-            assert_eq!(activity.workflow_runs.len(), 1);
+            assert_eq!(activity.workflow_runs.len(), 2);
             assert_eq!(activity.workflow_runs[0].id, 42);
+            assert_eq!(activity.workflow_runs[1].id, 43);
 
             let items = activity.to_activity_items();
-            assert_eq!(items.len(), 3);
+            assert_eq!(items.len(), 5);
             assert_eq!(items[0].kind, GitHubActivityKind::Issue);
             assert_eq!(items[0].source_id, "github:owner/repo:issue:1");
             assert_eq!(items[0].repository_name_with_owner, "owner/repo");
@@ -592,50 +679,62 @@ mod tests {
             assert_eq!(items[0].number, Some(1));
             assert_eq!(items[0].state.as_deref(), Some("open"));
             assert_eq!(items[0].updated_at.as_deref(), Some("2026-06-24T10:00:00Z"));
-            assert_eq!(items[1].kind, GitHubActivityKind::PullRequest);
-            assert_eq!(items[1].source_id, "github:owner/repo:pull_request:7");
-            assert_eq!(items[1].title, "Improve graph");
-            assert_eq!(items[1].body.as_deref(), Some("pull request body"));
-            assert_eq!(items[1].author_login.as_deref(), Some("hubot"));
-            assert_eq!(items[1].labels, vec!["enhancement"]);
-            assert_eq!(items[1].number, Some(7));
-            assert_eq!(items[1].state.as_deref(), Some("open"));
-            assert_eq!(items[1].draft, Some(true));
-            assert_eq!(items[1].updated_at.as_deref(), Some("2026-06-24T11:00:00Z"));
-            assert_eq!(items[2].kind, GitHubActivityKind::WorkflowRun);
-            assert_eq!(items[2].source_id, "github:owner/repo:workflow_run:42");
-            assert_eq!(items[2].title, "CI");
-            assert_eq!(items[2].author_login.as_deref(), Some("ci-user"));
-            assert_eq!(items[2].workflow_run_id, Some(42));
-            assert_eq!(items[2].updated_at.as_deref(), Some("2026-06-24T12:00:00Z"));
-            assert_eq!(items[2].workflow_status.as_deref(), Some("completed"));
-            assert_eq!(items[2].workflow_conclusion.as_deref(), Some("success"));
-            assert_eq!(items[2].workflow_event.as_deref(), Some("push"));
-            assert_eq!(items[2].workflow_head_branch.as_deref(), Some("main"));
+            assert_eq!(items[1].kind, GitHubActivityKind::Issue);
+            assert_eq!(items[1].source_id, "github:owner/repo:issue:3");
+            assert_eq!(items[1].state.as_deref(), Some("closed"));
+            assert_eq!(items[2].kind, GitHubActivityKind::PullRequest);
+            assert_eq!(items[2].source_id, "github:owner/repo:pull_request:7");
+            assert_eq!(items[2].title, "Improve graph");
+            assert_eq!(items[2].body.as_deref(), Some("pull request body"));
+            assert_eq!(items[2].author_login.as_deref(), Some("hubot"));
+            assert_eq!(items[2].labels, vec!["enhancement"]);
+            assert_eq!(items[2].number, Some(7));
+            assert_eq!(items[2].state.as_deref(), Some("open"));
+            assert_eq!(items[2].draft, Some(true));
+            assert_eq!(items[2].updated_at.as_deref(), Some("2026-06-24T11:00:00Z"));
+            assert_eq!(items[3].kind, GitHubActivityKind::WorkflowRun);
+            assert_eq!(items[3].source_id, "github:owner/repo:workflow_run:42");
+            assert_eq!(items[3].title, "CI");
+            assert_eq!(items[3].author_login.as_deref(), Some("ci-user"));
+            assert_eq!(items[3].workflow_run_id, Some(42));
+            assert_eq!(items[3].updated_at.as_deref(), Some("2026-06-24T12:00:00Z"));
+            assert_eq!(items[3].workflow_status.as_deref(), Some("completed"));
+            assert_eq!(items[3].workflow_conclusion.as_deref(), Some("success"));
+            assert_eq!(items[3].workflow_event.as_deref(), Some("push"));
+            assert_eq!(items[3].workflow_head_branch.as_deref(), Some("main"));
             assert_eq!(
-                items[2].workflow_head_sha.as_deref(),
+                items[3].workflow_head_sha.as_deref(),
                 Some("1234567890abcdef")
             );
+            assert_eq!(items[4].source_id, "github:owner/repo:workflow_run:43");
+            assert_eq!(items[4].workflow_conclusion.as_deref(), Some("failure"));
 
             let requests = http.requests.lock();
-            assert_eq!(requests.len(), 3);
+            assert_eq!(requests.len(), 5);
             assert!(
                 requests[0]
                     .uri()
                     .to_string()
                     .ends_with("/issues?state=all&per_page=100&sort=updated&direction=desc")
             );
+            assert!(requests[1].uri().to_string().ends_with("/issues?page=2"));
             assert!(
-                requests[1]
+                requests[2]
                     .uri()
                     .to_string()
                     .ends_with("/pulls?state=all&per_page=100&sort=updated&direction=desc")
             );
             assert!(
-                requests[2]
+                requests[3]
                     .uri()
                     .to_string()
                     .ends_with("/actions/runs?per_page=100&exclude_pull_requests=false")
+            );
+            assert!(
+                requests[4]
+                    .uri()
+                    .to_string()
+                    .ends_with("/actions/runs?page=2")
             );
             assert!(requests.iter().all(|request| {
                 request
@@ -759,24 +858,20 @@ mod tests {
     }
 
     struct TestHttpClient {
-        responses: Mutex<VecDeque<(StatusCode, &'static str)>>,
+        responses: Mutex<VecDeque<TestResponse>>,
         requests: Mutex<Vec<Request<AsyncBody>>>,
     }
 
+    struct TestResponse {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: &'static str,
+    }
+
     impl TestHttpClient {
-        fn new(responses: Vec<(u16, &'static str)>) -> Self {
+        fn new_with_headers(responses: Vec<TestResponse>) -> Self {
             Self {
-                responses: Mutex::new(
-                    responses
-                        .into_iter()
-                        .map(|(status, body)| {
-                            (
-                                StatusCode::from_u16(status).expect("test status should be valid"),
-                                body,
-                            )
-                        })
-                        .collect(),
-                ),
+                responses: Mutex::new(responses.into()),
                 requests: Mutex::new(Vec::new()),
             }
         }
@@ -793,14 +888,19 @@ mod tests {
 
         fn send(&self, req: Request<AsyncBody>) -> BoxFuture<'static, Result<Response<AsyncBody>>> {
             self.requests.lock().push(req);
-            let Some((status, body)) = self.responses.lock().pop_front() else {
+            let Some(test_response) = self.responses.lock().pop_front() else {
                 return Box::pin(async { anyhow::bail!("no test response queued") });
             };
             Box::pin(async move {
-                Ok(Response::builder()
+                let status = StatusCode::from_u16(test_response.status)
+                    .expect("test status should be valid");
+                let mut response = Response::builder()
                     .status(status)
-                    .extension(RedirectPolicy::FollowAll)
-                    .body(AsyncBody::from(body))?)
+                    .extension(RedirectPolicy::FollowAll);
+                for (name, value) in test_response.headers {
+                    response = response.header(name, value);
+                }
+                Ok(response.body(AsyncBody::from(test_response.body))?)
             })
         }
     }
