@@ -5745,6 +5745,10 @@ impl GitPanel {
                         login = account.login.as_str(),
                         scopes = &account.scopes
                     );
+                } else {
+                    cx.update(|cx| cx.delete_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
+                        .await
+                        .log_err();
                 }
                 return GitHubTokenSync {
                     token,
@@ -8351,6 +8355,16 @@ mod tests {
 
         assert!(formatted.contains("octo"));
         assert!(!formatted.contains("github-secret-token"));
+    }
+
+    #[test]
+    fn test_non_empty_github_token_trims_and_rejects_empty_values() {
+        assert_eq!(
+            non_empty_token(" token ".to_string()),
+            Some("token".to_string())
+        );
+        assert_eq!(non_empty_token("  ".to_string()), None);
+        assert_eq!(non_empty_token(String::new()), None);
     }
 
     async fn await_git_panel_entries(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) {
