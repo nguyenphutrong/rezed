@@ -46,12 +46,23 @@ pub struct AuthenticatedUser {
     pub has_connected_to_collab_once: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubConnectedAccount {
     pub login: String,
     #[serde(default)]
     pub scopes: Vec<String>,
     pub access_token: String,
+}
+
+impl std::fmt::Debug for GitHubConnectedAccount {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitHubConnectedAccount")
+            .field("login", &self.login)
+            .field("scopes", &self.scopes)
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize)]
@@ -217,4 +228,23 @@ pub struct EditPredictionSettledKeptChars {
     pub kept_rate: f64,
     #[serde(rename = "edit_bytes_recall_rate")]
     pub recall_rate: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitHubConnectedAccount;
+
+    #[test]
+    fn github_connected_account_debug_redacts_token() {
+        let account = GitHubConnectedAccount {
+            login: "octo".to_string(),
+            scopes: vec!["repo".to_string(), "read:user".to_string()],
+            access_token: "github-secret-token".to_string(),
+        };
+
+        let formatted = format!("{account:?}");
+        assert!(formatted.contains("octo"));
+        assert!(formatted.contains("<redacted>"));
+        assert!(!formatted.contains("github-secret-token"));
+    }
 }
