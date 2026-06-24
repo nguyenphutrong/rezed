@@ -840,14 +840,16 @@ enum BranchPushMode {
     Normal,
     SetUpstream,
     ForceWithLease,
+    Force,
 }
 
 impl BranchPushMode {
     fn option(self) -> Option<PushOptions> {
         match self {
             Self::Normal => None,
-            Self::SetUpstream => Some(PushOptions::SetUpstream),
-            Self::ForceWithLease => Some(PushOptions::Force),
+            Self::SetUpstream => Some(PushOptions::set_upstream()),
+            Self::ForceWithLease => Some(PushOptions::force_with_lease()),
+            Self::Force => Some(PushOptions::force()),
         }
     }
 }
@@ -6479,6 +6481,12 @@ impl Render for PushBranchModal {
                                 "Force With Lease",
                                 BranchPushMode::ForceWithLease,
                                 cx,
+                            ))
+                            .child(self.render_push_mode_option(
+                                "push-branch-mode-force-unconditional",
+                                "Force",
+                                BranchPushMode::Force,
+                                cx,
                             )),
                     )
                     .child(
@@ -11140,7 +11148,7 @@ mod tests {
         let target = state.push_target();
         assert_eq!(target.remote.name.as_ref(), "origin");
         assert_eq!(target.remote_branch_name.as_ref(), "feature");
-        assert_eq!(target.option, Some(PushOptions::SetUpstream));
+        assert_eq!(target.option, Some(PushOptions::set_upstream()));
     }
 
     #[test]
@@ -11155,7 +11163,28 @@ mod tests {
 
         let target = state.push_target();
         assert_eq!(target.remote.name.as_ref(), "origin");
-        assert_eq!(target.option, Some(PushOptions::Force));
+        assert_eq!(target.option, Some(PushOptions::force_with_lease()));
+    }
+
+    #[test]
+    fn push_branch_dialog_supports_force() {
+        let mut state = PushBranchDialogState::new(
+            local_branch("feature", Some("refs/remotes/origin/feature")),
+            vec!["origin".into()],
+        )
+        .expect("remote should be available");
+
+        state.push_mode = BranchPushMode::Force;
+
+        let target = state.push_target();
+        assert_eq!(target.remote.name.as_ref(), "origin");
+        assert_eq!(
+            target.option,
+            Some(PushOptions {
+                set_upstream: false,
+                push_mode: git::repository::PushMode::Force,
+            })
+        );
     }
 
     #[test]

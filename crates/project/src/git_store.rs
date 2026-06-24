@@ -2476,8 +2476,10 @@ impl GitStore {
             .options
             .as_ref()
             .map(|_| match envelope.payload.options() {
-                proto::push::PushOptions::SetUpstream => git::repository::PushOptions::SetUpstream,
-                proto::push::PushOptions::Force => git::repository::PushOptions::Force,
+                proto::push::PushOptions::SetUpstream => {
+                    git::repository::PushOptions::set_upstream()
+                }
+                proto::push::PushOptions::Force => git::repository::PushOptions::force_with_lease(),
             });
 
         let branch_name = envelope.payload.branch_name.into();
@@ -7260,11 +7262,21 @@ impl Repository {
         let id = self.id;
 
         let args = options
-            .map(|option| match option {
-                PushOptions::SetUpstream => " --set-upstream",
-                PushOptions::Force => " --force-with-lease",
+            .map(|options| {
+                let mut args = Vec::new();
+                if options.set_upstream {
+                    args.push("--set-upstream");
+                }
+                match options.push_mode {
+                    git::repository::PushMode::Normal => {}
+                    git::repository::PushMode::ForceWithLease => args.push("--force-with-lease"),
+                    git::repository::PushMode::Force => args.push("--force"),
+                }
+                args.join(" ")
             })
-            .unwrap_or("");
+            .filter(|args| !args.is_empty())
+            .map(|args| format!(" {args}"))
+            .unwrap_or_default();
 
         let updates_tx = self
             .git_store()
@@ -7340,13 +7352,19 @@ impl Repository {
                                 branch_name: branch.to_string(),
                                 remote_branch_name: remote_branch.to_string(),
                                 remote_name: remote.to_string(),
-                                options: options.map(|options| match options {
-                                    PushOptions::Force => proto::push::PushOptions::Force,
-                                    PushOptions::SetUpstream => {
-                                        proto::push::PushOptions::SetUpstream
+                                options: options.and_then(|options| {
+                                    if options.set_upstream {
+                                        Some(proto::push::PushOptions::SetUpstream as i32)
+                                    } else {
+                                        match options.push_mode {
+                                            git::repository::PushMode::Normal => None,
+                                            git::repository::PushMode::ForceWithLease
+                                            | git::repository::PushMode::Force => {
+                                                Some(proto::push::PushOptions::Force as i32)
+                                            }
+                                        }
                                     }
-                                }
-                                    as i32),
+                                }),
                             })
                             .await?;
 
