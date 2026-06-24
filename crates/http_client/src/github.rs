@@ -45,6 +45,10 @@ impl GitHubRepositoryActivity {
             .iter()
             .map(|issue| GitHubActivityItem {
                 kind: GitHubActivityKind::Issue,
+                source_id: format!(
+                    "github:{}:issue:{}",
+                    self.repository_name_with_owner, issue.number
+                ),
                 repository_name_with_owner: self.repository_name_with_owner.clone(),
                 title: issue.title.clone(),
                 body: issue.body.clone(),
@@ -52,6 +56,9 @@ impl GitHubRepositoryActivity {
                 labels: label_names(&issue.labels),
                 url: issue.html_url.clone(),
                 number: Some(issue.number),
+                state: Some(issue.state.clone()),
+                draft: None,
+                workflow_run_id: None,
                 workflow_status: None,
                 workflow_conclusion: None,
                 workflow_event: None,
@@ -62,6 +69,10 @@ impl GitHubRepositoryActivity {
                     .iter()
                     .map(|pull_request| GitHubActivityItem {
                         kind: GitHubActivityKind::PullRequest,
+                        source_id: format!(
+                            "github:{}:pull_request:{}",
+                            self.repository_name_with_owner, pull_request.number
+                        ),
                         repository_name_with_owner: self.repository_name_with_owner.clone(),
                         title: pull_request.title.clone(),
                         body: pull_request.body.clone(),
@@ -69,6 +80,9 @@ impl GitHubRepositoryActivity {
                         labels: label_names(&pull_request.labels),
                         url: pull_request.html_url.clone(),
                         number: Some(pull_request.number),
+                        state: Some(pull_request.state.clone()),
+                        draft: Some(pull_request.draft),
+                        workflow_run_id: None,
                         workflow_status: None,
                         workflow_conclusion: None,
                         workflow_event: None,
@@ -78,6 +92,10 @@ impl GitHubRepositoryActivity {
             .chain(self.workflow_runs.iter().map(|run| {
                 GitHubActivityItem {
                     kind: GitHubActivityKind::WorkflowRun,
+                    source_id: format!(
+                        "github:{}:workflow_run:{}",
+                        self.repository_name_with_owner, run.id
+                    ),
                     repository_name_with_owner: self.repository_name_with_owner.clone(),
                     title: run
                         .name
@@ -89,6 +107,9 @@ impl GitHubRepositoryActivity {
                     labels: Vec::new(),
                     url: run.html_url.clone(),
                     number: None,
+                    state: None,
+                    draft: None,
+                    workflow_run_id: Some(run.id),
                     workflow_status: run.status.clone(),
                     workflow_conclusion: run.conclusion.clone(),
                     workflow_event: Some(run.event.clone()),
@@ -102,6 +123,7 @@ impl GitHubRepositoryActivity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitHubActivityItem {
     pub kind: GitHubActivityKind,
+    pub source_id: String,
     pub repository_name_with_owner: String,
     pub title: String,
     pub body: Option<String>,
@@ -109,6 +131,9 @@ pub struct GitHubActivityItem {
     pub labels: Vec<String>,
     pub url: String,
     pub number: Option<u64>,
+    pub state: Option<String>,
+    pub draft: Option<bool>,
+    pub workflow_run_id: Option<u64>,
     pub workflow_status: Option<String>,
     pub workflow_conclusion: Option<String>,
     pub workflow_event: Option<String>,
@@ -529,20 +554,27 @@ mod tests {
             let items = activity.to_activity_items();
             assert_eq!(items.len(), 3);
             assert_eq!(items[0].kind, GitHubActivityKind::Issue);
+            assert_eq!(items[0].source_id, "github:owner/repo:issue:1");
             assert_eq!(items[0].repository_name_with_owner, "owner/repo");
             assert_eq!(items[0].title, "Real issue");
             assert_eq!(items[0].body.as_deref(), Some("issue body"));
             assert_eq!(items[0].author_login.as_deref(), Some("octo"));
             assert_eq!(items[0].labels, vec!["bug"]);
             assert_eq!(items[0].number, Some(1));
+            assert_eq!(items[0].state.as_deref(), Some("open"));
             assert_eq!(items[1].kind, GitHubActivityKind::PullRequest);
+            assert_eq!(items[1].source_id, "github:owner/repo:pull_request:7");
             assert_eq!(items[1].title, "Improve graph");
             assert_eq!(items[1].body.as_deref(), Some("pull request body"));
             assert_eq!(items[1].author_login.as_deref(), Some("hubot"));
             assert_eq!(items[1].labels, vec!["enhancement"]);
             assert_eq!(items[1].number, Some(7));
+            assert_eq!(items[1].state.as_deref(), Some("open"));
+            assert_eq!(items[1].draft, Some(true));
             assert_eq!(items[2].kind, GitHubActivityKind::WorkflowRun);
+            assert_eq!(items[2].source_id, "github:owner/repo:workflow_run:42");
             assert_eq!(items[2].title, "CI");
+            assert_eq!(items[2].workflow_run_id, Some(42));
             assert_eq!(items[2].workflow_status.as_deref(), Some("completed"));
             assert_eq!(items[2].workflow_conclusion.as_deref(), Some("success"));
             assert_eq!(items[2].workflow_event.as_deref(), Some("push"));
