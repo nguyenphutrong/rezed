@@ -587,6 +587,12 @@ pub enum ResetMode {
     Hard,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropCommitSupport {
+    pub can_drop: bool,
+    pub reason: Option<SharedString>,
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum FetchOptions {
     All,
@@ -955,6 +961,7 @@ pub trait GitRepository: Send + Sync {
         no_commit: bool,
     ) -> BoxFuture<'_, Result<()>>;
     fn revert_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn drop_commit_support(&self, sha: String) -> BoxFuture<'_, Result<DropCommitSupport>>;
     fn drop_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn merge_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn rebase_onto(&self, sha: String) -> BoxFuture<'_, Result<()>>;
@@ -1271,6 +1278,36 @@ impl RefEdit {
     }
 }
 
+struct DropCommitPreflight {
+    support: DropCommitSupport,
+    parent_sha: Option<String>,
+    is_head: bool,
+}
+
+impl DropCommitPreflight {
+    fn supported(parent_sha: String, is_head: bool) -> Self {
+        Self {
+            support: DropCommitSupport {
+                can_drop: true,
+                reason: None,
+            },
+            parent_sha: Some(parent_sha),
+            is_head,
+        }
+    }
+
+    fn unsupported(reason: impl Into<SharedString>) -> Self {
+        Self {
+            support: DropCommitSupport {
+                can_drop: false,
+                reason: Some(reason.into()),
+            },
+            parent_sha: None,
+            is_head: false,
+        }
+    }
+}
+
 impl RealGitRepository {
     pub fn new(
         dotgit_path: &Path,
@@ -1384,6 +1421,59 @@ impl RealGitRepository {
                 Ok(())
             })
             .boxed()
+    }
+
+    async fn drop_commit_preflight(
+        git_binary: &GitBinary,
+        sha: &str,
+    ) -> Result<DropCommitPreflight> {
+        let commit_line = git_binary
+            .run(&["rev-list", "--parents", "-n", "1", sha])
+            .await?;
+        let mut commit_parts = commit_line.split_whitespace();
+        let _commit_sha = commit_parts
+            .next()
+            .context("failed to parse commit metadata while dropping commit")?;
+        let parent_shas = commit_parts.collect::<Vec<_>>();
+
+        let Some(parent_sha) = parent_shas.first() else {
+            return Ok(DropCommitPreflight::unsupported(
+                "Cannot drop the root commit",
+            ));
+        };
+        if parent_shas.len() > 1 {
+            return Ok(DropCommitPreflight::unsupported(
+                "Cannot drop merge commits",
+            ));
+        }
+
+        let ancestry_output = git_binary
+            .build_command(&["merge-base", "--is-ancestor", sha, "HEAD"])
+            .output()
+            .await?;
+        if !ancestry_output.status.success() {
+            return Ok(DropCommitPreflight::unsupported(
+                "Commit is not on the current branch",
+            ));
+        }
+
+        let head_sha = git_binary.run(&["rev-parse", "HEAD"]).await?;
+        let is_head = sha.trim() == head_sha.trim();
+        if is_head {
+            let status_output = git_binary
+                .run(&["status", "--porcelain=v1", "--untracked-files=no"])
+                .await?;
+            if !status_output.trim().is_empty() {
+                return Ok(DropCommitPreflight::unsupported(
+                    "Cannot drop HEAD while the working tree has uncommitted changes",
+                ));
+            }
+        }
+
+        Ok(DropCommitPreflight::supported(
+            parent_sha.to_string(),
+            is_head,
+        ))
     }
 
     async fn any_git_binary_help_output(&self) -> SharedString {
@@ -2374,54 +2464,44 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn drop_commit_support(&self, sha: String) -> BoxFuture<'_, Result<DropCommitSupport>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                Ok(Self::drop_commit_preflight(&git_binary, &sha)
+                    .await?
+                    .support)
+            })
+            .boxed()
+    }
+
     fn drop_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
         let git_binary = self.git_binary_in_worktree();
 
         self.executor
             .spawn(async move {
                 let git_binary = git_binary?;
-                let commit_line = git_binary
-                    .run(&["rev-list", "--parents", "-n", "1", &sha])
-                    .await?;
-                let mut commit_parts = commit_line.split_whitespace();
-                let _commit_sha = commit_parts
-                    .next()
-                    .context("failed to parse commit metadata while dropping commit")?;
-                let parent_shas = commit_parts.collect::<Vec<_>>();
-
-                if parent_shas.is_empty() {
-                    bail!("Cannot drop the root commit");
-                }
-                if parent_shas.len() > 1 {
-                    bail!("Cannot drop merge commits");
+                let preflight = Self::drop_commit_preflight(&git_binary, &sha).await?;
+                if !preflight.support.can_drop {
+                    let reason = preflight
+                        .support
+                        .reason
+                        .unwrap_or_else(|| "Commit cannot be dropped".into());
+                    bail!("{}", reason.as_ref());
                 }
 
-                let ancestry_output = git_binary
-                    .build_command(&["merge-base", "--is-ancestor", &sha, "HEAD"])
-                    .output()
-                    .await?;
-                if !ancestry_output.status.success() {
-                    bail!("Commit is not on the current branch");
-                }
-
-                let head_sha = git_binary.run(&["rev-parse", "HEAD"]).await?;
-                if sha.trim() == head_sha.trim() {
-                    let status_output = git_binary
-                        .run(&["status", "--porcelain=v1", "--untracked-files=no"])
-                        .await?;
-                    if !status_output.trim().is_empty() {
-                        bail!("Cannot drop HEAD while the working tree has uncommitted changes");
-                    }
-
+                if preflight.is_head {
                     git_binary.run(&["reset", "--hard", "HEAD^"]).await?;
                     return anyhow::Ok(());
                 }
 
-                let parent_sha = parent_shas
-                    .first()
+                let parent_sha = preflight
+                    .parent_sha
                     .context("selected commit does not have a first parent")?;
                 git_binary
-                    .run(&["rebase", "--onto", parent_sha, &sha, "HEAD"])
+                    .run(&["rebase", "--onto", &parent_sha, &sha, "HEAD"])
                     .await?;
                 anyhow::Ok(())
             })
@@ -4213,9 +4293,42 @@ mod tests {
         );
     }
 
+    #[allow(clippy::disallowed_methods)]
+    #[track_caller]
+    fn git_output<I, S>(working_directory: &Path, arguments: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(working_directory)
+            .env("GIT_CONFIG_GLOBAL", "")
+            .env("GIT_CONFIG_SYSTEM", "")
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@zed.dev")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@zed.dev")
+            .output()
+            .expect("failed to run git command");
+        assert!(
+            output.status.success(),
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git output should be utf8")
+    }
+
     fn git_init_repo(path: &Path) {
         fs::create_dir_all(path).expect("failed to create repo directory");
         git_command(path, ["init", "-b", "main"]);
+    }
+
+    fn git_commit_file(path: &Path, file_name: &str, contents: &str, message: &str) -> String {
+        fs::write(path.join(file_name), contents).expect("failed to write commit file");
+        git_command(path, ["add", file_name]);
+        git_command(path, ["commit", "-m", message]);
+        git_output(path, ["rev-parse", "HEAD"]).trim().to_string()
     }
 
     fn test_commit_envs() -> HashMap<String, String> {
@@ -4279,6 +4392,91 @@ mod tests {
         assert!(repository.check_access().await.is_err());
         git_init_repo(repo_dir.path());
         assert!(repository.check_access().await.is_ok());
+    }
+
+    #[gpui::test]
+    async fn test_drop_commit_support_rejects_root_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        let root_sha = git_commit_file(repo_dir.path(), "file.txt", "initial", "initial");
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let support = repository.drop_commit_support(root_sha).await.unwrap();
+
+        assert!(!support.can_drop);
+        assert_eq!(
+            support.reason.as_deref(),
+            Some("Cannot drop the root commit")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_drop_commit_support_rejects_merge_commit(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        git_commit_file(repo_dir.path(), "base.txt", "base", "base");
+        git_command(repo_dir.path(), ["checkout", "-b", "feature"]);
+        git_commit_file(repo_dir.path(), "feature.txt", "feature", "feature");
+        git_command(repo_dir.path(), ["checkout", "main"]);
+        git_commit_file(repo_dir.path(), "main.txt", "main", "main");
+        git_command(
+            repo_dir.path(),
+            ["merge", "--no-ff", "feature", "-m", "merge"],
+        );
+        let merge_sha = git_output(repo_dir.path(), ["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let support = repository.drop_commit_support(merge_sha).await.unwrap();
+
+        assert!(!support.can_drop);
+        assert_eq!(support.reason.as_deref(), Some("Cannot drop merge commits"));
+    }
+
+    #[gpui::test]
+    async fn test_drop_commit_support_rejects_dirty_head(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        git_commit_file(repo_dir.path(), "file.txt", "initial", "initial");
+        let head_sha = git_commit_file(repo_dir.path(), "file.txt", "changed", "changed");
+        fs::write(repo_dir.path().join("file.txt"), "dirty").unwrap();
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let support = repository.drop_commit_support(head_sha).await.unwrap();
+
+        assert!(!support.can_drop);
+        assert_eq!(
+            support.reason.as_deref(),
+            Some("Cannot drop HEAD while the working tree has uncommitted changes")
+        );
     }
 
     #[gpui::test]

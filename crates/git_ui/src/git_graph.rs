@@ -3670,24 +3670,50 @@ impl GitGraph {
             return;
         };
 
-        let confirm = self.prompt_confirmation(
-            PromptLevel::Warning,
-            format!("Drop commit {commit_sha}?"),
-            Some("This rewrites history on the current branch.".into()),
-            "Drop Commit",
-            window,
-            cx,
-        );
-        let operation = cx.spawn(async move |_, cx| {
-            confirm.await?;
-            repository
-                .update(cx, |repository, _| repository.drop_commit(commit_sha))
+        let support_receiver = repository.update(cx, |repository, _| {
+            repository.drop_commit_support(commit_sha.clone())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let drop_support = support_receiver
                 .await
                 .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
-            anyhow::Ok(())
-        });
+            if !drop_support.can_drop {
+                let reason = drop_support
+                    .reason
+                    .unwrap_or_else(|| "Commit cannot be dropped".into());
+                anyhow::bail!("{}", reason.as_ref());
+            }
 
-        self.run_git_operation(operation, "Failed to drop commit", window, cx);
+            let confirm = this.update_in(cx, |this, window, cx| {
+                this.prompt_confirmation(
+                    PromptLevel::Warning,
+                    format!("Drop commit {commit_sha}?"),
+                    Some("This rewrites history on the current branch."),
+                    "Drop Commit",
+                    window,
+                    cx,
+                )
+            })?;
+            confirm.await?;
+
+            this.update_in(cx, |this, window, cx| {
+                let repository = repository.clone();
+                let commit_sha = commit_sha.clone();
+                let operation = cx.spawn(async move |_, cx| {
+                    repository
+                        .update(cx, |repository, _| repository.drop_commit(commit_sha))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+                    anyhow::Ok(())
+                });
+                this.run_git_operation(operation, "Failed to drop commit", window, cx);
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to drop commit", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
     }
 
     fn merge_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
