@@ -43,9 +43,7 @@ use gpui::{
     Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
     point, size, uniform_list,
 };
-use http_client::github::{
-    GitHubIssue, GitHubPullRequest, GitHubRepositoryActivity, GitHubWorkflowRun,
-};
+use http_client::github::{GitHubActivityItem, GitHubActivityKind, GitHubRepositoryActivity};
 use itertools::Itertools;
 use language::{Buffer, File};
 use language_model::{
@@ -5866,19 +5864,7 @@ impl GitPanel {
                                     ),
                                 )
                             } else {
-                                this.child(self.render_github_issues(&activity.issues, cx))
-                                    .child(
-                                        self.render_github_pull_requests(
-                                            &activity.pull_requests,
-                                            cx,
-                                        ),
-                                    )
-                                    .child(
-                                        self.render_github_workflow_runs(
-                                            &activity.workflow_runs,
-                                            cx,
-                                        ),
-                                    )
+                                this.child(self.render_github_activity(activity, cx))
                             }
                         }
                     }),
@@ -5927,117 +5913,89 @@ impl GitPanel {
         }
     }
 
-    fn render_github_issues(&self, issues: &[GitHubIssue], cx: &mut Context<Self>) -> AnyElement {
-        self.render_github_section(
-            "Issues",
-            IconName::ListTodo,
-            issues.iter().map(|issue| GitHubActivityRow {
-                title: format!("#{} {}", issue.number, issue.title).into(),
-                meta: format!(
-                    "{} by {}{}",
-                    issue.state,
-                    issue.user.login,
-                    if issue.labels.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            " · {}",
-                            issue
-                                .labels
-                                .iter()
-                                .map(|label| label.name.as_str())
-                                .join(", ")
-                        )
-                    }
-                )
-                .into(),
-                url: issue.html_url.clone(),
-            }),
-            cx,
-        )
-    }
-
-    fn render_github_pull_requests(
+    fn render_github_activity(
         &self,
-        pull_requests: &[GitHubPullRequest],
+        activity: &GitHubRepositoryActivity,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.render_github_section(
-            "Pull Requests",
-            IconName::PullRequest,
-            pull_requests.iter().map(|pull_request| GitHubActivityRow {
-                title: format!("#{} {}", pull_request.number, pull_request.title).into(),
-                meta: format!(
-                    "{} by {}{}",
-                    if pull_request.draft {
-                        "draft"
-                    } else {
-                        pull_request.state.as_str()
-                    },
-                    pull_request.user.login,
-                    if pull_request.labels.is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            " · {}",
-                            pull_request
-                                .labels
-                                .iter()
-                                .map(|label| label.name.as_str())
-                                .join(", ")
-                        )
-                    }
-                )
-                .into(),
-                url: pull_request.html_url.clone(),
-            }),
+            "Activity",
+            IconName::Github,
+            activity
+                .to_activity_items()
+                .into_iter()
+                .map(|item| Self::github_activity_row(&item)),
             cx,
         )
     }
 
-    fn render_github_workflow_runs(
-        &self,
-        workflow_runs: &[GitHubWorkflowRun],
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        self.render_github_section(
-            "Actions",
-            IconName::PlayOutlined,
-            workflow_runs.iter().map(|run| GitHubActivityRow {
-                title: run
-                    .name
-                    .clone()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "Workflow run".to_string())
-                    .into(),
-                meta: format!(
-                    "{} · {}{}{}{}",
-                    run.conclusion
-                        .as_deref()
-                        .or(run.status.as_deref())
-                        .unwrap_or("unknown"),
-                    run.event,
-                    run.actor
-                        .as_ref()
-                        .map(|actor| format!(" · {}", actor.login))
-                        .unwrap_or_default(),
-                    run.head_branch
-                        .as_ref()
-                        .map(|branch| format!(" · {branch}"))
-                        .unwrap_or_default(),
-                    Self::github_workflow_short_sha(run)
-                        .map(|sha| format!(" · {sha}"))
-                        .unwrap_or_default()
-                )
-                .into(),
-                url: run.html_url.clone(),
-            }),
-            cx,
-        )
+    fn github_activity_row(item: &GitHubActivityItem) -> GitHubActivityRow {
+        let number = item
+            .number
+            .map(|number| format!(" #{number}"))
+            .unwrap_or_default();
+        let labels = if item.labels.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", item.labels.iter().join(", "))
+        };
+        let author = item
+            .author_login
+            .as_ref()
+            .map(|author| format!(" · by {author}"))
+            .unwrap_or_default();
+        let updated_at = item
+            .updated_at
+            .as_ref()
+            .map(|updated_at| format!(" · updated {updated_at}"))
+            .unwrap_or_default();
+
+        let (kind, state) = match item.kind {
+            GitHubActivityKind::Issue => ("Issue", item.state.as_deref().unwrap_or("unknown")),
+            GitHubActivityKind::PullRequest => (
+                "Pull request",
+                if item.draft == Some(true) {
+                    "draft"
+                } else {
+                    item.state.as_deref().unwrap_or("unknown")
+                },
+            ),
+            GitHubActivityKind::WorkflowRun => (
+                "Action",
+                item.workflow_conclusion
+                    .as_deref()
+                    .or(item.workflow_status.as_deref())
+                    .unwrap_or("unknown"),
+            ),
+        };
+
+        let action_details = if item.kind == GitHubActivityKind::WorkflowRun {
+            format!(
+                " · {}{}{}",
+                item.workflow_event.as_deref().unwrap_or("unknown event"),
+                item.workflow_head_branch
+                    .as_ref()
+                    .map(|branch| format!(" · {branch}"))
+                    .unwrap_or_default(),
+                Self::github_activity_short_sha(item)
+                    .map(|sha| format!(" · {sha}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            labels
+        };
+
+        GitHubActivityRow {
+            title: format!("{kind}{number} · {}", item.title).into(),
+            meta: format!("{state}{author}{action_details}{updated_at}").into(),
+            url: item.url.clone(),
+        }
     }
 
-    fn github_workflow_short_sha(run: &GitHubWorkflowRun) -> Option<&str> {
-        run.head_sha.as_deref().map(|sha| &sha[..7.min(sha.len())])
+    fn github_activity_short_sha(item: &GitHubActivityItem) -> Option<&str> {
+        item.workflow_head_sha
+            .as_deref()
+            .map(|sha| &sha[..7.min(sha.len())])
     }
 
     fn render_github_section(
@@ -8319,6 +8277,66 @@ mod tests {
                 .status_entry()
                 .is_some_and(|entry| &entry.repo_path == repo_path)
         })
+    }
+
+    fn github_activity_item(kind: GitHubActivityKind) -> GitHubActivityItem {
+        GitHubActivityItem {
+            kind,
+            source_id: "github:owner/repo:item:1".to_string(),
+            repository_name_with_owner: "owner/repo".to_string(),
+            title: "Activity title".to_string(),
+            body: None,
+            author_login: Some("octo".to_string()),
+            labels: Vec::new(),
+            url: "https://github.com/owner/repo/issues/1".to_string(),
+            number: Some(1),
+            state: Some("open".to_string()),
+            draft: None,
+            updated_at: Some("2026-06-24T10:00:00Z".to_string()),
+            workflow_run_id: None,
+            workflow_status: None,
+            workflow_conclusion: None,
+            workflow_event: None,
+            workflow_head_branch: None,
+            workflow_head_sha: None,
+        }
+    }
+
+    #[test]
+    fn test_github_activity_row_formats_issue_pull_request_and_action() {
+        let mut issue = github_activity_item(GitHubActivityKind::Issue);
+        issue.labels = vec!["bug".to_string(), "regression".to_string()];
+        let issue_row = GitPanel::github_activity_row(&issue);
+        assert_eq!(issue_row.title.as_ref(), "Issue #1 · Activity title");
+        assert_eq!(
+            issue_row.meta.as_ref(),
+            "open · by octo · bug, regression · updated 2026-06-24T10:00:00Z"
+        );
+
+        let mut pull_request = github_activity_item(GitHubActivityKind::PullRequest);
+        pull_request.draft = Some(true);
+        let pull_request_row = GitPanel::github_activity_row(&pull_request);
+        assert_eq!(
+            pull_request_row.title.as_ref(),
+            "Pull request #1 · Activity title"
+        );
+        assert_eq!(
+            pull_request_row.meta.as_ref(),
+            "draft · by octo · updated 2026-06-24T10:00:00Z"
+        );
+
+        let mut workflow_run = github_activity_item(GitHubActivityKind::WorkflowRun);
+        workflow_run.number = None;
+        workflow_run.workflow_conclusion = Some("success".to_string());
+        workflow_run.workflow_event = Some("push".to_string());
+        workflow_run.workflow_head_branch = Some("main".to_string());
+        workflow_run.workflow_head_sha = Some("1234567890abcdef".to_string());
+        let workflow_run_row = GitPanel::github_activity_row(&workflow_run);
+        assert_eq!(workflow_run_row.title.as_ref(), "Action · Activity title");
+        assert_eq!(
+            workflow_run_row.meta.as_ref(),
+            "success · by octo · push · main · 1234567 · updated 2026-06-24T10:00:00Z"
+        );
     }
 
     async fn await_git_panel_entries(panel: &Entity<GitPanel>, cx: &mut VisualTestContext) {
