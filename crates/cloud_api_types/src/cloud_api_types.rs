@@ -99,6 +99,11 @@ pub struct GitHubIntegrationStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubOAuthAuthorizeUrlResponse {
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubActivitySyncBatch {
     pub repository_name_with_owner: String,
     pub items: Vec<GitHubActivityItem>,
@@ -350,6 +355,7 @@ mod tests {
     use super::{
         GITHUB_REQUIRED_OAUTH_SCOPES, GitHubActivityItem, GitHubActivityKind,
         GitHubActivitySyncBatch, GitHubConnectedAccount, GitHubInboxItem, GitHubInboxItemsResponse,
+        GitHubOAuthAuthorizeUrlResponse,
     };
 
     #[test]
@@ -391,6 +397,25 @@ mod tests {
     #[test]
     fn github_required_oauth_scopes_match_integration_contract() {
         assert_eq!(GITHUB_REQUIRED_OAUTH_SCOPES, &["repo", "read:user"]);
+    }
+
+    #[test]
+    fn github_oauth_authorize_url_response_serializes_url() {
+        let response = GitHubOAuthAuthorizeUrlResponse {
+            url: "https://github.com/login/oauth/authorize?client_id=rezed".to_string(),
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "url": "https://github.com/login/oauth/authorize?client_id=rezed"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<GitHubOAuthAuthorizeUrlResponse>(json).unwrap(),
+            response
+        );
     }
 
     #[test]

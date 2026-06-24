@@ -58,6 +58,7 @@ use util::{ConnectionResult, ResultExt};
 pub use cloud_api_types::{
     GitHubActivityItem, GitHubActivityKind, GitHubActivitySyncBatch, GitHubConnectedAccount,
     GitHubInboxItem, GitHubInboxItemsResponse, GitHubIntegrationStatus,
+    GitHubOAuthAuthorizeUrlResponse,
 };
 pub use llm_token::*;
 pub use rpc::*;
@@ -635,6 +636,22 @@ impl Client {
             .exchange_github_oauth_code(code, redirect_uri)
             .await
             .context("failed to exchange GitHub OAuth code")
+    }
+
+    pub async fn fetch_github_oauth_authorize_url(
+        &self,
+        redirect_uri: String,
+        state: Option<String>,
+        cx: &AsyncApp,
+    ) -> Result<GitHubOAuthAuthorizeUrlResponse> {
+        self.github_api_credentials(cx)
+            .await?
+            .context("missing credentials for GitHub OAuth authorize URL")?;
+
+        self.cloud_client
+            .fetch_github_oauth_authorize_url(redirect_uri, state)
+            .await
+            .context("failed to fetch GitHub OAuth authorize URL")
     }
 
     pub async fn fetch_github_integration_status(
@@ -2582,6 +2599,65 @@ mod tests {
             "https://rezed.dev/oauth/github/callback"
         );
         assert_eq!(status.login, "octo");
+    }
+
+    #[gpui::test]
+    async fn test_fetch_github_oauth_authorize_url(cx: &mut TestAppContext) {
+        init_test(cx);
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(
+                request.uri().path(),
+                "/client/integrations/github/oauth/authorize_url"
+            );
+            assert_eq!(
+                request.uri().query(),
+                Some(
+                    "redirect_uri=https%3A%2F%2Frezed.dev%2Foauth%2Fgithub%2Fcallback&state=csrf-token"
+                )
+            );
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("42 rezed-token")
+            );
+
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(
+                    serde_json::json!({
+                        "url": "https://github.com/login/oauth/authorize?client_id=rezed"
+                    })
+                    .to_string()
+                    .into(),
+                )
+                .unwrap())
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+
+        let response = client
+            .fetch_github_oauth_authorize_url(
+                "https://rezed.dev/oauth/github/callback".to_string(),
+                Some("csrf-token".to_string()),
+                &cx.to_async(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(
+            response.url,
+            "https://github.com/login/oauth/authorize?client_id=rezed"
+        );
     }
 
     #[gpui::test]

@@ -178,6 +178,28 @@ impl CloudApiClient {
         self.send_authenticated_json_request(request).await
     }
 
+    pub async fn fetch_github_oauth_authorize_url(
+        &self,
+        redirect_uri: String,
+        state: Option<String>,
+    ) -> Result<GitHubOAuthAuthorizeUrlResponse, ClientApiError> {
+        let mut url = self
+            .http_client
+            .build_zed_cloud_url("/client/integrations/github/oauth/authorize_url")
+            .map_err(ClientApiError::RequestBuildFailed)?;
+        {
+            let mut query_pairs = url.query_pairs_mut();
+            query_pairs.append_pair("redirect_uri", &redirect_uri);
+            if let Some(state) = state.as_deref() {
+                query_pairs.append_pair("state", state);
+            }
+        }
+        let request_builder = Request::builder().method(Method::GET).uri(url.as_ref());
+
+        let request = self.build_request(request_builder, AsyncBody::default())?;
+        self.send_authenticated_json_request(request).await
+    }
+
     pub async fn fetch_github_integration_status(
         &self,
     ) -> Result<Option<GitHubIntegrationStatus>, ClientApiError> {
@@ -681,6 +703,58 @@ mod tests {
             );
             assert_eq!(status.login, "octo");
             assert_eq!(status.scopes, vec!["repo", "read:user"]);
+        });
+    }
+
+    #[test]
+    fn test_fetch_github_oauth_authorize_url() {
+        futures::executor::block_on(async {
+            let http_client = FakeHttpClient::create(|request| async move {
+                assert_eq!(request.method(), Method::GET);
+                assert_eq!(
+                    request.uri().path(),
+                    "/client/integrations/github/oauth/authorize_url"
+                );
+                assert_eq!(
+                    request.uri().query(),
+                    Some(
+                        "redirect_uri=https%3A%2F%2Frezed.dev%2Foauth%2Fgithub%2Fcallback&state=csrf-token"
+                    )
+                );
+                assert_eq!(
+                    request
+                        .headers()
+                        .get("Authorization")
+                        .and_then(|header| header.to_str().ok()),
+                    Some("42 rezed-token")
+                );
+
+                Ok(Response::builder()
+                    .status(200)
+                    .body(
+                        serde_json::json!({
+                            "url": "https://github.com/login/oauth/authorize?client_id=rezed"
+                        })
+                        .to_string()
+                        .into(),
+                    )
+                    .unwrap())
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            let response = client
+                .fetch_github_oauth_authorize_url(
+                    "https://rezed.dev/oauth/github/callback".to_string(),
+                    Some("csrf-token".to_string()),
+                )
+                .await
+                .expect("request should succeed");
+
+            assert_eq!(
+                response.url,
+                "https://github.com/login/oauth/authorize?client_id=rezed"
+            );
         });
     }
 

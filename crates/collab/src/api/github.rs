@@ -4,7 +4,9 @@ use axum::{
     Extension, Json, Router, extract::Query, http::StatusCode, middleware, response::IntoResponse,
     routing::get,
 };
-use cloud_api_types::{GitHubActivitySyncBatch, GitHubConnectedAccount};
+use cloud_api_types::{
+    GITHUB_REQUIRED_OAUTH_SCOPES, GitHubActivitySyncBatch, GitHubConnectedAccount,
+};
 use http_client::github::{
     GitHubIssue, GitHubLabel, GitHubPullRequest, GitHubRepositoryActivity, GitHubUser,
     GitHubWorkflowRun,
@@ -25,6 +27,10 @@ pub fn router() -> Router {
         .route(
             "/client/integrations/github/oauth",
             axum::routing::post(exchange_oauth_code),
+        )
+        .route(
+            "/client/integrations/github/oauth/authorize_url",
+            get(github_oauth_authorize_url),
         )
         .route(
             "/client/integrations/github/activity",
@@ -159,6 +165,31 @@ async fn exchange_oauth_code(
     Ok(Json(status))
 }
 
+async fn github_oauth_authorize_url(
+    Extension(app): Extension<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<GitHubOAuthAuthorizeUrlQuery>,
+) -> Result<Json<cloud_api_types::GitHubOAuthAuthorizeUrlResponse>> {
+    let Principal::User(_) = principal;
+    let client_id = app
+        .config
+        .github_oauth_client_id
+        .as_deref()
+        .ok_or_else(|| {
+            Error::http(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "GitHub OAuth is not configured".into(),
+            )
+        })?;
+
+    let url =
+        build_github_oauth_authorize_url(client_id, &query.redirect_uri, query.state.as_deref())?;
+
+    Ok(Json(cloud_api_types::GitHubOAuthAuthorizeUrlResponse {
+        url: url.to_string(),
+    }))
+}
+
 async fn sync_repository_activity(
     Extension(app): Extension<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
@@ -216,6 +247,12 @@ struct SetGitHubIntegrationRequest {
 struct ExchangeGitHubOAuthCodeRequest {
     code: String,
     redirect_uri: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubOAuthAuthorizeUrlQuery {
+    redirect_uri: String,
+    state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -369,6 +406,26 @@ fn parse_github_oauth_scopes(scopes: &str) -> Vec<String> {
         .collect()
 }
 
+fn build_github_oauth_authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: Option<&str>,
+) -> anyhow::Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse("https://github.com/login/oauth/authorize")
+        .context("invalid GitHub OAuth authorize URL")?;
+    {
+        let mut query_pairs = url.query_pairs_mut();
+        query_pairs
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", &GITHUB_REQUIRED_OAUTH_SCOPES.join(" "));
+        if let Some(state) = state {
+            query_pairs.append_pair("state", state);
+        }
+    }
+    Ok(url)
+}
+
 async fn fetch_github_repository_activity(
     http_client: &reqwest::Client,
     repository_name_with_owner: &str,
@@ -493,4 +550,37 @@ fn github_next_link(link_header: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_oauth_authorize_url_uses_required_scopes() {
+        let url = build_github_oauth_authorize_url(
+            "rezed-client",
+            "https://rezed.dev/oauth/github/callback",
+            Some("csrf-token"),
+        )
+        .unwrap();
+        let query = url.query().unwrap();
+
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            "https://github.com/login/oauth/authorize"
+        );
+        assert!(query.contains("client_id=rezed-client"));
+        assert!(query.contains("redirect_uri=https%3A%2F%2Frezed.dev%2Foauth%2Fgithub%2Fcallback"));
+        assert!(query.contains("scope=repo+read%3Auser"));
+        assert!(query.contains("state=csrf-token"));
+    }
+
+    #[test]
+    fn github_oauth_scope_parser_accepts_space_and_comma_delimiters() {
+        assert_eq!(
+            parse_github_oauth_scopes("repo, read:user workflow"),
+            vec!["repo", "read:user", "workflow"]
+        );
+    }
 }
