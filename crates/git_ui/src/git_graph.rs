@@ -19,7 +19,7 @@ use git::{
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, ClickEvent, ClipboardItem, DefiniteLength,
     DismissEvent, DragMoveEvent, ElementId, Empty, Entity, EventEmitter, FocusHandle, Focusable,
-    Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, ScrollStrategy,
+    Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point, PromptLevel, ScrollStrategy,
     ScrollWheelEvent, SharedString, Subscription, Task, TextStyleRefinement,
     UniformListScrollHandle, WeakEntity, Window, actions, anchored, deferred, point, prelude::*,
     px, uniform_list,
@@ -700,6 +700,16 @@ actions!(
         AddTag,
         /// Creates a branch at the selected commit.
         CreateBranchAtCommit,
+        /// Checks out the selected commit in detached HEAD state.
+        CheckoutCommit,
+        /// Cherry-picks the selected commit onto the current branch.
+        CherryPickCommit,
+        /// Reverts the selected commit.
+        RevertCommit,
+        /// Merges the selected commit into the current branch.
+        MergeCommit,
+        /// Rebases the current branch onto the selected commit.
+        RebaseOntoCommit,
         /// Focuses the next git graph tab stop.
         FocusNextTabStop,
         /// Focuses the previous git graph tab stop.
@@ -2829,6 +2839,33 @@ impl GitGraph {
             .or(self.selected_entry_idx)
     }
 
+    fn context_menu_commit_sha(&self) -> Option<String> {
+        let index = self.context_menu_entry_index()?;
+        self.graph_data
+            .commits
+            .get(index)
+            .map(|commit| commit.data.sha.to_string())
+    }
+
+    fn prompt_confirmation(
+        &self,
+        level: PromptLevel,
+        message: String,
+        detail: Option<&str>,
+        confirm_label: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let prompt = window.prompt(level, &message, detail, &[confirm_label, "Cancel"], cx);
+        cx.background_spawn(async move {
+            if prompt.await == Ok(0) {
+                anyhow::Ok(())
+            } else {
+                anyhow::bail!("Operation was canceled")
+            }
+        })
+    }
+
     fn show_add_tag_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.context_menu_entry_index() else {
             return;
@@ -2889,6 +2926,137 @@ impl GitGraph {
         });
 
         self.run_git_operation(operation, "Failed to delete tag", window, cx);
+    }
+
+    fn checkout_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(commit_sha) = self.context_menu_commit_sha() else {
+            return;
+        };
+
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            format!("Checkout {commit_sha} in detached HEAD state?"),
+            Some("This will detach HEAD at the selected commit.".into()),
+            "Checkout",
+            window,
+            cx,
+        );
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, _| repository.checkout_commit(commit_sha))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.run_git_operation(operation, "Failed to checkout commit", window, cx);
+    }
+
+    fn cherry_pick_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(commit_sha) = self.context_menu_commit_sha() else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let graph = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                CherryPickModal::new(graph, repository, commit_sha.into(), window, cx)
+            });
+        });
+    }
+
+    fn revert_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(commit_sha) = self.context_menu_commit_sha() else {
+            return;
+        };
+
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            format!("Revert commit {commit_sha}?"),
+            None,
+            "Revert",
+            window,
+            cx,
+        );
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, _| repository.revert_commit(commit_sha))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.run_git_operation(operation, "Failed to revert commit", window, cx);
+    }
+
+    fn merge_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(commit_sha) = self.context_menu_commit_sha() else {
+            return;
+        };
+
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            format!("Merge commit {commit_sha} into the current branch?"),
+            None,
+            "Merge",
+            window,
+            cx,
+        );
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, _| repository.merge_commit(commit_sha))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.run_git_operation(operation, "Failed to merge commit", window, cx);
+    }
+
+    fn rebase_context_menu_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repository) = self.get_repository(cx) else {
+            return;
+        };
+        let Some(commit_sha) = self.context_menu_commit_sha() else {
+            return;
+        };
+
+        let confirm = self.prompt_confirmation(
+            PromptLevel::Warning,
+            format!("Rebase the current branch onto {commit_sha}?"),
+            None,
+            "Rebase",
+            window,
+            cx,
+        );
+        let operation = cx.spawn(async move |_, cx| {
+            confirm.await?;
+            repository
+                .update(cx, |repository, _| repository.rebase_onto(commit_sha))
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.run_git_operation(operation, "Failed to rebase current branch", window, cx);
     }
 
     fn deploy_entry_context_menu(
@@ -2997,6 +3165,15 @@ impl GitGraph {
                     menu.separator()
                         .action("Add Tag...", AddTag.boxed_clone())
                         .action("Create Branch...", CreateBranchAtCommit.boxed_clone())
+                        .separator()
+                        .action("Checkout...", CheckoutCommit.boxed_clone())
+                        .action("Cherry Pick...", CherryPickCommit.boxed_clone())
+                        .action("Revert...", RevertCommit.boxed_clone())
+                        .action("Merge into current branch...", MergeCommit.boxed_clone())
+                        .action(
+                            "Rebase current branch on this Commit...",
+                            RebaseOntoCommit.boxed_clone(),
+                        )
                 })
                 .when(is_tag_ref, |menu| {
                     let tag_name = ref_name.clone().expect("tag ref should be present");
@@ -4394,6 +4571,125 @@ impl Render for CreateBranchAtCommitModal {
     }
 }
 
+struct CherryPickModal {
+    graph: WeakEntity<GitGraph>,
+    repository: Entity<Repository>,
+    commit_sha: SharedString,
+    record_origin: bool,
+    no_commit: bool,
+    focus_handle: FocusHandle,
+}
+
+impl CherryPickModal {
+    fn new(
+        graph: WeakEntity<GitGraph>,
+        repository: Entity<Repository>,
+        commit_sha: SharedString,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            graph,
+            repository,
+            commit_sha,
+            record_origin: false,
+            no_commit: false,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let repository = self.repository.clone();
+        let commit_sha = self.commit_sha.to_string();
+        let record_origin = self.record_origin;
+        let no_commit = self.no_commit;
+        let operation = cx.spawn(async move |_, cx| {
+            repository
+                .update(cx, |repository, _| {
+                    repository.cherry_pick(commit_sha, record_origin, no_commit)
+                })
+                .await
+                .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
+            anyhow::Ok(())
+        });
+
+        self.graph
+            .update(cx, |graph, cx| {
+                graph.run_git_operation(operation, "Failed to cherry-pick commit", window, cx);
+            })
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for CherryPickModal {}
+impl ModalView for CherryPickModal {}
+impl Focusable for CherryPickModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for CherryPickModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("CherryPickModal")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm))
+            .elevation_2(cx)
+            .w(rems(34.))
+            .child(
+                h_flex()
+                    .px_3()
+                    .pt_2()
+                    .pb_1()
+                    .w_full()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::GitCommit).size(IconSize::XSmall))
+                    .child(
+                        Headline::new(format!("Cherry Pick {}", self.commit_sha))
+                            .size(HeadlineSize::XSmall),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .px_3()
+                    .pb_3()
+                    .gap_2()
+                    .w_full()
+                    .track_focus(&self.focus_handle)
+                    .child(
+                        Checkbox::new("cherry-pick-record-origin", self.record_origin.into())
+                            .label("Record origin (-x)")
+                            .on_click(cx.listener(|this, state, _window, cx| {
+                                this.record_origin = matches!(state, ToggleState::Selected);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Checkbox::new("cherry-pick-no-commit", self.no_commit.into())
+                            .label("Apply without committing")
+                            .on_click(cx.listener(|this, state, _window, cx| {
+                                this.no_commit = matches!(state, ToggleState::Selected);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("cherry-pick-confirm", "Cherry Pick")
+                            .style(ButtonStyle::Filled)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&menu::Confirm, window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
 struct AddTagModal {
     graph: WeakEntity<GitGraph>,
     repository: Entity<Repository>,
@@ -4850,6 +5146,21 @@ impl Render for GitGraph {
             }))
             .on_action(cx.listener(|this, _: &CreateBranchAtCommit, window, cx| {
                 this.show_create_branch_modal(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CheckoutCommit, window, cx| {
+                this.checkout_context_menu_commit(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CherryPickCommit, window, cx| {
+                this.cherry_pick_context_menu_commit(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RevertCommit, window, cx| {
+                this.revert_context_menu_commit(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MergeCommit, window, cx| {
+                this.merge_context_menu_commit(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RebaseOntoCommit, window, cx| {
+                this.rebase_context_menu_commit(window, cx);
             }))
             .on_action(cx.listener(Self::focus_next_tab_stop))
             .on_action(cx.listener(Self::focus_previous_tab_stop))

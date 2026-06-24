@@ -933,6 +933,31 @@ impl GitRepository for FakeGitRepository {
         future::ready(Ok(())).boxed()
     }
 
+    fn checkout_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
+        future::ready(Ok(())).boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        _sha: String,
+        _record_origin: bool,
+        _no_commit: bool,
+    ) -> BoxFuture<'_, Result<()>> {
+        future::ready(Ok(())).boxed()
+    }
+
+    fn revert_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
+        future::ready(Ok(())).boxed()
+    }
+
+    fn merge_commit(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
+        future::ready(Ok(())).boxed()
+    }
+
+    fn rebase_onto(&self, _sha: String) -> BoxFuture<'_, Result<()>> {
+        future::ready(Ok(())).boxed()
+    }
+
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
             if !state.branches.remove(&branch) {

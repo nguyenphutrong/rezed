@@ -945,6 +945,16 @@ pub trait GitRepository: Send + Sync {
         name: String,
         message: Option<String>,
     ) -> BoxFuture<'_, Result<()>>;
+    fn checkout_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn cherry_pick(
+        &self,
+        sha: String,
+        record_origin: bool,
+        no_commit: bool,
+    ) -> BoxFuture<'_, Result<()>>;
+    fn revert_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn merge_commit(&self, sha: String) -> BoxFuture<'_, Result<()>>;
+    fn rebase_onto(&self, sha: String) -> BoxFuture<'_, Result<()>>;
     fn rename_branch(&self, branch: String, new_name: String) -> BoxFuture<'_, Result<()>>;
 
     fn delete_branch(
@@ -2298,6 +2308,87 @@ impl GitRepository for RealGitRepository {
                 } else {
                     git_binary.run(&["tag", &name, &sha]).await?;
                 }
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn checkout_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["checkout", "--detach", &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn cherry_pick(
+        &self,
+        sha: String,
+        record_origin: bool,
+        no_commit: bool,
+    ) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                let commit_line = git_binary
+                    .run(&["rev-list", "--parents", "-n", "1", &sha])
+                    .await?;
+                let parent_count = commit_line.split_whitespace().count().saturating_sub(1);
+
+                let mut args = vec!["cherry-pick"];
+                if parent_count > 1 {
+                    args.extend_from_slice(&["-m", "1"]);
+                }
+                if record_origin {
+                    args.push("-x");
+                }
+                if no_commit {
+                    args.push("--no-commit");
+                }
+                args.push(&sha);
+                git_binary.run(&args).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn revert_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["revert", "--no-edit", &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn merge_commit(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["merge", &sha]).await?;
+                anyhow::Ok(())
+            })
+            .boxed()
+    }
+
+    fn rebase_onto(&self, sha: String) -> BoxFuture<'_, Result<()>> {
+        let git_binary = self.git_binary_in_worktree();
+
+        self.executor
+            .spawn(async move {
+                let git_binary = git_binary?;
+                git_binary.run(&["rebase", &sha]).await?;
                 anyhow::Ok(())
             })
             .boxed()

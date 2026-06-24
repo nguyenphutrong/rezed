@@ -5752,6 +5752,120 @@ impl Repository {
         })
     }
 
+    pub fn checkout_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job(
+            "checkout_commit",
+            None,
+            move |git_repo, mut cx| async move {
+                let result = match git_repo {
+                    RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                        backend.checkout_commit(sha).await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("checking out a commit is only supported locally")
+                    }
+                };
+                if result.is_ok() {
+                    this.update(&mut cx, |_this, cx| {
+                        cx.emit(RepositoryEvent::HeadChanged);
+                    })
+                    .ok();
+                }
+                result
+            },
+        )
+    }
+
+    pub fn cherry_pick(
+        &mut self,
+        sha: String,
+        record_origin: bool,
+        no_commit: bool,
+    ) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job("cherry_pick", None, move |git_repo, mut cx| async move {
+            let result = match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.cherry_pick(sha, record_origin, no_commit).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("cherry-picking a commit is only supported locally")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |_this, cx| {
+                    cx.emit(RepositoryEvent::HeadChanged);
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn revert_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job("revert_commit", None, move |git_repo, mut cx| async move {
+            let result = match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.revert_commit(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("reverting a commit is only supported locally")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |_this, cx| {
+                    cx.emit(RepositoryEvent::HeadChanged);
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn merge_commit(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job("merge_commit", None, move |git_repo, mut cx| async move {
+            let result = match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.merge_commit(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("merging a commit is only supported locally")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |_this, cx| {
+                    cx.emit(RepositoryEvent::HeadChanged);
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    pub fn rebase_onto(&mut self, sha: String) -> oneshot::Receiver<Result<()>> {
+        let this = self.this.clone();
+        self.send_job("rebase_onto", None, move |git_repo, mut cx| async move {
+            let result = match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.rebase_onto(sha).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("rebasing onto a commit is only supported locally")
+                }
+            };
+            if result.is_ok() {
+                this.update(&mut cx, |_this, cx| {
+                    cx.emit(RepositoryEvent::HeadChanged);
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
     pub fn get_graph_data(
         &self,
         log_source: LogSource,
