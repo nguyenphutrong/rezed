@@ -37,9 +37,10 @@ use git::{
 };
 use gpui::{
     AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, DismissEvent,
-    Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent,
-    Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle,
-    UniformListScrollHandle, WeakEntity, actions, anchored, deferred, point, size, uniform_list,
+    Empty, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, KeyContext,
+    MouseButton, MouseDownEvent, Point, PromptLevel, ScrollHandle, ScrollStrategy, Subscription,
+    Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
+    point, size, uniform_list,
 };
 use http_client::github::{
     GitHubIssue, GitHubPullRequest, GitHubRepositoryActivity, GitHubWorkflowRun,
@@ -766,6 +767,7 @@ pub struct GitPanel {
     github_activity: GitHubActivityState,
     github_activity_repo: Option<SharedString>,
     github_activity_task: Option<Task<()>>,
+    github_activity_scroll_handle: ScrollHandle,
     _repo_subscriptions: Vec<Subscription>,
 
     _settings_subscription: Subscription,
@@ -999,6 +1001,7 @@ impl GitPanel {
                 github_activity: GitHubActivityState::Idle,
                 github_activity_repo: None,
                 github_activity_task: None,
+                github_activity_scroll_handle: ScrollHandle::new(),
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
                 git_access: GitAccess::Yes,
@@ -5718,11 +5721,13 @@ impl GitPanel {
         std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token)
     }
 
-    fn render_github_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_github_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("github-activity-tab")
             .flex_1()
             .size_full()
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.github_activity_scroll_handle)
             .child(v_flex().min_h_full().p_2().gap_2().map(|this| {
                 match &self.github_activity {
                     GitHubActivityState::Idle | GitHubActivityState::Loading => this.child(
@@ -5773,6 +5778,7 @@ impl GitPanel {
                     }
                 }
             }))
+            .vertical_scrollbar_for(&self.github_activity_scroll_handle, window, cx)
     }
 
     fn render_github_issues(&self, issues: &[GitHubIssue], cx: &mut Context<Self>) -> AnyElement {
@@ -7385,7 +7391,7 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
-                        GitPanelTab::GitHub => this.child(self.render_github_tab(cx)),
+                        GitPanelTab::GitHub => this.child(self.render_github_tab(window, cx)),
                     })
                     .into_any_element(),
             )
