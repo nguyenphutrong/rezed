@@ -64,6 +64,18 @@ impl GitHubConnectedAccount {
             .filter(|required_scope| !self.scopes.iter().any(|scope| scope == required_scope))
             .collect()
     }
+
+    pub fn to_status(&self) -> GitHubIntegrationStatus {
+        GitHubIntegrationStatus {
+            login: self.login.clone(),
+            scopes: self.scopes.clone(),
+            missing_scopes: self
+                .missing_required_scopes()
+                .into_iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
 }
 
 impl std::fmt::Debug for GitHubConnectedAccount {
@@ -75,6 +87,15 @@ impl std::fmt::Debug for GitHubConnectedAccount {
             .field("access_token", &"<redacted>")
             .finish()
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitHubIntegrationStatus {
+    pub login: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub missing_scopes: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -324,6 +345,31 @@ mod tests {
     #[test]
     fn github_required_oauth_scopes_match_integration_contract() {
         assert_eq!(GITHUB_REQUIRED_OAUTH_SCOPES, &["repo", "read:user"]);
+    }
+
+    #[test]
+    fn github_connected_account_status_excludes_token() {
+        let account = GitHubConnectedAccount {
+            login: "octo".to_string(),
+            scopes: vec!["read:user".to_string()],
+            access_token: "github-secret-token".to_string(),
+        };
+
+        let status = account.to_status();
+        assert_eq!(status.login, "octo");
+        assert_eq!(status.scopes, vec!["read:user"]);
+        assert_eq!(status.missing_scopes, vec!["repo"]);
+
+        let json = serde_json::to_value(&status).expect("status should serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "login": "octo",
+                "scopes": ["read:user"],
+                "missing_scopes": ["repo"]
+            })
+        );
+        assert!(!json.to_string().contains("github-secret-token"));
     }
 
     #[test]
