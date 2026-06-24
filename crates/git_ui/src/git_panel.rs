@@ -13,6 +13,7 @@ use crate::{
 use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::Context as _;
 use askpass::AskPassDelegate;
+use client::GitHubConnectedAccount;
 use collections::{BTreeMap, HashMap, HashSet};
 use db::kvp::KeyValueStore;
 use editor::{Editor, EditorElement, EditorMode, MultiBuffer, MultiBufferOffset, SizingBehavior};
@@ -353,10 +354,22 @@ enum GitHubActivityState {
     UnsupportedRemote,
 }
 
+#[derive(Clone, Debug)]
+enum GitHubConnectionState {
+    Unknown,
+    Connected(GitHubConnectedAccount),
+    Disconnected,
+}
+
 struct GitHubActivityRow {
     title: SharedString,
     meta: SharedString,
     url: String,
+}
+
+struct GitHubTokenSync {
+    token: Option<String>,
+    connection: GitHubConnectionState,
 }
 
 fn non_empty_token(token: String) -> Option<String> {
@@ -765,6 +778,7 @@ pub struct GitPanel {
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
     github_activity: GitHubActivityState,
+    github_connection: GitHubConnectionState,
     github_activity_repo: Option<SharedString>,
     github_activity_task: Option<Task<()>>,
     github_activity_scroll_handle: ScrollHandle,
@@ -999,6 +1013,7 @@ impl GitPanel {
                 focused_history_entry: None,
                 history_keyboard_nav: false,
                 github_activity: GitHubActivityState::Idle,
+                github_connection: GitHubConnectionState::Unknown,
                 github_activity_repo: None,
                 github_activity_task: None,
                 github_activity_scroll_handle: ScrollHandle::new(),
@@ -5639,6 +5654,7 @@ impl GitPanel {
     fn load_github_activity(&mut self, cx: &mut Context<Self>) {
         let Some(remote) = self.git_remote(cx) else {
             self.github_activity = GitHubActivityState::Error("No remote configured".into());
+            self.github_connection = GitHubConnectionState::Unknown;
             self.github_activity_repo = None;
             self.github_activity_task = None;
             return;
@@ -5646,6 +5662,7 @@ impl GitPanel {
 
         if remote.host.name() != "GitHub" {
             self.github_activity = GitHubActivityState::UnsupportedRemote;
+            self.github_connection = GitHubConnectionState::Unknown;
             self.github_activity_repo = None;
             self.github_activity_task = None;
             return;
@@ -5662,12 +5679,14 @@ impl GitPanel {
         }
 
         self.github_activity = GitHubActivityState::Loading;
+        self.github_connection = GitHubConnectionState::Unknown;
         self.github_activity_repo = Some(repo_name.clone());
         let http_client = cx.http_client();
         let repo_name_string = repo_name.to_string();
 
         self.github_activity_task = Some(cx.spawn(async move |this, cx| {
-            let token = Self::github_token(cx).await;
+            let token_sync = Self::github_token(cx).await;
+            let token = token_sync.token;
             let activity = http_client::github::repository_activity(
                 &repo_name_string,
                 token.as_deref(),
@@ -5676,6 +5695,7 @@ impl GitPanel {
             .await;
 
             this.update(cx, |this, cx| {
+                this.github_connection = token_sync.connection;
                 match activity {
                     Ok(activity) => {
                         this.github_activity = GitHubActivityState::Loaded(activity);
@@ -5693,11 +5713,12 @@ impl GitPanel {
         cx.notify();
     }
 
-    async fn github_token(cx: &mut AsyncApp) -> Option<String> {
+    async fn github_token(cx: &mut AsyncApp) -> GitHubTokenSync {
         let client = cx.update(|cx| client::Client::global(cx));
         match client.fetch_github_connected_account(cx).await {
             Ok(Some(account)) => {
-                if let Some(token) = non_empty_token(account.access_token) {
+                let token = non_empty_token(account.access_token.clone());
+                if let Some(token) = token.as_ref() {
                     cx.update(|cx| {
                         cx.write_credentials(
                             GITHUB_TOKEN_KEYCHAIN_KEY,
@@ -5708,15 +5729,21 @@ impl GitPanel {
                     .await
                     .log_err();
                     telemetry::event!("GitHub Token Synced");
-                    return Some(token);
                 }
+                return GitHubTokenSync {
+                    token,
+                    connection: GitHubConnectionState::Connected(account),
+                };
             }
             Ok(None) => {
                 cx.update(|cx| cx.delete_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
                     .await
                     .log_err();
                 telemetry::event!("GitHub Integration Disconnected");
-                return None;
+                return GitHubTokenSync {
+                    token: None,
+                    connection: GitHubConnectionState::Disconnected,
+                };
             }
             Err(error) => {
                 log::debug!("failed to sync GitHub integration from Rezed: {error:?}");
@@ -5732,10 +5759,16 @@ impl GitPanel {
             .and_then(non_empty_token);
 
         if keychain_token.is_some() {
-            return keychain_token;
+            return GitHubTokenSync {
+                token: keychain_token,
+                connection: GitHubConnectionState::Unknown,
+            };
         }
 
-        std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token)
+        GitHubTokenSync {
+            token: std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token),
+            connection: GitHubConnectionState::Unknown,
+        }
     }
 
     fn render_github_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -5745,57 +5778,102 @@ impl GitPanel {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.github_activity_scroll_handle)
-            .child(v_flex().min_h_full().p_2().gap_2().map(|this| {
-                match &self.github_activity {
-                    GitHubActivityState::Idle | GitHubActivityState::Loading => this.child(
-                        h_flex()
-                            .flex_1()
-                            .justify_center()
-                            .child(Label::new("Loading GitHub activity…").color(Color::Muted)),
-                    ),
-                    GitHubActivityState::UnsupportedRemote => this.child(
-                        h_flex().flex_1().justify_center().child(
-                            Label::new("GitHub activity is only available for GitHub remotes")
-                                .color(Color::Muted),
+            .child(
+                v_flex()
+                    .min_h_full()
+                    .p_2()
+                    .gap_2()
+                    .child(self.render_github_connection_status())
+                    .map(|this| match &self.github_activity {
+                        GitHubActivityState::Idle | GitHubActivityState::Loading => this.child(
+                            h_flex()
+                                .flex_1()
+                                .justify_center()
+                                .child(Label::new("Loading GitHub activity…").color(Color::Muted)),
                         ),
-                    ),
-                    GitHubActivityState::Error(error) => this.child(
-                        v_flex()
-                            .flex_1()
-                            .items_center()
-                            .justify_center()
-                            .gap_1()
-                            .child(Label::new("Unable to load GitHub activity").color(Color::Muted))
-                            .child(
-                                Label::new(error.clone())
-                                    .size(LabelSize::Small)
+                        GitHubActivityState::UnsupportedRemote => this.child(
+                            h_flex().flex_1().justify_center().child(
+                                Label::new("GitHub activity is only available for GitHub remotes")
                                     .color(Color::Muted),
                             ),
-                    ),
-                    GitHubActivityState::Loaded(activity) => {
-                        if activity.issues.is_empty()
-                            && activity.pull_requests.is_empty()
-                            && activity.workflow_runs.is_empty()
-                        {
-                            this.child(
-                                h_flex()
-                                    .flex_1()
-                                    .justify_center()
-                                    .child(Label::new("No GitHub activity").color(Color::Muted)),
-                            )
-                        } else {
-                            this.child(self.render_github_issues(&activity.issues, cx))
+                        ),
+                        GitHubActivityState::Error(error) => this.child(
+                            v_flex()
+                                .flex_1()
+                                .items_center()
+                                .justify_center()
+                                .gap_1()
                                 .child(
-                                    self.render_github_pull_requests(&activity.pull_requests, cx),
+                                    Label::new("Unable to load GitHub activity")
+                                        .color(Color::Muted),
                                 )
                                 .child(
-                                    self.render_github_workflow_runs(&activity.workflow_runs, cx),
+                                    Label::new(error.clone())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                        GitHubActivityState::Loaded(activity) => {
+                            if activity.issues.is_empty()
+                                && activity.pull_requests.is_empty()
+                                && activity.workflow_runs.is_empty()
+                            {
+                                this.child(
+                                    h_flex().flex_1().justify_center().child(
+                                        Label::new("No GitHub activity").color(Color::Muted),
+                                    ),
                                 )
+                            } else {
+                                this.child(self.render_github_issues(&activity.issues, cx))
+                                    .child(
+                                        self.render_github_pull_requests(
+                                            &activity.pull_requests,
+                                            cx,
+                                        ),
+                                    )
+                                    .child(
+                                        self.render_github_workflow_runs(
+                                            &activity.workflow_runs,
+                                            cx,
+                                        ),
+                                    )
+                            }
                         }
-                    }
-                }
-            }))
+                    }),
+            )
             .vertical_scrollbar_for(&self.github_activity_scroll_handle, window, cx)
+    }
+
+    fn render_github_connection_status(&self) -> AnyElement {
+        match &self.github_connection {
+            GitHubConnectionState::Connected(account) => {
+                let scopes = if account.scopes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · scopes: {}", account.scopes.iter().join(", "))
+                };
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::Github).size(IconSize::Small))
+                    .child(
+                        Label::new(format!("Connected as @{}{}", account.login, scopes))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            }
+            GitHubConnectionState::Disconnected => h_flex()
+                .gap_1()
+                .child(Icon::new(IconName::Github).size(IconSize::Small))
+                .child(
+                    Label::new("GitHub is not connected in Rezed")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+            GitHubConnectionState::Unknown => Empty.into_any_element(),
+        }
     }
 
     fn render_github_issues(&self, issues: &[GitHubIssue], cx: &mut Context<Self>) -> AnyElement {
@@ -5838,13 +5916,25 @@ impl GitPanel {
             pull_requests.iter().map(|pull_request| GitHubActivityRow {
                 title: format!("#{} {}", pull_request.number, pull_request.title).into(),
                 meta: format!(
-                    "{} by {}",
+                    "{} by {}{}",
                     if pull_request.draft {
                         "draft"
                     } else {
                         pull_request.state.as_str()
                     },
-                    pull_request.user.login
+                    pull_request.user.login,
+                    if pull_request.labels.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " · {}",
+                            pull_request
+                                .labels
+                                .iter()
+                                .map(|label| label.name.as_str())
+                                .join(", ")
+                        )
+                    }
                 )
                 .into(),
                 url: pull_request.html_url.clone(),

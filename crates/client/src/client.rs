@@ -17,7 +17,7 @@ use clock::SystemClock;
 use cloud_api_client::LlmApiToken;
 use cloud_api_client::websocket_protocol::MessageToClient;
 use cloud_api_client::{ClientApiError, CloudApiClient};
-use cloud_api_types::{GitHubConnectedAccount, OrganizationId};
+use cloud_api_types::OrganizationId;
 use credentials_provider::CredentialsProvider;
 use feature_flags::FeatureFlagAppExt as _;
 use futures::{
@@ -55,6 +55,7 @@ use tokio::net::TcpStream;
 use url::Url;
 use util::{ConnectionResult, ResultExt};
 
+pub use cloud_api_types::GitHubConnectedAccount;
 pub use llm_token::*;
 pub use rpc::*;
 pub use telemetry_events::Event;
