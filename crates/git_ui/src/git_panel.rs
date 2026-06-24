@@ -5691,10 +5691,24 @@ impl GitPanel {
                 (GitHubConnectionState::Connected(_), None) => {
                     Some(Err(anyhow!("GitHub token is unavailable")))
                 }
-                (_, token) => Some(
-                    http_client::github::repository_activity(&repo_name_string, token, http_client)
-                        .await,
-                ),
+                (_, token) => {
+                    let activity = http_client::github::repository_activity(
+                        &repo_name_string,
+                        token,
+                        http_client,
+                    )
+                    .await;
+                    if let Ok(activity) = &activity {
+                        let client = cx.update(|cx| client::Client::global(cx));
+                        if let Err(error) = client
+                            .sync_github_activity(activity.to_sync_batch(), cx)
+                            .await
+                        {
+                            log::debug!("failed to sync GitHub activity to Rezed: {error:?}");
+                        }
+                    }
+                    Some(activity)
+                }
             };
 
             this.update(cx, |this, cx| {

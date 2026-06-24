@@ -158,6 +158,22 @@ impl CloudApiClient {
         }
     }
 
+    pub async fn sync_github_activity(
+        &self,
+        batch: GitHubActivitySyncBatch,
+    ) -> Result<(), ClientApiError> {
+        let request_builder = Request::builder().method(Method::POST).uri(
+            self.http_client
+                .build_zed_cloud_url("/client/integrations/github/activity")
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let request = self.build_request(request_builder, Json(batch))?;
+        self.send_authenticated_request(request).await?;
+        Ok(())
+    }
+
     pub fn connect(&self, cx: &App) -> Result<Task<Result<Connection>>> {
         let mut connect_url = self
             .http_client
@@ -490,6 +506,74 @@ mod tests {
 
             assert!(matches!(error, ClientApiError::NotSignedIn));
             assert_eq!(*request_count.lock(), 0);
+        });
+    }
+
+    #[test]
+    fn test_sync_github_activity_posts_authenticated_batch() {
+        futures::executor::block_on(async {
+            let request_body = Arc::new(Mutex::new(None));
+            let http_client = FakeHttpClient::create({
+                let request_body = request_body.clone();
+                move |mut request| {
+                    let request_body = request_body.clone();
+                    async move {
+                        assert_eq!(request.method(), Method::POST);
+                        assert_eq!(request.uri().path(), "/client/integrations/github/activity");
+                        assert_eq!(
+                            request
+                                .headers()
+                                .get("Authorization")
+                                .and_then(|header| header.to_str().ok()),
+                            Some("42 rezed-token")
+                        );
+
+                        let mut body = String::new();
+                        request.body_mut().read_to_string(&mut body).await.unwrap();
+                        *request_body.lock() = Some(body);
+
+                        Ok(Response::builder()
+                            .status(StatusCode::NO_CONTENT)
+                            .body(Default::default())
+                            .unwrap())
+                    }
+                }
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            client
+                .sync_github_activity(GitHubActivitySyncBatch {
+                    repository_name_with_owner: "owner/repo".to_string(),
+                    items: vec![GitHubActivityItem {
+                        kind: GitHubActivityKind::Issue,
+                        source_id: "github:owner/repo:issue:1".to_string(),
+                        repository_name_with_owner: "owner/repo".to_string(),
+                        title: "Issue".to_string(),
+                        body: None,
+                        author_login: Some("octocat".to_string()),
+                        labels: vec!["bug".to_string()],
+                        url: "https://github.com/owner/repo/issues/1".to_string(),
+                        number: Some(1),
+                        state: Some("open".to_string()),
+                        draft: None,
+                        updated_at: Some("2026-06-25T00:00:00Z".to_string()),
+                        workflow_run_id: None,
+                        workflow_status: None,
+                        workflow_conclusion: None,
+                        workflow_event: None,
+                        workflow_head_branch: None,
+                        workflow_head_sha: None,
+                    }],
+                })
+                .await
+                .expect("sync request should succeed");
+
+            let body: serde_json::Value =
+                serde_json::from_str(request_body.lock().as_deref().unwrap()).unwrap();
+            assert_eq!(body["repository_name_with_owner"], "owner/repo");
+            assert_eq!(body["items"][0]["kind"], "issue");
+            assert_eq!(body["items"][0]["source_id"], "github:owner/repo:issue:1");
         });
     }
 }
