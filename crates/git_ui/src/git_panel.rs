@@ -5741,7 +5741,11 @@ impl GitPanel {
                     })
                     .await
                     .log_err();
-                    telemetry::event!("GitHub Token Synced");
+                    telemetry::event!(
+                        "GitHub Token Synced",
+                        login = account.login.as_str(),
+                        scopes = &account.scopes
+                    );
                 }
                 return GitHubTokenSync {
                     token,
