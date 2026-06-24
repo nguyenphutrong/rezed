@@ -2155,6 +2155,11 @@ impl GitGraph {
         self.context_menu.is_some()
     }
 
+    fn clear_context_menu(&mut self, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        cx.notify();
+    }
+
     /// Checks whether a ref name from git's `%D` decoration
     ///  format refers to the currently checked-out branch.
     fn is_head_ref(ref_name: &str, head_branch_name: &Option<SharedString>) -> bool {
@@ -5427,12 +5432,31 @@ impl GitGraph {
         self.handle_entry_secondary_mouse_down(row, event, window, cx);
     }
 
+    fn handle_context_menu_overlay_secondary_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.row_at_position(event.position.y, window, cx) {
+            self.deploy_entry_context_menu(event.position, row, None, window, cx);
+        } else {
+            self.clear_context_menu(cx);
+        }
+        cx.stop_propagation();
+    }
+
     fn handle_graph_scroll(
         &mut self,
         event: &ScrollWheelEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.context_menu.is_some() {
+            cx.stop_propagation();
+            return;
+        }
+
         let line_height = window.line_height();
         let delta = event.delta.pixel_delta(line_height);
 
@@ -6650,6 +6674,27 @@ impl Render for GitGraph {
                     .child(self.render_search_bar(cx))
                     .child(div().flex_1().child(content)),
             )
+            .children(self.context_menu.as_ref().map(|_| {
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.clear_context_menu(cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.handle_context_menu_overlay_secondary_mouse_down(
+                                event, window, cx,
+                            );
+                        }),
+                    )
+            }))
             .children(self.context_menu.as_ref().map(|context_menu| {
                 deferred(
                     anchored()
@@ -7236,7 +7281,7 @@ mod tests {
     use fs::FakeFs;
     use git::Oid;
     use git::repository::{CommitData, InitialGraphCommitData};
-    use gpui::{TestAppContext, UpdateGlobal};
+    use gpui::{Modifiers, TestAppContext, UpdateGlobal};
     use project::git_store::{GitStoreEvent, RepositoryEvent};
     use project::{Project, TaskSourceKind, task_store::TaskSettingsLocation};
     use rand::prelude::*;
@@ -9339,6 +9384,161 @@ mod tests {
         cx.run_until_parked();
         git_graph.read_with(&*cx, |graph, _| {
             assert_eq!(graph.selected_entry_idx, Some(0));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_graph_scroll_is_blocked_while_context_menu_is_open(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.insert_branches(Path::new("/project/.git"), &["main"]);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let commits = generate_random_commit_dag(&mut rng, 20, false);
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            let scroll_event = ScrollWheelEvent {
+                position: point(px(10.), px(10.)),
+                delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-100.))),
+                ..Default::default()
+            };
+            let initial_offset = graph.table_interaction_state.read(cx).scroll_offset();
+
+            graph.handle_graph_scroll(&scroll_event, window, cx);
+            let scrolled_offset = graph.table_interaction_state.read(cx).scroll_offset();
+            assert!(
+                scrolled_offset.y < initial_offset.y,
+                "scroll should move the graph when no context menu is open"
+            );
+
+            graph.deploy_entry_context_menu(point(px(10.), px(10.)), 0, None, window, cx);
+            assert!(graph.context_menu.is_some());
+
+            graph.handle_graph_scroll(&scroll_event, window, cx);
+            assert_eq!(
+                graph.table_interaction_state.read(cx).scroll_offset(),
+                scrolled_offset
+            );
+            assert!(graph.context_menu.is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_right_clicking_another_commit_replaces_open_context_menu(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        fs.insert_branches(Path::new("/project/.git"), &["main"]);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let commits = generate_random_commit_dag(&mut rng, 3, false);
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            let row_height = GitGraph::row_height(window, cx);
+            graph.graph_canvas_bounds.set(Some(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: gpui::size(px(1000.), row_height * 3.),
+            }));
+
+            graph.deploy_entry_context_menu(point(px(10.), row_height * 0.5), 0, None, window, cx);
+            assert_eq!(
+                graph
+                    .context_menu
+                    .as_ref()
+                    .map(|context_menu| context_menu.entry_idx),
+                Some(0)
+            );
+
+            graph.handle_context_menu_overlay_secondary_mouse_down(
+                &MouseDownEvent {
+                    button: MouseButton::Right,
+                    position: point(px(10.), row_height * 1.5),
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                },
+                window,
+                cx,
+            );
+
+            assert_eq!(
+                graph
+                    .context_menu
+                    .as_ref()
+                    .map(|context_menu| context_menu.entry_idx),
+                Some(1)
+            );
         });
     }
 
