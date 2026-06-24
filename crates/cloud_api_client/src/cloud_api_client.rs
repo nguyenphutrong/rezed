@@ -379,3 +379,117 @@ fn build_request(
         )
         .body(body.into())?)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use http_client::{FakeHttpClient, Response};
+    use parking_lot::Mutex;
+
+    use super::*;
+
+    #[test]
+    fn test_fetch_github_connected_account() {
+        futures::executor::block_on(async {
+            let authorization_headers = Arc::new(Mutex::new(Vec::new()));
+            let http_client = FakeHttpClient::create({
+                let authorization_headers = authorization_headers.clone();
+                move |request| {
+                    let authorization_headers = authorization_headers.clone();
+                    async move {
+                        assert_eq!(request.uri().path(), "/client/integrations/github/token");
+                        authorization_headers.lock().push(
+                            request
+                                .headers()
+                                .get("Authorization")
+                                .and_then(|header| header.to_str().ok())
+                                .map(ToString::to_string),
+                        );
+                        Ok(Response::builder()
+                            .status(200)
+                            .body(
+                                serde_json::json!({
+                                    "login": "octo",
+                                    "scopes": ["repo", "read:user"],
+                                    "access_token": "github-token"
+                                })
+                                .to_string()
+                                .into(),
+                            )
+                            .unwrap())
+                    }
+                }
+            });
+            let client = CloudApiClient::new(http_client);
+            client.set_credentials(42, "rezed-token".to_string());
+
+            let account = client
+                .fetch_github_connected_account()
+                .await
+                .expect("request should succeed")
+                .expect("account should be connected");
+
+            assert_eq!(account.login, "octo");
+            assert_eq!(account.scopes, vec!["repo", "read:user"]);
+            assert_eq!(account.access_token, "github-token");
+            assert_eq!(
+                authorization_headers.lock().as_slice(),
+                &[Some("42 rezed-token".to_string())]
+            );
+        });
+    }
+
+    #[test]
+    fn test_fetch_github_connected_account_returns_none_when_disconnected() {
+        futures::executor::block_on(async {
+            for status in [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND] {
+                let http_client = FakeHttpClient::create(move |request| async move {
+                    assert_eq!(request.uri().path(), "/client/integrations/github/token");
+                    Ok(Response::builder()
+                        .status(status)
+                        .body(Default::default())
+                        .unwrap())
+                });
+                let client = CloudApiClient::new(http_client);
+                client.set_credentials(7, "rezed-token".to_string());
+
+                let account = client
+                    .fetch_github_connected_account()
+                    .await
+                    .expect("request should succeed");
+
+                assert_eq!(account, None);
+            }
+        });
+    }
+
+    #[test]
+    fn test_fetch_github_connected_account_requires_credentials() {
+        futures::executor::block_on(async {
+            let request_count = Arc::new(Mutex::new(0));
+            let http_client = FakeHttpClient::create({
+                let request_count = request_count.clone();
+                move |_request| {
+                    let request_count = request_count.clone();
+                    async move {
+                        *request_count.lock() += 1;
+                        Ok(Response::builder()
+                            .status(500)
+                            .body("unexpected request".into())
+                            .unwrap())
+                    }
+                }
+            });
+            let client = CloudApiClient::new(http_client);
+
+            let error = client
+                .fetch_github_connected_account()
+                .await
+                .expect_err("missing credentials should fail before request");
+
+            assert!(matches!(error, ClientApiError::NotSignedIn));
+            assert_eq!(*request_count.lock(), 0);
+        });
+    }
+}
