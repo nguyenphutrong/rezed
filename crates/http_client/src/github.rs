@@ -33,6 +33,7 @@ pub struct GithubReleaseAsset {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitHubRepositoryActivity {
+    pub repository_name_with_owner: String,
     pub issues: Vec<GitHubIssue>,
     pub pull_requests: Vec<GitHubPullRequest>,
     pub workflow_runs: Vec<GitHubWorkflowRun>,
@@ -60,6 +61,10 @@ pub struct GitHubPullRequest {
     pub user: GitHubUser,
     #[serde(default)]
     pub draft: bool,
+    #[serde(default)]
+    pub labels: Vec<GitHubLabel>,
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -124,6 +129,7 @@ pub async fn repository_activity(
         get_github_json(http, &workflow_runs_url, token).await?;
 
     Ok(GitHubRepositoryActivity {
+        repository_name_with_owner: repo_name_with_owner.to_string(),
         issues: issue_items
             .into_iter()
             .filter(|issue| issue.pull_request.is_none())
@@ -392,7 +398,9 @@ mod tests {
                         "html_url": "https://github.com/owner/repo/pull/7",
                         "state": "open",
                         "user": { "login": "hubot" },
-                        "draft": true
+                        "draft": true,
+                        "labels": [{ "name": "enhancement" }],
+                        "body": "pull request body"
                     }
                 ]"#,
                 ),
@@ -418,10 +426,16 @@ mod tests {
                 .await
                 .expect("activity should parse");
 
+            assert_eq!(activity.repository_name_with_owner, "owner/repo");
             assert_eq!(activity.issues.len(), 1);
             assert_eq!(activity.issues[0].number, 1);
             assert_eq!(activity.pull_requests.len(), 1);
             assert_eq!(activity.pull_requests[0].number, 7);
+            assert_eq!(activity.pull_requests[0].labels[0].name, "enhancement");
+            assert_eq!(
+                activity.pull_requests[0].body.as_deref(),
+                Some("pull request body")
+            );
             assert_eq!(activity.workflow_runs.len(), 1);
             assert_eq!(activity.workflow_runs[0].id, 42);
 
