@@ -80,6 +80,39 @@ actions!(
     ]
 );
 
+pub mod github {
+    use gpui::actions;
+
+    actions!(
+        github,
+        [
+            /// Connects a GitHub account to Rezed.
+            Connect,
+            /// Disconnects the GitHub account from Rezed.
+            Disconnect,
+            /// Refreshes GitHub activity for the current repository.
+            RefreshActivity,
+            /// Opens GitHub activity for the current repository.
+            OpenActivity,
+        ]
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::Action;
+
+    use super::github;
+
+    #[test]
+    fn github_actions_use_github_namespace() {
+        assert_eq!(github::Connect.name(), "github::Connect");
+        assert_eq!(github::Disconnect.name(), "github::Disconnect");
+        assert_eq!(github::RefreshActivity.name(), "github::RefreshActivity");
+        assert_eq!(github::OpenActivity.name(), "github::OpenActivity");
+    }
+}
+
 #[derive(PartialEq, Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionCategoryFilter {

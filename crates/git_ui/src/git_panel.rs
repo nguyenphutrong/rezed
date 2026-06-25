@@ -90,7 +90,13 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotificationId, NotifyTaskExt},
 };
-use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
+use zed_actions::{
+    DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
+    github::{
+        Connect as ConnectGitHub, Disconnect as DisconnectGitHub,
+        OpenActivity as OpenGitHubActivity, RefreshActivity as RefreshGitHubActivity,
+    },
+};
 
 actions!(
     git_panel,
@@ -318,6 +324,60 @@ pub fn register(workspace: &mut Workspace) {
         if let Some(panel) = workspace.panel::<GitPanel>(cx) {
             panel.update(cx, |panel, cx| {
                 panel.show_git_job_queue(window, cx);
+            });
+        }
+    });
+    workspace.register_action(|_, _: &ConnectGitHub, window, cx| {
+        let client = client::Client::global(cx);
+        cx.spawn(async move |_, cx| {
+            let authorize_url = client
+                .fetch_github_oauth_authorize_url(GITHUB_OAUTH_REDIRECT_URI.to_string(), None, cx)
+                .await?;
+            cx.update(|cx| cx.open_url(&authorize_url.url));
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err("Failed to connect GitHub", window, cx, |error, _, _| {
+            Some(error.to_string())
+        });
+    });
+    workspace.register_action(|workspace, _: &DisconnectGitHub, window, cx| {
+        let client = client::Client::global(cx);
+        let workspace = workspace.weak_handle();
+        cx.spawn_in(window, async move |_, cx| {
+            client.disconnect_github_integration(cx).await?;
+            cx.update(|_, cx| cx.delete_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))?
+                .await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.github_connection = GitHubConnectionState::Disconnected;
+                        panel.github_activity_repo = None;
+                        panel.activate_github_activity(true, window, cx);
+                    });
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err(
+            "Failed to disconnect GitHub",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+    });
+    workspace.register_action(|workspace, _: &OpenGitHubActivity, window, cx| {
+        workspace.open_panel::<GitPanel>(window, cx);
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.activate_github_activity(false, window, cx);
+            });
+        }
+    });
+    workspace.register_action(|workspace, _: &RefreshGitHubActivity, window, cx| {
+        workspace.open_panel::<GitPanel>(window, cx);
+        if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.activate_github_activity(true, window, cx);
             });
         }
     });
@@ -795,6 +855,7 @@ struct BulkStaging {
 
 const MAX_PANEL_EDITOR_LINES: usize = 6;
 const GITHUB_TOKEN_KEYCHAIN_KEY: &str = "github:api-token";
+const GITHUB_OAUTH_REDIRECT_URI: &str = "https://rezed.dev/oauth/github/callback";
 
 pub(crate) fn commit_message_editor(
     commit_message_buffer: Entity<Buffer>,
@@ -5546,6 +5607,22 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::GitHub, window, cx);
     }
 
+    fn activate_github_activity(
+        &mut self,
+        refresh: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_tab != GitPanelTab::GitHub {
+            self.set_active_tab(GitPanelTab::GitHub, window, cx);
+        } else {
+            self.focus_handle.focus(window, cx);
+            if refresh || matches!(self.github_activity, GitHubActivityState::Idle) {
+                self.refresh_github_activity(cx);
+            }
+        }
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
@@ -5852,8 +5929,10 @@ impl GitPanel {
                         ),
                         GitHubActivityState::Disconnected => this.child(
                             h_flex().flex_1().justify_center().child(
-                                Label::new("Connect GitHub in Dashboard > Integrations")
-                                    .color(Color::Muted),
+                                Label::new(
+                                    "Connect GitHub from the Welcome screen or command palette",
+                                )
+                                .color(Color::Muted),
                             ),
                         ),
                         GitHubActivityState::Error(error) => this.child(
