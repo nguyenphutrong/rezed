@@ -116,9 +116,6 @@ impl CommitTagPicker {
         let picker = cx.new(|cx| {
             Picker::nonsearchable_uniform_list(delegate, window, cx)
                 .initial_width(COMMIT_TAG_LIST_WIDTH_IN_REMS)
-                .minimum_results_width(COMMIT_TAG_LIST_WIDTH_IN_REMS)
-                .height(rems(24.))
-                .no_vertical_padding()
         });
         Self { picker }
     }
@@ -2624,10 +2621,9 @@ impl GitGraph {
             delegate.query = query;
             delegate.set_matches(matches);
             Picker::uniform_list(delegate, window, cx)
-                .minimum_results_width(rems(24.))
-                .height(rems(28.))
+                .initial_width(rems(24.))
+                .max_height(rems(28.))
                 .show_scrollbar(true)
-                .no_vertical_padding()
         });
         self.branch_filter_picker = Some(picker.clone());
         picker
@@ -3871,7 +3867,7 @@ impl GitGraph {
             return;
         };
         let remote_name = target.remote.name.clone();
-        let tag_name = target.tag_name.clone();
+        let tag_name = target.tag_name;
         let askpass = self.askpass_delegate(format!("git push {}", remote_name), window, cx);
 
         let operation = cx.spawn(async move |_, cx| {
@@ -4080,7 +4076,7 @@ impl GitGraph {
         let confirm = self.prompt_confirmation(
             PromptLevel::Warning,
             format!("Checkout {commit_sha} in detached HEAD state?"),
-            Some("This will detach HEAD at the selected commit.".into()),
+            Some("This will detach HEAD at the selected commit."),
             "Checkout",
             window,
             cx,
@@ -4357,8 +4353,8 @@ impl GitGraph {
                     let checkout_name = lookup_name.clone();
                     let copy_name = display_name.clone();
                     let rename_name = lookup_name.clone();
-                    let delete_name = lookup_name.clone();
-                    let push_branch = branch.clone();
+                    let delete_name = lookup_name;
+                    let push_branch = branch;
                     let menu = context_menu
                         .context(focus_handle.clone())
                         .header(format!("Branch {display_name}"))
