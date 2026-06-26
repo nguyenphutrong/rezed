@@ -213,6 +213,17 @@ pub async fn pull_request(
     Ok(pull_request)
 }
 
+pub async fn pull_request_files(
+    repo_name_with_owner: &str,
+    pull_number: u64,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubPullRequestFile>> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls/{pull_number}/files");
+    let (files, _) = get_github_json_page::<Vec<GitHubPullRequestFile>>(http, &url, token).await?;
+    Ok(files)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubRepositoryActivity {
     pub repository_name_with_owner: String,
@@ -372,6 +383,22 @@ pub struct GitHubPullRequest {
     pub additions: Option<u32>,
     #[serde(default)]
     pub deletions: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubPullRequestFile {
+    pub filename: String,
+    pub status: String,
+    #[serde(default)]
+    pub previous_filename: Option<String>,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    #[serde(default)]
+    pub changes: u32,
+    #[serde(default)]
+    pub patch: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -707,8 +734,8 @@ mod tests {
         AsyncBody, HttpClient, RedirectPolicy, Response, StatusCode,
         github::{
             AssetKind, GitHubActivityKind, GitHubDeviceAccessTokenPoll, build_asset_url,
-            poll_device_access_token, pull_request, pull_requests, pull_requests_page,
-            repository_activity, request_device_code, viewer,
+            poll_device_access_token, pull_request, pull_request_files, pull_requests,
+            pull_requests_page, repository_activity, request_device_code, viewer,
         },
     };
     use anyhow::Result;
@@ -1048,6 +1075,53 @@ mod tests {
             let requests = http.requests.lock();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].uri().to_string().ends_with("/pulls/7"));
+            assert_eq!(
+                requests[0]
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("Bearer secret")
+            );
+        });
+    }
+
+    #[test]
+    fn test_pull_request_files_parse_patch_metadata() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"[
+                    {
+                        "filename": "src/main.rs",
+                        "status": "modified",
+                        "additions": 3,
+                        "deletions": 1,
+                        "changes": 4,
+                        "patch": "@@ -1 +1 @@\n-old\n+new"
+                    },
+                    {
+                        "filename": "src/new.rs",
+                        "status": "added",
+                        "additions": 10,
+                        "deletions": 0,
+                        "changes": 10
+                    }
+                ]"#,
+            }]));
+
+            let files = pull_request_files("owner/repo", 7, Some("secret"), http.clone())
+                .await
+                .expect("pull request files should parse");
+
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0].filename, "src/main.rs");
+            assert_eq!(files[0].patch.as_deref(), Some("@@ -1 +1 @@\n-old\n+new"));
+            assert_eq!(files[1].patch, None);
+
+            let requests = http.requests.lock();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].uri().to_string().ends_with("/pulls/7/files"));
             assert_eq!(
                 requests[0]
                     .headers()

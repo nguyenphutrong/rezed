@@ -1,9 +1,9 @@
-use crate::git_panel::GitPanel;
+use crate::git_panel::{GitPanel, github_pull_request_patch_text, open_output};
 use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Styled, TextStyle, WeakEntity, Window,
-    relative, rems,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, TextStyle,
+    WeakEntity, Window, relative, rems,
 };
 use http_client::github::GitHubPullRequest;
 use language::Buffer;
@@ -31,6 +31,7 @@ pub(crate) struct GitHubPullRequestView {
     git_panel: WeakEntity<GitPanel>,
     body_editor: Entity<Editor>,
     checking_out: bool,
+    viewing_changes: bool,
     focus_handle: FocusHandle,
 }
 
@@ -49,6 +50,7 @@ impl GitHubPullRequestView {
             git_panel,
             body_editor,
             checking_out: false,
+            viewing_changes: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -63,6 +65,7 @@ impl GitHubPullRequestView {
         self.repo_name_with_owner = repo_name_with_owner;
         self.pull = pull;
         self.checking_out = false;
+        self.viewing_changes = false;
         self.body_editor = Self::new_body_editor(&self.pull, window, cx);
         cx.notify();
     }
@@ -156,12 +159,69 @@ impl GitHubPullRequestView {
     }
 
     fn view_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo_name = self.repo_name_with_owner.clone();
         let pull = self.pull.clone();
-        self.git_panel
+        let operation = self
+            .git_panel
             .update(cx, |git_panel, cx| {
-                git_panel.view_github_pull_request_changes(pull, window, cx);
+                git_panel.prepare_github_pull_request_changes(repo_name, pull, cx)
+            })
+            .ok()
+            .flatten();
+        let Some(operation) = operation else {
+            return;
+        };
+
+        self.viewing_changes = true;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let token = GitPanel::github_token(cx).await.token;
+            let result = async {
+                let files = http_client::github::pull_request_files(
+                    &operation.repo_name_with_owner,
+                    operation.pull_number,
+                    token.as_deref(),
+                    operation.http_client,
+                )
+                .await?;
+                let patch_text = github_pull_request_patch_text(
+                    &operation.repo_name_with_owner,
+                    operation.pull_number,
+                    &files,
+                );
+
+                operation.workspace.update_in(cx, |workspace, window, cx| {
+                    open_output(
+                        format!(
+                            "github pr {} #{}",
+                            operation.repo_name_with_owner, operation.pull_number
+                        ),
+                        workspace,
+                        &patch_text,
+                        window,
+                        cx,
+                    );
+                })?;
+
+                anyhow::Ok(())
+            }
+            .await;
+
+            this.update(cx, |this, cx| {
+                this.viewing_changes = false;
+                cx.notify();
             })
             .ok();
+
+            result
+        })
+        .detach_and_prompt_err(
+            "Failed to view pull request changes",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
     }
 }
 
@@ -393,6 +453,8 @@ impl GitHubPullRequestView {
                     .child(
                         Button::new("github-pr-view-changes", "View Changes")
                             .size(ButtonSize::Compact)
+                            .loading(self.viewing_changes)
+                            .disabled(self.viewing_changes)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.view_changes(window, cx);
                             })),
