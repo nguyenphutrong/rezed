@@ -1022,42 +1022,6 @@ fn github_branch_slug(value: &str) -> String {
     }
 }
 
-fn github_pull_request_patch_text(
-    pull: &GitHubPullRequest,
-    files: &[http_client::github::GitHubPullRequestFile],
-) -> String {
-    let mut output = format!(
-        "Pull Request #{}: {}\n{} -> {}\n{}\n\n",
-        pull.number, pull.title, pull.head.ref_name, pull.base.ref_name, pull.html_url
-    );
-    if let Some(body) = pull
-        .body
-        .as_ref()
-        .and_then(|body| non_empty_token(body.clone()))
-    {
-        output.push_str(&body);
-        output.push_str("\n\n");
-    }
-    for file in files {
-        output.push_str(&format!(
-            "diff --git a/{0} b/{0}\n# status: {1}, +{2} -{3}\n",
-            file.filename, file.status, file.additions, file.deletions
-        ));
-        if let Some(previous_filename) = &file.previous_filename {
-            output.push_str(&format!("# renamed from {previous_filename}\n"));
-        }
-        match &file.patch {
-            Some(patch) => {
-                output.push_str(patch);
-                output.push('\n');
-            }
-            None => output.push_str("# binary or large file; patch unavailable\n"),
-        }
-        output.push('\n');
-    }
-    output
-}
-
 pub(crate) fn commit_message_editor(
     commit_message_buffer: Entity<Buffer>,
     placeholder: Option<SharedString>,
@@ -6211,58 +6175,6 @@ impl GitPanel {
         true
     }
 
-    pub(crate) fn preview_github_pull_request(
-        &mut self,
-        pull: GitHubPullRequest,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(remote) = self.git_remote(cx) else {
-            self.show_error_toast(
-                "preview pull request",
-                anyhow!("No GitHub remote configured"),
-                cx,
-            );
-            return;
-        };
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-
-        let repo_name_with_owner = format!("{}/{}", remote.owner, remote.repo);
-        let http_client = cx.http_client();
-        window
-            .spawn(cx, async move |cx| {
-                let token = Self::github_token(cx).await.token;
-                let files = http_client::github::pull_request_files(
-                    &repo_name_with_owner,
-                    pull.number as u32,
-                    token.as_deref(),
-                    http_client,
-                )
-                .await?;
-                let patch = github_pull_request_patch_text(&pull, &files);
-
-                workspace.update_in(cx, |workspace, window, cx| {
-                    open_output(
-                        format!("GitHub PR #{}", pull.number),
-                        workspace,
-                        &patch,
-                        window,
-                        cx,
-                    );
-                })?;
-
-                anyhow::Ok(())
-            })
-            .detach_and_prompt_err(
-                "Failed to preview pull request",
-                window,
-                cx,
-                |error, _, _| Some(error.to_string()),
-            );
-    }
-
     async fn github_token(cx: &mut AsyncApp) -> GitHubTokenSync {
         let keychain_token = cx
             .update(|cx| cx.read_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
@@ -8974,46 +8886,6 @@ mod tests {
         assert_eq!(
             github_pull_request_refspec(42, "origin", "pr/42-feature-pr-diff"),
             "+refs/pull/42/head:refs/remotes/origin/pr/42-feature-pr-diff"
-        );
-    }
-
-    #[test]
-    fn test_github_pull_request_patch_text_includes_metadata_and_file_patches() {
-        let pull_request = github_pull_request();
-        let patch = github_pull_request_patch_text(
-            &pull_request,
-            &[
-                http_client::github::GitHubPullRequestFile {
-                    filename: "src/lib.rs".to_string(),
-                    status: "modified".to_string(),
-                    additions: 2,
-                    deletions: 1,
-                    changes: 3,
-                    patch: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
-                    previous_filename: None,
-                },
-                http_client::github::GitHubPullRequestFile {
-                    filename: "assets/image.png".to_string(),
-                    status: "modified".to_string(),
-                    additions: 0,
-                    deletions: 0,
-                    changes: 0,
-                    patch: None,
-                    previous_filename: Some("assets/old.png".to_string()),
-                },
-            ],
-        );
-
-        assert!(patch.contains("Pull Request #42: Improve GitHub pull request flow"));
-        assert!(patch.contains("Feature/PR Diff! -> main"));
-        assert!(patch.contains("diff --git a/src/lib.rs b/src/lib.rs"));
-        assert!(patch.contains("@@ -1 +1 @@\n-old\n+new"));
-        assert!(patch.contains("# renamed from assets/old.png"));
-        assert_eq!(
-            patch
-                .matches("# binary or large file; patch unavailable")
-                .count(),
-            1
         );
     }
 

@@ -97,15 +97,6 @@ impl GitHubPullRequestView {
             cx.notify();
         }
     }
-
-    fn preview_changes(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let pull = self.pull.clone();
-        self.git_panel
-            .update(cx, |git_panel, cx| {
-                git_panel.preview_github_pull_request(pull, window, cx);
-            })
-            .ok();
-    }
 }
 
 pub(crate) fn github_pull_request_row_meta(
@@ -331,14 +322,6 @@ impl GitHubPullRequestView {
                             .disabled(self.reviewing_changes)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.review_changes(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("github-pr-preview-changes", "Preview patch")
-                            .size(ButtonSize::Compact)
-                            .start_icon(Icon::new(IconName::File).size(IconSize::Small))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.preview_changes(window, cx);
                             })),
                     )
                     .child(
