@@ -202,6 +202,17 @@ pub async fn pull_requests(
     Ok(pull_requests)
 }
 
+pub async fn pull_request(
+    repo_name_with_owner: &str,
+    pull_number: u64,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<GitHubPullRequest> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls/{pull_number}");
+    let (pull_request, _) = get_github_json_page::<GitHubPullRequest>(http, &url, token).await?;
+    Ok(pull_request)
+}
+
 pub async fn pull_request_files(
     repo_name_with_owner: &str,
     pull_number: u32,
@@ -709,8 +720,8 @@ mod tests {
         AsyncBody, HttpClient, RedirectPolicy, Response, StatusCode,
         github::{
             AssetKind, GitHubActivityKind, GitHubDeviceAccessTokenPoll, build_asset_url,
-            poll_device_access_token, pull_request_files, pull_requests, repository_activity,
-            request_device_code, viewer,
+            poll_device_access_token, pull_request, pull_request_files, pull_requests,
+            repository_activity, request_device_code, viewer,
         },
     };
     use anyhow::Result;
@@ -956,6 +967,73 @@ mod tests {
                     .to_string()
                     .ends_with("/pulls?state=open&per_page=20&sort=updated&direction=desc")
             );
+            assert_eq!(
+                requests[0]
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("Bearer secret")
+            );
+        });
+    }
+
+    #[test]
+    fn test_pull_request_fetches_detail_stats() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{
+                    "number": 7,
+                    "title": "Improve graph",
+                    "html_url": "https://github.com/owner/repo/pull/7",
+                    "state": "open",
+                    "user": { "login": "hubot" },
+                    "base": {
+                        "ref": "main",
+                        "sha": "base-sha",
+                        "repo": {
+                            "full_name": "owner/repo",
+                            "clone_url": "https://github.com/owner/repo.git",
+                            "ssh_url": "git@github.com:owner/repo.git"
+                        }
+                    },
+                    "head": {
+                        "ref": "feature/pr-diff",
+                        "sha": "head-sha",
+                        "repo": {
+                            "full_name": "owner/repo",
+                            "clone_url": "https://github.com/owner/repo.git",
+                            "ssh_url": "git@github.com:owner/repo.git"
+                        }
+                    },
+                    "draft": false,
+                    "updated_at": "2026-06-24T11:00:00Z",
+                    "created_at": "2026-06-20T11:00:00Z",
+                    "comments": 4,
+                    "review_comments": 5,
+                    "changed_files": 3,
+                    "commits": 2,
+                    "additions": 12,
+                    "deletions": 4
+                }"#,
+            }]));
+
+            let pull = pull_request("owner/repo", 7, Some("secret"), http.clone())
+                .await
+                .expect("pull request detail should parse");
+
+            assert_eq!(pull.number, 7);
+            assert_eq!(pull.commits, Some(2));
+            assert_eq!(pull.changed_files, Some(3));
+            assert_eq!(pull.additions, Some(12));
+            assert_eq!(pull.deletions, Some(4));
+            assert_eq!(pull.comments, 4);
+            assert_eq!(pull.review_comments, 5);
+
+            let requests = http.requests.lock();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].uri().to_string().ends_with("/pulls/7"));
             assert_eq!(
                 requests[0]
                     .headers()

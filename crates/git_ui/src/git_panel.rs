@@ -6022,11 +6022,34 @@ impl GitPanel {
             return;
         };
         let git_panel = cx.entity().downgrade();
-        let item =
-            cx.new(|cx| GitHubPullRequestView::new(repo_name_with_owner, pull, git_panel, cx));
-        workspace.update(cx, |workspace, cx| {
-            workspace.add_item_to_center(Box::new(item), window, cx);
-        });
+        let http_client = cx.http_client();
+        let repo_name_string = repo_name_with_owner.to_string();
+        let pull_number = pull.number;
+
+        window
+            .spawn(cx, async move |cx| {
+                let token = Self::github_token(cx).await.token;
+                let pull = http_client::github::pull_request(
+                    &repo_name_string,
+                    pull_number,
+                    token.as_deref(),
+                    http_client,
+                )
+                .await?;
+
+                workspace.update_in(cx, |workspace, window, cx| {
+                    let repo_name_with_owner: SharedString = repo_name_string.into();
+                    let item = cx.new(|cx| {
+                        GitHubPullRequestView::new(repo_name_with_owner, pull, git_panel, cx)
+                    });
+                    workspace.add_item_to_center(Box::new(item), window, cx);
+                })?;
+
+                anyhow::Ok(())
+            })
+            .detach_and_prompt_err("Failed to load pull request", window, cx, |error, _, _| {
+                Some(error.to_string())
+            });
         cx.notify();
     }
 
