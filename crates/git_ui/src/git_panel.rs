@@ -64,6 +64,7 @@ use project::{
 };
 use prompt_store::RULES_FILE_NAMES;
 use proto::RpcError;
+use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use settings::{
     GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore, StatusStyle,
@@ -330,8 +331,7 @@ pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|_, _: &ConnectGitHub, window, cx| {
         let client = client::Client::global(cx);
         cx.spawn(async move |_, cx| {
-            let authorize_url = github_oauth_authorize_url(client, cx).await?;
-            cx.update(|cx| cx.open_url(&authorize_url.url));
+            github_oauth_flow(client, cx).await?;
             anyhow::Ok(())
         })
         .detach_and_prompt_err("Failed to connect GitHub", window, cx, |error, _, _| {
@@ -853,16 +853,65 @@ struct BulkStaging {
 
 const MAX_PANEL_EDITOR_LINES: usize = 6;
 const GITHUB_TOKEN_KEYCHAIN_KEY: &str = "github:api-token";
-const GITHUB_OAUTH_REDIRECT_URI: &str = "https://rezed.dev/oauth/github/callback";
+const GITHUB_OAUTH_CALLBACK_HOST: &str = "127.0.0.1";
+const GITHUB_OAUTH_CALLBACK_PORT: u16 = 48176;
+const GITHUB_OAUTH_CALLBACK_PATH: &str = "/github/callback";
+
+async fn github_oauth_flow(
+    client: Arc<client::Client>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<GitHubIntegrationStatus> {
+    client.sign_in(true, cx).await?;
+
+    let (redirect_uri, callback_rx) =
+        oauth_callback_server::start_oauth_callback_server_with_config(
+            oauth_callback_server::OAuthCallbackServerConfig {
+                host: GITHUB_OAUTH_CALLBACK_HOST,
+                preferred_port: GITHUB_OAUTH_CALLBACK_PORT,
+                fallback_port: None,
+                path: GITHUB_OAUTH_CALLBACK_PATH,
+            },
+        )
+        .context("Failed to start GitHub OAuth callback server")?;
+
+    let state = github_oauth_state();
+    let authorize_url =
+        github_oauth_authorize_url(client.clone(), redirect_uri.clone(), state.clone(), cx).await?;
+
+    cx.update(|cx| cx.open_url(&authorize_url.url));
+
+    let callback = callback_rx
+        .await
+        .map_err(|_| anyhow!("GitHub OAuth callback was cancelled"))?
+        .context("GitHub OAuth callback failed")?;
+
+    if callback.state != state {
+        anyhow::bail!("GitHub OAuth state mismatch");
+    }
+
+    client
+        .exchange_github_oauth_code(callback.code, redirect_uri, cx)
+        .await
+}
 
 async fn github_oauth_authorize_url(
     client: Arc<client::Client>,
-    cx: &mut AsyncApp,
+    redirect_uri: String,
+    state: String,
+    cx: &AsyncApp,
 ) -> anyhow::Result<client::GitHubOAuthAuthorizeUrlResponse> {
-    client.sign_in(true, cx).await?;
     client
-        .fetch_github_oauth_authorize_url(GITHUB_OAUTH_REDIRECT_URI.to_string(), None, cx)
+        .fetch_github_oauth_authorize_url(redirect_uri, Some(state), cx)
         .await
+}
+
+fn github_oauth_state() -> String {
+    let mut state_bytes = [0u8; 16];
+    rand::rng().fill(&mut state_bytes);
+    state_bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn commit_message_editor(
@@ -8438,7 +8487,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_github_connect_signs_in_before_fetching_authorize_url(cx: &mut TestAppContext) {
+    async fn test_github_connect_fetches_authorize_url_with_local_callback(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
 
         let request_count = Arc::new(Mutex::new(0));
@@ -8454,7 +8505,9 @@ mod tests {
                     );
                     assert_eq!(
                         request.uri().query(),
-                        Some("redirect_uri=https%3A%2F%2Frezed.dev%2Foauth%2Fgithub%2Fcallback")
+                        Some(
+                            "redirect_uri=http%3A%2F%2F127.0.0.1%3A48176%2Fgithub%2Fcallback&state=test-state"
+                        )
                     );
                     assert_eq!(
                         request
@@ -8468,7 +8521,7 @@ mod tests {
                         .status(200)
                         .body(
                             serde_json::json!({
-                                "url": "https://github.com/login/oauth/authorize?client_id=rezed"
+                                "url": "https://github.com/login/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A48176%2Fgithub%2Fcallback&state=test-state"
                             })
                             .to_string()
                             .into(),
@@ -8488,13 +8541,19 @@ mod tests {
             })
         });
 
-        let response = github_oauth_authorize_url(client, &mut cx.to_async())
-            .await
-            .expect("connect should sign in before fetching authorize URL");
+        client.sign_in(true, &mut cx.to_async()).await.unwrap();
+        let response = github_oauth_authorize_url(
+            client,
+            "http://127.0.0.1:48176/github/callback".to_string(),
+            "test-state".to_string(),
+            &cx.to_async(),
+        )
+        .await
+        .expect("authorize URL should use local callback");
 
         assert_eq!(
             response.url,
-            "https://github.com/login/oauth/authorize?client_id=rezed"
+            "https://github.com/login/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A48176%2Fgithub%2Fcallback&state=test-state"
         );
         assert_eq!(*request_count.lock().unwrap(), 1);
     }
