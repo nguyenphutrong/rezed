@@ -389,6 +389,14 @@ pub fn register(workspace: &mut Workspace) {
     });
 }
 
+pub(crate) struct GitHubPullRequestCheckoutOperation {
+    pub(crate) repository: Entity<Repository>,
+    pub(crate) remote_name: String,
+    pub(crate) local_branch: String,
+    pub(crate) refspec: String,
+    pub(crate) askpass: AskPassDelegate,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     Focus,
@@ -6104,75 +6112,84 @@ impl GitPanel {
         cx.notify();
     }
 
-    pub(crate) fn checkout_github_pull_request(
+    pub(crate) fn prepare_github_pull_request_checkout(
         &mut self,
-        repo_name_with_owner: SharedString,
         pull: GitHubPullRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Option<GitHubPullRequestCheckoutOperation> {
         if self.changes_count > 0 {
             self.show_error_toast(
                 "checkout pull request",
                 anyhow!("Commit or stash local changes before checking out a pull request"),
                 cx,
             );
-            return false;
+            return None;
         }
 
         let Some(repository) = self.active_repository.clone() else {
             self.show_error_toast("checkout pull request", anyhow!("No active repository"), cx);
-            return false;
+            return None;
         };
-        let Some(workspace) = self.workspace.upgrade() else {
-            return false;
-        };
-
         let remote_name = "origin".to_string();
         let local_branch = github_pull_request_local_branch(&pull);
-        let remote_branch = format!("{remote_name}/{local_branch}");
         let refspec = github_pull_request_refspec(pull.number, &remote_name, &local_branch);
-        let base_ref: SharedString = format!("{remote_name}/{}", pull.base.ref_name).into();
         let askpass = self.askpass_delegate(format!("git fetch {remote_name}"), window, cx);
 
-        window
-            .spawn(cx, async move |cx| {
-                let fetch = repository.update(cx, |repository, cx| {
-                    repository.fetch_refspec(remote_name, refspec, askpass, cx)
-                });
-                fetch.await??;
+        Some(GitHubPullRequestCheckoutOperation {
+            repository,
+            remote_name,
+            local_branch,
+            refspec,
+            askpass,
+        })
+    }
 
-                let checkout = repository.update(cx, |repository, _| {
-                    repository.change_branch(remote_branch.clone())
-                });
-                checkout.await??;
+    pub(crate) fn view_github_pull_request_changes(
+        &mut self,
+        pull: GitHubPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.active_repository.clone() else {
+            self.show_error_toast(
+                "view pull request changes",
+                anyhow!("No active repository"),
+                cx,
+            );
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
 
-                workspace.update_in(cx, |workspace, window, cx| {
-                    ProjectDiff::deploy_branch_diff_with_base_ref(
-                        workspace,
-                        workspace.project().clone(),
-                        repository,
-                        base_ref,
-                        window,
-                        cx,
-                    );
-                })?;
+        let local_branch = github_pull_request_local_branch(&pull);
+        let current_branch = repository
+            .read(cx)
+            .branch
+            .as_ref()
+            .map(|branch| branch.name().to_string());
 
-                anyhow::Ok(())
-            })
-            .detach_and_prompt_err(
-                "Failed to checkout pull request",
+        if current_branch.as_deref() != Some(local_branch.as_str()) {
+            self.show_error_toast(
+                "view pull request changes",
+                anyhow!("Checkout this pull request before viewing changes"),
+                cx,
+            );
+            return;
+        }
+
+        let base_ref: SharedString = format!("origin/{}", pull.base.ref_name).into();
+        workspace.update(cx, |workspace, cx| {
+            ProjectDiff::deploy_branch_diff_with_base_ref(
+                workspace,
+                workspace.project().clone(),
+                repository,
+                base_ref,
                 window,
                 cx,
-                |error, _, _| Some(error.to_string()),
             );
-
-        telemetry::event!(
-            "GitHub Pull Request Checkout Started",
-            repo = repo_name_with_owner.as_ref(),
-            pull_request = pull.number
-        );
-        true
+        });
     }
 
     async fn github_token(cx: &mut AsyncApp) -> GitHubTokenSync {

@@ -17,6 +17,7 @@ use ui::{
     h_flex, prelude::*, v_flex,
 };
 use workspace::item::{Item, TabContentParams};
+use workspace::notifications::DetachAndPromptErr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GitHubPullRequestRowMeta {
@@ -29,7 +30,7 @@ pub(crate) struct GitHubPullRequestView {
     pull: GitHubPullRequest,
     git_panel: WeakEntity<GitPanel>,
     body_editor: Entity<Editor>,
-    reviewing_changes: bool,
+    checking_out: bool,
     focus_handle: FocusHandle,
 }
 
@@ -47,7 +48,7 @@ impl GitHubPullRequestView {
             pull,
             git_panel,
             body_editor,
-            reviewing_changes: false,
+            checking_out: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -61,7 +62,7 @@ impl GitHubPullRequestView {
     ) {
         self.repo_name_with_owner = repo_name_with_owner;
         self.pull = pull;
-        self.reviewing_changes = false;
+        self.checking_out = false;
         self.body_editor = Self::new_body_editor(&self.pull, window, cx);
         cx.notify();
     }
@@ -83,19 +84,84 @@ impl GitHubPullRequestView {
         })
     }
 
-    fn review_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn checkout_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let repo_name = self.repo_name_with_owner.clone();
         let pull = self.pull.clone();
-        let started = self
+        let pull_number = pull.number;
+        let operation = self
             .git_panel
             .update(cx, |git_panel, cx| {
-                git_panel.checkout_github_pull_request(repo_name, pull, window, cx)
+                git_panel.prepare_github_pull_request_checkout(pull, window, cx)
             })
-            .unwrap_or(false);
-        if started {
-            self.reviewing_changes = true;
-            cx.notify();
-        }
+            .ok()
+            .flatten();
+        let Some(operation) = operation else {
+            return;
+        };
+
+        self.checking_out = true;
+        cx.notify();
+
+        let repo_name_for_task = repo_name.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let remote_branch = format!("{}/{}", operation.remote_name, operation.local_branch);
+            let fetch = operation.repository.update(cx, |repository, cx| {
+                repository.fetch_refspec(
+                    operation.remote_name,
+                    operation.refspec,
+                    operation.askpass,
+                    cx,
+                )
+            });
+            let result = async {
+                fetch.await??;
+
+                let checkout = operation
+                    .repository
+                    .update(cx, |repository, _| repository.change_branch(remote_branch));
+                checkout.await??;
+
+                anyhow::Ok(())
+            }
+            .await;
+
+            this.update(cx, |this, cx| {
+                this.checking_out = false;
+                cx.notify();
+            })
+            .ok();
+
+            result?;
+
+            telemetry::event!(
+                "GitHub Pull Request Checkout Finished",
+                repo = repo_name_for_task.as_ref(),
+                pull_request = pull_number
+            );
+
+            anyhow::Ok(())
+        })
+        .detach_and_prompt_err(
+            "Failed to checkout pull request",
+            window,
+            cx,
+            |error, _, _| Some(error.to_string()),
+        );
+
+        telemetry::event!(
+            "GitHub Pull Request Checkout Started",
+            repo = repo_name.as_ref(),
+            pull_request = pull_number
+        );
+    }
+
+    fn view_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pull = self.pull.clone();
+        self.git_panel
+            .update(cx, |git_panel, cx| {
+                git_panel.view_github_pull_request_changes(pull, window, cx);
+            })
+            .ok();
     }
 }
 
@@ -315,13 +381,20 @@ impl GitHubPullRequestView {
                 h_flex()
                     .gap_1()
                     .child(
-                        Button::new("github-pr-review-changes", "Review changes")
+                        Button::new("github-pr-checkout", "Checkout PR")
                             .style(ButtonStyle::Filled)
                             .size(ButtonSize::Compact)
-                            .loading(self.reviewing_changes)
-                            .disabled(self.reviewing_changes)
+                            .loading(self.checking_out)
+                            .disabled(self.checking_out)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.review_changes(window, cx);
+                                this.checkout_pull_request(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("github-pr-view-changes", "View Changes")
+                            .size(ButtonSize::Compact)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.view_changes(window, cx);
                             })),
                     )
                     .child(
