@@ -423,6 +423,8 @@ enum GitHubActivityState {
 struct GitHubPullRequests {
     repo_name_with_owner: SharedString,
     pulls: Vec<GitHubPullRequest>,
+    next_url: Option<String>,
+    loading_more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -852,6 +854,7 @@ pub struct GitPanel {
     github_connection: GitHubConnectionState,
     github_activity_repo: Option<SharedString>,
     selected_github_pull_request: Option<SelectedGitHubPullRequest>,
+    github_pull_request_detail: Option<WeakEntity<GitHubPullRequestView>>,
     github_activity_task: Option<Task<()>>,
     github_activity_scroll_handle: ScrollHandle,
     _repo_subscriptions: Vec<Subscription>,
@@ -1274,6 +1277,7 @@ impl GitPanel {
                 github_connection: GitHubConnectionState::Unknown,
                 github_activity_repo: None,
                 selected_github_pull_request: None,
+                github_pull_request_detail: None,
                 github_activity_task: None,
                 github_activity_scroll_handle: ScrollHandle::new(),
                 _repo_subscriptions: Vec::new(),
@@ -5968,9 +5972,12 @@ impl GitPanel {
                     Some(Err(anyhow!("GitHub token is unavailable")))
                 }
                 (_, token) => {
-                    let pulls =
-                        http_client::github::pull_requests(&repo_name_string, token, http_client)
-                            .await;
+                    let pulls = http_client::github::pull_requests_page(
+                        &repo_name_string,
+                        token,
+                        http_client,
+                    )
+                    .await;
                     Some(pulls)
                 }
             };
@@ -5981,10 +5988,12 @@ impl GitPanel {
                     None => {
                         this.github_activity = GitHubActivityState::Disconnected;
                     }
-                    Some(Ok(pulls)) => {
+                    Some(Ok((pulls, next_url))) => {
                         this.github_activity = GitHubActivityState::Loaded(GitHubPullRequests {
                             repo_name_with_owner: repo_name_string.into(),
                             pulls,
+                            next_url,
+                            loading_more: false,
                         });
                     }
                     Some(Err(err)) => {
@@ -6003,6 +6012,49 @@ impl GitPanel {
     fn refresh_github_activity(&mut self, cx: &mut Context<Self>) {
         self.github_activity_repo = None;
         self.load_github_activity(cx);
+    }
+
+    fn load_more_github_pull_requests(&mut self, cx: &mut Context<Self>) {
+        let GitHubActivityState::Loaded(pull_requests) = &mut self.github_activity else {
+            return;
+        };
+        if pull_requests.loading_more {
+            return;
+        }
+        let Some(next_url) = pull_requests.next_url.clone() else {
+            return;
+        };
+
+        pull_requests.loading_more = true;
+        let http_client = cx.http_client();
+        self.github_activity_task = Some(cx.spawn(async move |this, cx| {
+            let token = Self::github_token(cx).await.token;
+            let page = http_client::github::pull_requests_page_url(
+                next_url,
+                token.as_deref(),
+                http_client,
+            )
+            .await;
+
+            this.update(cx, |this, cx| {
+                match (&mut this.github_activity, page) {
+                    (GitHubActivityState::Loaded(pull_requests), Ok((mut pulls, next_url))) => {
+                        pull_requests.pulls.append(&mut pulls);
+                        pull_requests.next_url = next_url;
+                        pull_requests.loading_more = false;
+                    }
+                    (GitHubActivityState::Loaded(pull_requests), Err(err)) => {
+                        pull_requests.loading_more = false;
+                        this.github_activity = GitHubActivityState::Error(err.to_string().into());
+                    }
+                    _ => {}
+                }
+                this.github_activity_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn open_github_pull_request_detail(
@@ -6039,9 +6091,44 @@ impl GitPanel {
 
                 workspace.update_in(cx, |workspace, window, cx| {
                     let repo_name_with_owner: SharedString = repo_name_string.into();
-                    let item = cx.new(|cx| {
-                        GitHubPullRequestView::new(repo_name_with_owner, pull, git_panel, cx)
-                    });
+                    let item = if let Some(item) = git_panel
+                        .update(cx, |git_panel, cx| {
+                            git_panel
+                                .github_pull_request_detail
+                                .as_ref()
+                                .and_then(|item| item.upgrade())
+                                .inspect(|item| {
+                                    item.update(cx, |item, cx| {
+                                        item.set_pull_request(
+                                            repo_name_with_owner.clone(),
+                                            pull.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                })
+                        })
+                        .ok()
+                        .flatten()
+                    {
+                        item
+                    } else {
+                        let item = cx.new(|cx| {
+                            GitHubPullRequestView::new(
+                                repo_name_with_owner,
+                                pull,
+                                git_panel.clone(),
+                                window,
+                                cx,
+                            )
+                        });
+                        git_panel
+                            .update(cx, |git_panel, _| {
+                                git_panel.github_pull_request_detail = Some(item.downgrade());
+                            })
+                            .ok();
+                        item
+                    };
                     workspace.add_item_to_center(Box::new(item), window, cx);
                 })?;
 
@@ -6059,22 +6146,22 @@ impl GitPanel {
         pull: GitHubPullRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         if self.changes_count > 0 {
             self.show_error_toast(
                 "checkout pull request",
                 anyhow!("Commit or stash local changes before checking out a pull request"),
                 cx,
             );
-            return;
+            return false;
         }
 
         let Some(repository) = self.active_repository.clone() else {
             self.show_error_toast("checkout pull request", anyhow!("No active repository"), cx);
-            return;
+            return false;
         };
         let Some(workspace) = self.workspace.upgrade() else {
-            return;
+            return false;
         };
 
         let remote_name = "origin".to_string();
@@ -6121,6 +6208,7 @@ impl GitPanel {
             repo = repo_name_with_owner.as_ref(),
             pull_request = pull.number
         );
+        true
     }
 
     pub(crate) fn preview_github_pull_request(
@@ -6394,6 +6482,19 @@ impl GitPanel {
                 pull_requests,
                 cx,
             ))
+            .when(pull_requests.next_url.is_some(), |this| {
+                this.child(
+                    h_flex().pt_1().child(
+                        Button::new("github-pr-load-more", "Load more")
+                            .size(ButtonSize::Compact)
+                            .loading(pull_requests.loading_more)
+                            .disabled(pull_requests.loading_more)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load_more_github_pull_requests(cx);
+                            })),
+                    ),
+                )
+            })
             .into_any_element()
     }
 

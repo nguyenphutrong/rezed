@@ -194,12 +194,28 @@ pub async fn pull_requests(
     token: Option<&str>,
     http: Arc<dyn HttpClient>,
 ) -> anyhow::Result<Vec<GitHubPullRequest>> {
+    Ok(pull_requests_page(repo_name_with_owner, token, http)
+        .await?
+        .0)
+}
+
+pub async fn pull_requests_page(
+    repo_name_with_owner: &str,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<(Vec<GitHubPullRequest>, Option<String>)> {
     let url = format!(
         "{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls?state=open&per_page={GITHUB_ACTIVITY_PER_PAGE}&sort=updated&direction=desc"
     );
-    let (pull_requests, _) =
-        get_github_json_page::<Vec<GitHubPullRequest>>(http, &url, token).await?;
-    Ok(pull_requests)
+    pull_requests_page_url(url, token, http).await
+}
+
+pub async fn pull_requests_page_url(
+    url: String,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<(Vec<GitHubPullRequest>, Option<String>)> {
+    get_github_json_page::<Vec<GitHubPullRequest>>(http, &url, token).await
 }
 
 pub async fn pull_request(
@@ -721,7 +737,7 @@ mod tests {
         github::{
             AssetKind, GitHubActivityKind, GitHubDeviceAccessTokenPoll, build_asset_url,
             poll_device_access_token, pull_request, pull_request_files, pull_requests,
-            repository_activity, request_device_code, viewer,
+            pull_requests_page, repository_activity, request_device_code, viewer,
         },
     };
     use anyhow::Result;
@@ -904,7 +920,10 @@ mod tests {
         futures::executor::block_on(async {
             let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
                 status: 200,
-                headers: Vec::new(),
+                headers: vec![(
+                    "link",
+                    r#"<https://api.github.com/repositories/1/pulls?page=2>; rel="next""#,
+                )],
                 body: r#"[
                     {
                         "number": 7,
@@ -973,6 +992,30 @@ mod tests {
                     .get("Authorization")
                     .and_then(|header| header.to_str().ok()),
                 Some("Bearer secret")
+            );
+        });
+    }
+
+    #[test]
+    fn test_pull_requests_page_returns_next_url() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: vec![(
+                    "link",
+                    r#"<https://api.github.com/repositories/1/pulls?page=2>; rel="next""#,
+                )],
+                body: "[]",
+            }]));
+
+            let (pulls, next_url) = pull_requests_page("owner/repo", Some("secret"), http.clone())
+                .await
+                .expect("pull request page should parse");
+
+            assert!(pulls.is_empty());
+            assert_eq!(
+                next_url.as_deref(),
+                Some("https://api.github.com/repositories/1/pulls?page=2")
             );
         });
     }

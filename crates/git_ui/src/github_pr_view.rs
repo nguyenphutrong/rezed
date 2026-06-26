@@ -1,9 +1,14 @@
 use crate::git_panel::GitPanel;
+use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
-    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, Styled, WeakEntity, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, Styled, TextStyle, WeakEntity, Window,
+    relative, rems,
 };
 use http_client::github::GitHubPullRequest;
+use language::Buffer;
+use settings::Settings;
+use theme_settings::ThemeSettings;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 use time_format::{TimestampFormat, format_localized_timestamp};
@@ -23,6 +28,8 @@ pub(crate) struct GitHubPullRequestView {
     repo_name_with_owner: SharedString,
     pull: GitHubPullRequest,
     git_panel: WeakEntity<GitPanel>,
+    body_editor: Entity<Editor>,
+    reviewing_changes: bool,
     focus_handle: FocusHandle,
 }
 
@@ -31,24 +38,64 @@ impl GitHubPullRequestView {
         repo_name_with_owner: SharedString,
         pull: GitHubPullRequest,
         git_panel: WeakEntity<GitPanel>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let body_editor = Self::new_body_editor(&pull, window, cx);
         Self {
             repo_name_with_owner,
             pull,
             git_panel,
+            body_editor,
+            reviewing_changes: false,
             focus_handle: cx.focus_handle(),
         }
     }
 
-    fn review_changes(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn set_pull_request(
+        &mut self,
+        repo_name_with_owner: SharedString,
+        pull: GitHubPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.repo_name_with_owner = repo_name_with_owner;
+        self.pull = pull;
+        self.reviewing_changes = false;
+        self.body_editor = Self::new_body_editor(&self.pull, window, cx);
+        cx.notify();
+    }
+
+    fn new_body_editor(
+        pull: &GitHubPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Editor> {
+        let body = github_pull_request_body_text(pull);
+        let buffer = cx.new(|cx| Buffer::local(body.as_ref(), cx));
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_capability(language::Capability::ReadOnly, cx);
+        });
+        cx.new(|cx| {
+            let mut editor = Editor::for_buffer(buffer, None, window, cx);
+            editor.set_read_only(true);
+            editor
+        })
+    }
+
+    fn review_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let repo_name = self.repo_name_with_owner.clone();
         let pull = self.pull.clone();
-        self.git_panel
+        let started = self
+            .git_panel
             .update(cx, |git_panel, cx| {
-                git_panel.checkout_github_pull_request(repo_name, pull, window, cx);
+                git_panel.checkout_github_pull_request(repo_name, pull, window, cx)
             })
-            .ok();
+            .unwrap_or(false);
+        if started {
+            self.reviewing_changes = true;
+            cx.notify();
+        }
     }
 
     fn preview_changes(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -103,6 +150,15 @@ pub(crate) fn github_pull_request_diff_boxes(additions: u32, deletions: u32) -> 
     let added = ((additions as f32 / total as f32) * BOX_COUNT as f32).round() as usize;
     let added = added.min(BOX_COUNT);
     (added, BOX_COUNT - added)
+}
+
+pub(crate) fn github_pull_request_body_text(pull: &GitHubPullRequest) -> SharedString {
+    pull.body
+        .as_deref()
+        .filter(|body| !body.trim().is_empty())
+        .unwrap_or("No description provided.")
+        .to_string()
+        .into()
 }
 
 pub(crate) fn github_format_timestamp(timestamp: &str) -> Option<String> {
@@ -271,20 +327,25 @@ impl GitHubPullRequestView {
                         Button::new("github-pr-review-changes", "Review changes")
                             .style(ButtonStyle::Filled)
                             .size(ButtonSize::Compact)
+                            .loading(self.reviewing_changes)
+                            .disabled(self.reviewing_changes)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.review_changes(window, cx);
                             })),
                     )
                     .child(
-                        Button::new("github-pr-preview-changes", "Preview")
+                        Button::new("github-pr-preview-changes", "Preview patch")
                             .size(ButtonSize::Compact)
+                            .start_icon(Icon::new(IconName::File).size(IconSize::Small))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.preview_changes(window, cx);
                             })),
                     )
                     .child(
-                        Button::new("github-pr-open-browser", "Open")
+                        Button::new("github-pr-open-browser", "View on GitHub")
                             .size(ButtonSize::Compact)
+                            .start_icon(Icon::new(IconName::Github).size(IconSize::Small))
+                            .end_icon(Icon::new(IconName::ArrowUpRight).size(IconSize::Small))
                             .on_click({
                                 let url = self.pull.html_url.clone();
                                 move |_, _, cx| cx.open_url(&url)
@@ -294,13 +355,6 @@ impl GitHubPullRequestView {
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = self
-            .pull
-            .body
-            .as_deref()
-            .filter(|body| !body.trim().is_empty())
-            .unwrap_or("No description provided.");
-
         v_flex()
             .gap_3()
             .rounded_lg()
@@ -308,11 +362,29 @@ impl GitHubPullRequestView {
             .border_color(cx.theme().colors().border.opacity(0.5))
             .p_4()
             .child(Label::new("Summary").size(LabelSize::Large))
-            .child(
-                Label::new(body.to_string())
-                    .color(Color::Default)
-                    .line_height_style(ui::LineHeightStyle::UiLabel),
-            )
+            .child(div().min_h_32().child(EditorElement::new(
+                &self.body_editor,
+                self.body_editor_style(cx),
+            )))
+    }
+
+    fn body_editor_style(&self, cx: &mut Context<Self>) -> EditorStyle {
+        let settings = ThemeSettings::get_global(cx);
+        EditorStyle {
+            background: cx.theme().colors().editor_background,
+            local_player: cx.theme().players().local(),
+            text: TextStyle {
+                color: cx.theme().colors().text,
+                font_family: settings.ui_font.family.clone(),
+                font_features: settings.ui_font.features.clone(),
+                font_fallbacks: settings.ui_font.fallbacks.clone(),
+                font_size: rems(0.875).into(),
+                font_weight: settings.ui_font.weight,
+                line_height: relative(1.5),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn render_sidebar(
