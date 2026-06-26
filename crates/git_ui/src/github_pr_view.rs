@@ -1,4 +1,4 @@
-use crate::git_panel::{GitPanel, github_pull_request_patch_text, open_output};
+use crate::{git_panel::GitPanel, github_pr_diff_view::GitHubPrDiffView};
 use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
@@ -185,24 +185,18 @@ impl GitHubPullRequestView {
                     operation.http_client,
                 )
                 .await?;
-                let patch_text = github_pull_request_patch_text(
-                    &operation.repo_name_with_owner,
-                    operation.pull_number,
-                    &files,
-                );
-
-                operation.workspace.update_in(cx, |workspace, window, cx| {
-                    open_output(
-                        format!(
-                            "github pr {} #{}",
-                            operation.repo_name_with_owner, operation.pull_number
-                        ),
-                        workspace,
-                        &patch_text,
-                        window,
-                        cx,
-                    );
-                })?;
+                let project = operation
+                    .workspace
+                    .update(cx, |workspace, _| workspace.project().clone());
+                GitHubPrDiffView::build(
+                    operation.repo_name_with_owner.into(),
+                    operation.pull,
+                    files,
+                    project,
+                    operation.workspace.downgrade(),
+                    cx,
+                )
+                .await?;
 
                 anyhow::Ok(())
             }

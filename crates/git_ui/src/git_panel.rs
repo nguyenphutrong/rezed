@@ -44,7 +44,7 @@ use gpui::{
     ScrollStrategy, Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity,
     actions, anchored, deferred, point, size, uniform_list,
 };
-use http_client::github::{GitHubPullRequest, GitHubPullRequestFile};
+use http_client::github::GitHubPullRequest;
 use itertools::Itertools;
 use language::{Buffer, File};
 use language_model::{
@@ -401,6 +401,7 @@ pub(crate) struct GitHubPullRequestChangesOperation {
     pub(crate) workspace: Entity<Workspace>,
     pub(crate) repo_name_with_owner: String,
     pub(crate) pull_number: u64,
+    pub(crate) pull: GitHubPullRequest,
     pub(crate) http_client: Arc<dyn http_client::HttpClient>,
 }
 
@@ -1010,46 +1011,6 @@ fn github_pull_request_local_branch(pull: &GitHubPullRequest) -> String {
 
 fn github_pull_request_refspec(pull_number: u64, remote_name: &str, local_branch: &str) -> String {
     format!("+refs/pull/{pull_number}/head:refs/remotes/{remote_name}/{local_branch}")
-}
-
-pub(crate) fn github_pull_request_patch_text(
-    repo_name_with_owner: &str,
-    pull_number: u64,
-    files: &[GitHubPullRequestFile],
-) -> String {
-    let mut text = format!("{repo_name_with_owner} #{pull_number}\n\n");
-    if files.is_empty() {
-        text.push_str("No changed files.\n");
-        return text;
-    }
-
-    for file in files {
-        text.push_str(&format!(
-            "diff --git a/{filename} b/{filename}\n",
-            filename = file.filename
-        ));
-        text.push_str(&format!(
-            "# {status}: +{additions} -{deletions}",
-            status = file.status,
-            additions = file.additions,
-            deletions = file.deletions
-        ));
-        if let Some(previous_filename) = &file.previous_filename {
-            text.push_str(&format!(" renamed from {previous_filename}"));
-        }
-        text.push('\n');
-        if let Some(patch) = &file.patch {
-            text.push_str(patch);
-            if !patch.ends_with('\n') {
-                text.push('\n');
-            }
-        } else {
-            text.push_str("Binary file or patch unavailable from GitHub API.\n");
-        }
-        text.push('\n');
-    }
-
-    text
 }
 
 fn github_branch_slug(value: &str) -> String {
@@ -6206,6 +6167,7 @@ impl GitPanel {
             workspace,
             repo_name_with_owner: repo_name_with_owner.to_string(),
             pull_number: pull.number,
+            pull,
             http_client: cx.http_client(),
         })
     }
@@ -8922,39 +8884,6 @@ mod tests {
             github_pull_request_refspec(42, "origin", "pr/42-feature-pr-diff"),
             "+refs/pull/42/head:refs/remotes/origin/pr/42-feature-pr-diff"
         );
-    }
-
-    #[test]
-    fn test_github_pull_request_patch_text_includes_file_patches() {
-        let patch = github_pull_request_patch_text(
-            "owner/repo",
-            42,
-            &[
-                GitHubPullRequestFile {
-                    filename: "src/main.rs".to_string(),
-                    status: "modified".to_string(),
-                    previous_filename: None,
-                    additions: 2,
-                    deletions: 1,
-                    changes: 3,
-                    patch: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
-                },
-                GitHubPullRequestFile {
-                    filename: "assets/logo.png".to_string(),
-                    status: "modified".to_string(),
-                    previous_filename: None,
-                    additions: 0,
-                    deletions: 0,
-                    changes: 0,
-                    patch: None,
-                },
-            ],
-        );
-
-        assert!(patch.contains("owner/repo #42"));
-        assert!(patch.contains("diff --git a/src/main.rs b/src/main.rs"));
-        assert!(patch.contains("@@ -1 +1 @@"));
-        assert!(patch.contains("Binary file or patch unavailable from GitHub API."));
     }
 
     #[test]
