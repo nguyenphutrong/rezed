@@ -88,12 +88,12 @@ impl CloudApiClient {
         *self.credentials.write() = None;
     }
 
-    fn cloud_host(&self) -> String {
-        self.http_client
-            .build_zed_cloud_url("/")
-            .ok()
-            .and_then(|url| url.host_str().map(String::from))
-            .unwrap_or_else(|| "cloud.zed.dev".into())
+    fn request_host(request: &Request<AsyncBody>) -> String {
+        request
+            .uri()
+            .host()
+            .map(String::from)
+            .unwrap_or_else(|| "unknown host".into())
     }
 
     fn build_request(
@@ -131,13 +131,13 @@ impl CloudApiClient {
     ) -> Result<Option<GitHubConnectedAccount>, ClientApiError> {
         let request_builder = Request::builder().method(Method::GET).uri(
             self.http_client
-                .build_zed_cloud_url("/client/integrations/github/token")
+                .build_zed_api_url("/client/integrations/github/token", &[])
                 .map_err(ClientApiError::RequestBuildFailed)?
                 .as_ref(),
         );
 
         let request = self.build_request(request_builder, AsyncBody::default())?;
-        let host = self.cloud_host();
+        let host = Self::request_host(&request);
         let mut response = self.http_client.send(request).await.map_err(|source| {
             ClientApiError::ConnectionFailed {
                 host: host.clone(),
@@ -166,7 +166,7 @@ impl CloudApiClient {
     ) -> Result<GitHubIntegrationStatus, ClientApiError> {
         let request_builder = Request::builder().method(Method::POST).uri(
             self.http_client
-                .build_zed_cloud_url("/client/integrations/github/oauth")
+                .build_zed_api_url("/client/integrations/github/oauth", &[])
                 .map_err(ClientApiError::RequestBuildFailed)?
                 .as_ref(),
         );
@@ -185,7 +185,7 @@ impl CloudApiClient {
     ) -> Result<GitHubOAuthAuthorizeUrlResponse, ClientApiError> {
         let mut url = self
             .http_client
-            .build_zed_cloud_url("/client/integrations/github/oauth/authorize_url")
+            .build_zed_api_url("/client/integrations/github/oauth/authorize_url", &[])
             .map_err(ClientApiError::RequestBuildFailed)?;
         {
             let mut query_pairs = url.query_pairs_mut();
@@ -205,7 +205,7 @@ impl CloudApiClient {
     ) -> Result<GitHubRepositoriesResponse, ClientApiError> {
         let request_builder = Request::builder().method(Method::GET).uri(
             self.http_client
-                .build_zed_cloud_url("/client/integrations/github/repositories")
+                .build_zed_api_url("/client/integrations/github/repositories", &[])
                 .map_err(ClientApiError::RequestBuildFailed)?
                 .as_ref(),
         );
@@ -219,13 +219,13 @@ impl CloudApiClient {
     ) -> Result<Option<GitHubIntegrationStatus>, ClientApiError> {
         let request_builder = Request::builder().method(Method::GET).uri(
             self.http_client
-                .build_zed_cloud_url("/client/integrations/github")
+                .build_zed_api_url("/client/integrations/github", &[])
                 .map_err(ClientApiError::RequestBuildFailed)?
                 .as_ref(),
         );
 
         let request = self.build_request(request_builder, AsyncBody::default())?;
-        let host = self.cloud_host();
+        let host = Self::request_host(&request);
         let mut response = self.http_client.send(request).await.map_err(|source| {
             ClientApiError::ConnectionFailed {
                 host: host.clone(),
@@ -253,7 +253,7 @@ impl CloudApiClient {
     ) -> Result<GitHubInboxItemsResponse, ClientApiError> {
         let mut url = self
             .http_client
-            .build_zed_cloud_url("/client/integrations/github/inbox")
+            .build_zed_api_url("/client/integrations/github/inbox", &[])
             .map_err(ClientApiError::RequestBuildFailed)?;
         url.query_pairs_mut()
             .append_pair("limit", &limit.to_string());
@@ -269,7 +269,7 @@ impl CloudApiClient {
     ) -> Result<(), ClientApiError> {
         let request_builder = Request::builder().method(Method::POST).uri(
             self.http_client
-                .build_zed_cloud_url("/client/integrations/github/activity")
+                .build_zed_api_url("/client/integrations/github/activity", &[])
                 .map_err(ClientApiError::RequestBuildFailed)?
                 .as_ref(),
         );
@@ -285,7 +285,7 @@ impl CloudApiClient {
     ) -> Result<(), ClientApiError> {
         let request_builder = Request::builder().method(Method::POST).uri(
             self.http_client
-                .build_zed_cloud_url("/client/integrations/github/activity/sync")
+                .build_zed_api_url("/client/integrations/github/activity/sync", &[])
                 .map_err(ClientApiError::RequestBuildFailed)?
                 .as_ref(),
         );
@@ -303,7 +303,7 @@ impl CloudApiClient {
     pub async fn disconnect_github_integration(&self) -> Result<(), ClientApiError> {
         let request_builder = Request::builder().method(Method::DELETE).uri(
             self.http_client
-                .build_zed_cloud_url("/client/integrations/github")
+                .build_zed_api_url("/client/integrations/github", &[])
                 .map_err(ClientApiError::RequestBuildFailed)?
                 .as_ref(),
         );
@@ -397,7 +397,7 @@ impl CloudApiClient {
         &self,
         request: Request<AsyncBody>,
     ) -> Result<Response<AsyncBody>, ClientApiError> {
-        let host = self.cloud_host();
+        let host = Self::request_host(&request);
         let mut response = self.http_client.send(request).await.map_err(|source| {
             ClientApiError::ConnectionFailed {
                 host: host.clone(),
@@ -725,6 +725,9 @@ mod tests {
         futures::executor::block_on(async {
             let http_client = FakeHttpClient::create(|request| async move {
                 assert_eq!(request.method(), Method::GET);
+                assert_eq!(request.uri().scheme_str(), Some("http"));
+                assert_eq!(request.uri().host(), Some("localhost"));
+                assert_eq!(request.uri().port_u16(), Some(8080));
                 assert_eq!(
                     request.uri().path(),
                     "/client/integrations/github/oauth/authorize_url"
@@ -754,6 +757,7 @@ mod tests {
                     )
                     .unwrap())
             });
+            http_client.set_base_url("http://localhost:3000");
             let client = CloudApiClient::new(http_client);
             client.set_credentials(42, "rezed-token".to_string());
 
