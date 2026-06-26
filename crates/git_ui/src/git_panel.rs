@@ -982,8 +982,8 @@ fn github_pull_request_local_branch(pull: &GitHubPullRequest) -> String {
     format!("pr/{}-{}", pull.number, github_branch_slug(slug_source))
 }
 
-fn github_pull_request_refspec(pull_number: u64, local_branch: &str) -> String {
-    format!("+refs/pull/{pull_number}/head:refs/heads/{local_branch}")
+fn github_pull_request_refspec(pull_number: u64, remote_name: &str, local_branch: &str) -> String {
+    format!("+refs/pull/{pull_number}/head:refs/remotes/{remote_name}/{local_branch}")
 }
 
 fn github_branch_slug(value: &str) -> String {
@@ -6022,7 +6022,8 @@ impl GitPanel {
 
         let remote_name = "origin".to_string();
         let local_branch = github_pull_request_local_branch(&pull);
-        let refspec = github_pull_request_refspec(pull.number, &local_branch);
+        let remote_branch = format!("{remote_name}/{local_branch}");
+        let refspec = github_pull_request_refspec(pull.number, &remote_name, &local_branch);
         let base_ref: SharedString = format!("{remote_name}/{}", pull.base.ref_name).into();
         let askpass = self.askpass_delegate(format!("git fetch {remote_name}"), window, cx);
 
@@ -6034,7 +6035,7 @@ impl GitPanel {
                 fetch.await??;
 
                 let checkout = repository.update(cx, |repository, _| {
-                    repository.change_branch(local_branch.clone())
+                    repository.change_branch(remote_branch.clone())
                 });
                 checkout.await??;
 
@@ -8806,8 +8807,8 @@ mod tests {
             "pr/42-feature-pr-diff"
         );
         assert_eq!(
-            github_pull_request_refspec(42, "pr/42-feature-pr-diff"),
-            "+refs/pull/42/head:refs/heads/pr/42-feature-pr-diff"
+            github_pull_request_refspec(42, "origin", "pr/42-feature-pr-diff"),
+            "+refs/pull/42/head:refs/remotes/origin/pr/42-feature-pr-diff"
         );
     }
 
