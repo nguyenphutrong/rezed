@@ -10,7 +10,7 @@ use url::Url;
 const GITHUB_API_URL: &str = "https://api.github.com";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_DEVICE_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-const GITHUB_ACTIVITY_PER_PAGE: usize = 100;
+const GITHUB_ACTIVITY_PER_PAGE: usize = 20;
 
 pub struct GitHubLspBinaryVersion {
     pub name: String,
@@ -989,19 +989,19 @@ mod tests {
                 requests[0]
                     .uri()
                     .to_string()
-                    .ends_with("/issues?state=all&per_page=100&sort=updated&direction=desc")
+                    .ends_with("/issues?state=all&per_page=20&sort=updated&direction=desc")
             );
             assert!(
                 requests[1]
                     .uri()
                     .to_string()
-                    .ends_with("/pulls?state=all&per_page=100&sort=updated&direction=desc")
+                    .ends_with("/pulls?state=all&per_page=20&sort=updated&direction=desc")
             );
             assert!(
                 requests[2]
                     .uri()
                     .to_string()
-                    .ends_with("/actions/runs?per_page=100&exclude_pull_requests=false")
+                    .ends_with("/actions/runs?per_page=20&exclude_pull_requests=false")
             );
             assert!(requests.iter().all(|request| {
                 request
