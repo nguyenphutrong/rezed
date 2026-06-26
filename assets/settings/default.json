@@ -1022,8 +1022,8 @@
     // GitHub OAuth App client id used by desktop-only GitHub device authorization.
     // Can also be provided with the GITHUB_OAUTH_CLIENT_ID environment variable.
     //
-    // Default: null
-    "github_oauth_client_id": null,
+    // Default: "Ov23liOLsPKk6Q3D2lKV"
+    "github_oauth_client_id": "Ov23liOLsPKk6Q3D2lKV",
   },
   "message_editor": {
     // Whether to automatically replace emoji shortcodes with emoji characters.
