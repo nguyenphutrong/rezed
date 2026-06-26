@@ -330,9 +330,7 @@ pub fn register(workspace: &mut Workspace) {
     workspace.register_action(|_, _: &ConnectGitHub, window, cx| {
         let client = client::Client::global(cx);
         cx.spawn(async move |_, cx| {
-            let authorize_url = client
-                .fetch_github_oauth_authorize_url(GITHUB_OAUTH_REDIRECT_URI.to_string(), None, cx)
-                .await?;
+            let authorize_url = github_oauth_authorize_url(client, cx).await?;
             cx.update(|cx| cx.open_url(&authorize_url.url));
             anyhow::Ok(())
         })
@@ -856,6 +854,16 @@ struct BulkStaging {
 const MAX_PANEL_EDITOR_LINES: usize = 6;
 const GITHUB_TOKEN_KEYCHAIN_KEY: &str = "github:api-token";
 const GITHUB_OAUTH_REDIRECT_URI: &str = "https://rezed.dev/oauth/github/callback";
+
+async fn github_oauth_authorize_url(
+    client: Arc<client::Client>,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<client::GitHubOAuthAuthorizeUrlResponse> {
+    client.sign_in(true, cx).await?;
+    client
+        .fetch_github_oauth_authorize_url(GITHUB_OAUTH_REDIRECT_URI.to_string(), None, cx)
+        .await
+}
 
 pub(crate) fn commit_message_editor(
     commit_message_buffer: Entity<Buffer>,
@@ -8365,15 +8373,18 @@ pub(crate) fn commit_title_exceeds_limit(title: &str, max_length: usize) -> bool
 
 #[cfg(test)]
 mod tests {
+    use clock::FakeSystemClock;
     use git::{
         repository::repo_path,
         status::{StatusCode, UnmergedStatus, UnmergedStatusCode},
     };
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext, px};
+    use http_client::FakeHttpClient;
     use indoc::indoc;
     use project::FakeFs;
     use serde_json::json;
     use settings::SettingsStore;
+    use std::sync::Mutex;
     use theme::LoadThemes;
     use util::path;
     use util::rel_path::rel_path;
@@ -8424,6 +8435,68 @@ mod tests {
             workflow_head_branch: None,
             workflow_head_sha: None,
         }
+    }
+
+    #[gpui::test]
+    async fn test_github_connect_signs_in_before_fetching_authorize_url(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let request_count = Arc::new(Mutex::new(0));
+        let http_client = FakeHttpClient::create({
+            let request_count = request_count.clone();
+            move |request| {
+                let request_count = request_count.clone();
+                async move {
+                    *request_count.lock().unwrap() += 1;
+                    assert_eq!(
+                        request.uri().path(),
+                        "/client/integrations/github/oauth/authorize_url"
+                    );
+                    assert_eq!(
+                        request.uri().query(),
+                        Some("redirect_uri=https%3A%2F%2Frezed.dev%2Foauth%2Fgithub%2Fcallback")
+                    );
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get("Authorization")
+                            .and_then(|header| header.to_str().ok()),
+                        Some("42 rezed-token")
+                    );
+
+                    Ok(http_client::Response::builder()
+                        .status(200)
+                        .body(
+                            serde_json::json!({
+                                "url": "https://github.com/login/oauth/authorize?client_id=rezed"
+                            })
+                            .to_string()
+                            .into(),
+                        )
+                        .unwrap())
+                }
+            }
+        });
+        let client =
+            cx.update(|cx| client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(client::Credentials {
+                    user_id: 42,
+                    access_token: "rezed-token".into(),
+                })
+            })
+        });
+
+        let response = github_oauth_authorize_url(client, &mut cx.to_async())
+            .await
+            .expect("connect should sign in before fetching authorize URL");
+
+        assert_eq!(
+            response.url,
+            "https://github.com/login/oauth/authorize?client_id=rezed"
+        );
+        assert_eq!(*request_count.lock().unwrap(), 1);
     }
 
     #[test]
