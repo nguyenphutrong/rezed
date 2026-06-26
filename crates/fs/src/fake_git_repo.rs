@@ -1175,6 +1175,23 @@ impl GitRepository for FakeGitRepository {
         unimplemented!()
     }
 
+    fn fetch_refspec(
+        &self,
+        _remote_name: String,
+        _refspec: String,
+        _askpass: AskPassDelegate,
+        _env: Arc<HashMap<String, String>>,
+        _cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<git::repository::RemoteCommandOutput>> {
+        async {
+            Ok(git::repository::RemoteCommandOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        .boxed()
+    }
+
     fn get_all_remotes(&self) -> BoxFuture<'_, Result<Vec<Remote>>> {
         self.with_state_async(false, move |state| {
             let remotes = state

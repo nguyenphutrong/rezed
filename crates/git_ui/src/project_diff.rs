@@ -210,7 +210,7 @@ impl ProjectDiff {
         });
     }
 
-    fn deploy_branch_diff_with_base_ref(
+    pub(crate) fn deploy_branch_diff_with_base_ref(
         workspace: &mut Workspace,
         project: Entity<Project>,
         intended_repo: Entity<Repository>,

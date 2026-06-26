@@ -48,6 +48,37 @@ pub struct GitHubViewer {
     pub login: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubPullRequestBranch {
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    pub sha: String,
+    pub repo: Option<GitHubRepositoryRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubRepositoryRef {
+    pub full_name: String,
+    pub clone_url: Option<String>,
+    pub ssh_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GitHubPullRequestFile {
+    pub filename: String,
+    pub status: String,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    #[serde(default)]
+    pub changes: u32,
+    #[serde(default)]
+    pub patch: Option<String>,
+    #[serde(default)]
+    pub previous_filename: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct GitHubDeviceAccessTokenResponse {
     access_token: Option<String>,
@@ -156,6 +187,32 @@ pub async fn viewer(token: &str, http: Arc<dyn HttpClient>) -> anyhow::Result<Gi
     read_github_json_response(&mut response)
         .await
         .context("error fetching GitHub user")
+}
+
+pub async fn pull_requests(
+    repo_name_with_owner: &str,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubPullRequest>> {
+    let url = format!(
+        "{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls?state=open&per_page={GITHUB_ACTIVITY_PER_PAGE}&sort=updated&direction=desc"
+    );
+    let (pull_requests, _) =
+        get_github_json_page::<Vec<GitHubPullRequest>>(http, &url, token).await?;
+    Ok(pull_requests)
+}
+
+pub async fn pull_request_files(
+    repo_name_with_owner: &str,
+    pull_number: u32,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubPullRequestFile>> {
+    let url = format!(
+        "{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls/{pull_number}/files?per_page=100"
+    );
+    let (files, _) = get_github_json_page::<Vec<GitHubPullRequestFile>>(http, &url, token).await?;
+    Ok(files)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +348,8 @@ pub struct GitHubPullRequest {
     pub html_url: String,
     pub state: String,
     pub user: GitHubUser,
+    pub base: GitHubPullRequestBranch,
+    pub head: GitHubPullRequestBranch,
     #[serde(default)]
     pub draft: bool,
     #[serde(default)]
@@ -299,6 +358,14 @@ pub struct GitHubPullRequest {
     pub labels: Vec<GitHubLabel>,
     #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub requested_reviewers: Vec<GitHubUser>,
+    #[serde(default)]
+    pub comments: u32,
+    #[serde(default)]
+    pub commits: Option<u32>,
+    #[serde(default)]
+    pub changed_files: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -634,7 +701,8 @@ mod tests {
         AsyncBody, HttpClient, RedirectPolicy, Response, StatusCode,
         github::{
             AssetKind, GitHubActivityKind, GitHubDeviceAccessTokenPoll, build_asset_url,
-            poll_device_access_token, repository_activity, request_device_code, viewer,
+            poll_device_access_token, pull_request_files, pull_requests, repository_activity,
+            request_device_code, viewer,
         },
     };
     use anyhow::Result;
@@ -813,6 +881,122 @@ mod tests {
     }
 
     #[test]
+    fn test_pull_requests_fetches_open_pr_metadata() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"[
+                    {
+                        "number": 7,
+                        "title": "Improve graph",
+                        "html_url": "https://github.com/owner/repo/pull/7",
+                        "state": "open",
+                        "user": { "login": "hubot" },
+                        "base": {
+                            "ref": "main",
+                            "sha": "base-sha",
+                            "repo": {
+                                "full_name": "owner/repo",
+                                "clone_url": "https://github.com/owner/repo.git",
+                                "ssh_url": "git@github.com:owner/repo.git"
+                            }
+                        },
+                        "head": {
+                            "ref": "feature/pr-diff",
+                            "sha": "head-sha",
+                            "repo": {
+                                "full_name": "owner/repo",
+                                "clone_url": "https://github.com/owner/repo.git",
+                                "ssh_url": "git@github.com:owner/repo.git"
+                            }
+                        },
+                        "draft": true,
+                        "updated_at": "2026-06-24T11:00:00Z",
+                        "labels": [{ "name": "enhancement" }],
+                        "requested_reviewers": [{ "login": "octo" }],
+                        "changed_files": 3,
+                        "commits": 2
+                    }
+                ]"#,
+            }]));
+
+            let pulls = pull_requests("owner/repo", Some("secret"), http.clone())
+                .await
+                .expect("pull requests should parse");
+
+            assert_eq!(pulls.len(), 1);
+            assert_eq!(pulls[0].number, 7);
+            assert_eq!(pulls[0].base.ref_name, "main");
+            assert_eq!(pulls[0].head.ref_name, "feature/pr-diff");
+            assert_eq!(pulls[0].requested_reviewers[0].login, "octo");
+            assert_eq!(pulls[0].changed_files, Some(3));
+
+            let requests = http.requests.lock();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .uri()
+                    .to_string()
+                    .ends_with("/pulls?state=open&per_page=20&sort=updated&direction=desc")
+            );
+            assert_eq!(
+                requests[0]
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("Bearer secret")
+            );
+        });
+    }
+
+    #[test]
+    fn test_pull_request_files_fetches_file_patches() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"[
+                    {
+                        "filename": "src/lib.rs",
+                        "status": "modified",
+                        "additions": 2,
+                        "deletions": 1,
+                        "changes": 3,
+                        "patch": "@@ -1 +1 @@\n-old\n+new"
+                    },
+                    {
+                        "filename": "assets/image.png",
+                        "status": "renamed",
+                        "previous_filename": "assets/old.png"
+                    }
+                ]"#,
+            }]));
+
+            let files = pull_request_files("owner/repo", 7, Some("secret"), http.clone())
+                .await
+                .expect("pull request files should parse");
+
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0].filename, "src/lib.rs");
+            assert_eq!(files[0].patch.as_deref(), Some("@@ -1 +1 @@\n-old\n+new"));
+            assert_eq!(
+                files[1].previous_filename.as_deref(),
+                Some("assets/old.png")
+            );
+
+            let requests = http.requests.lock();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .uri()
+                    .to_string()
+                    .ends_with("/pulls/7/files?per_page=100")
+            );
+        });
+    }
+
+    #[test]
     fn test_repository_activity_fetches_issues_pull_requests_and_runs() {
         futures::executor::block_on(async {
             let http = Arc::new(TestHttpClient::new_with_headers(vec![
@@ -853,6 +1037,24 @@ mod tests {
                         "html_url": "https://github.com/owner/repo/pull/7",
                         "state": "open",
                         "user": { "login": "hubot" },
+                        "base": {
+                            "ref": "main",
+                            "sha": "base-sha",
+                            "repo": {
+                                "full_name": "owner/repo",
+                                "clone_url": "https://github.com/owner/repo.git",
+                                "ssh_url": "git@github.com:owner/repo.git"
+                            }
+                        },
+                        "head": {
+                            "ref": "feature/graph",
+                            "sha": "head-sha",
+                            "repo": {
+                                "full_name": "owner/repo",
+                                "clone_url": "https://github.com/owner/repo.git",
+                                "ssh_url": "git@github.com:owner/repo.git"
+                            }
+                        },
                         "draft": true,
                         "updated_at": "2026-06-24T11:00:00Z",
                         "labels": [{ "name": "enhancement" }],
@@ -1226,10 +1428,32 @@ mod tests {
                 user: super::GitHubUser {
                     login: "hubot".to_string(),
                 },
+                base: super::GitHubPullRequestBranch {
+                    ref_name: "main".to_string(),
+                    sha: "base-sha".to_string(),
+                    repo: Some(super::GitHubRepositoryRef {
+                        full_name: "owner/repo".to_string(),
+                        clone_url: Some("https://github.com/owner/repo.git".to_string()),
+                        ssh_url: Some("git@github.com:owner/repo.git".to_string()),
+                    }),
+                },
+                head: super::GitHubPullRequestBranch {
+                    ref_name: "feature/graph".to_string(),
+                    sha: "head-sha".to_string(),
+                    repo: Some(super::GitHubRepositoryRef {
+                        full_name: "owner/repo".to_string(),
+                        clone_url: Some("https://github.com/owner/repo.git".to_string()),
+                        ssh_url: Some("git@github.com:owner/repo.git".to_string()),
+                    }),
+                },
                 draft: false,
                 updated_at: Some("2026-06-24T11:00:00Z".to_string()),
                 labels: Vec::new(),
                 body: None,
+                requested_reviewers: Vec::new(),
+                comments: 0,
+                commits: None,
+                changed_files: None,
             }],
             workflow_runs: vec![super::GitHubWorkflowRun {
                 id: 42,

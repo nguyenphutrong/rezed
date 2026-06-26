@@ -7378,6 +7378,35 @@ impl Repository {
         )
     }
 
+    pub fn fetch_refspec(
+        &mut self,
+        remote_name: String,
+        refspec: String,
+        askpass: AskPassDelegate,
+        _cx: &mut App,
+    ) -> oneshot::Receiver<Result<RemoteCommandOutput>> {
+        self.send_job(
+            "fetch_refspec",
+            Some(format!("git fetch {remote_name} {refspec}").into()),
+            move |git_repo, cx| async move {
+                match git_repo {
+                    RepositoryState::Local(LocalRepositoryState {
+                        backend,
+                        environment,
+                        ..
+                    }) => {
+                        backend
+                            .fetch_refspec(remote_name, refspec, askpass, environment, cx)
+                            .await
+                    }
+                    RepositoryState::Remote(_) => {
+                        anyhow::bail!("GitHub pull request checkout is only supported locally")
+                    }
+                }
+            },
+        )
+    }
+
     pub fn pull(
         &mut self,
         branch: Option<SharedString>,

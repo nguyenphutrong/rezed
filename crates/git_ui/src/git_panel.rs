@@ -43,7 +43,7 @@ use gpui::{
     ScrollStrategy, Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity,
     actions, anchored, deferred, point, size, uniform_list,
 };
-use http_client::github::{GitHubActivityItem, GitHubActivityKind, GitHubRepositoryActivity};
+use http_client::github::GitHubPullRequest;
 use itertools::Itertools;
 use language::{Buffer, File};
 use language_model::{
@@ -412,10 +412,16 @@ enum GitPanelTab {
 enum GitHubActivityState {
     Idle,
     Loading,
-    Loaded(GitHubRepositoryActivity),
+    Loaded(GitHubPullRequests),
     Error(SharedString),
     UnsupportedRemote,
     Disconnected,
+}
+
+#[derive(Clone, Debug)]
+struct GitHubPullRequests {
+    repo_name_with_owner: SharedString,
+    pulls: Vec<GitHubPullRequest>,
 }
 
 #[derive(Clone, Debug)]
@@ -423,12 +429,6 @@ enum GitHubConnectionState {
     Unknown,
     Connected(GitHubIntegrationStatus),
     Disconnected,
-}
-
-struct GitHubActivityRow {
-    title: SharedString,
-    meta: SharedString,
-    url: String,
 }
 
 struct GitHubTokenSync {
@@ -971,6 +971,80 @@ fn github_missing_oauth_scopes(scopes: &[String]) -> Vec<String> {
         .filter(|required_scope| !scopes.iter().any(|scope| scope == required_scope))
         .map(ToString::to_string)
         .collect()
+}
+
+fn github_pull_request_local_branch(pull: &GitHubPullRequest) -> String {
+    let slug_source = if pull.head.ref_name.trim().is_empty() {
+        pull.title.as_str()
+    } else {
+        pull.head.ref_name.as_str()
+    };
+    format!("pr/{}-{}", pull.number, github_branch_slug(slug_source))
+}
+
+fn github_pull_request_refspec(pull_number: u64, local_branch: &str) -> String {
+    format!("+refs/pull/{pull_number}/head:refs/heads/{local_branch}")
+}
+
+fn github_branch_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "pull-request".to_string()
+    } else {
+        slug
+    }
+}
+
+fn github_pull_request_patch_text(
+    pull: &GitHubPullRequest,
+    files: &[http_client::github::GitHubPullRequestFile],
+) -> String {
+    let mut output = format!(
+        "Pull Request #{}: {}\n{} -> {}\n{}\n\n",
+        pull.number, pull.title, pull.head.ref_name, pull.base.ref_name, pull.html_url
+    );
+    if let Some(body) = pull
+        .body
+        .as_ref()
+        .and_then(|body| non_empty_token(body.clone()))
+    {
+        output.push_str(&body);
+        output.push_str("\n\n");
+    }
+    for file in files {
+        output.push_str(&format!(
+            "diff --git a/{0} b/{0}\n# status: {1}, +{2} -{3}\n",
+            file.filename, file.status, file.additions, file.deletions
+        ));
+        if let Some(previous_filename) = &file.previous_filename {
+            output.push_str(&format!("# renamed from {previous_filename}\n"));
+        }
+        match &file.patch {
+            Some(patch) => {
+                output.push_str(patch);
+                output.push('\n');
+            }
+            None => output.push_str("# binary or large file; patch unavailable\n"),
+        }
+        output.push('\n');
+    }
+    output
 }
 
 pub(crate) fn commit_message_editor(
@@ -5879,30 +5953,30 @@ impl GitPanel {
         self.github_activity_task = Some(cx.spawn(async move |this, cx| {
             let token_sync = Self::github_token(cx).await;
             let token = token_sync.token;
-            let activity = match (&token_sync.connection, token.as_deref()) {
+            let pulls = match (&token_sync.connection, token.as_deref()) {
                 (GitHubConnectionState::Disconnected, _) => None,
                 (GitHubConnectionState::Connected(_), None) => {
                     Some(Err(anyhow!("GitHub token is unavailable")))
                 }
                 (_, token) => {
-                    let activity = http_client::github::repository_activity(
-                        &repo_name_string,
-                        token,
-                        http_client,
-                    )
-                    .await;
-                    Some(activity)
+                    let pulls =
+                        http_client::github::pull_requests(&repo_name_string, token, http_client)
+                            .await;
+                    Some(pulls)
                 }
             };
 
             this.update(cx, |this, cx| {
                 this.github_connection = token_sync.connection;
-                match activity {
+                match pulls {
                     None => {
                         this.github_activity = GitHubActivityState::Disconnected;
                     }
-                    Some(Ok(activity)) => {
-                        this.github_activity = GitHubActivityState::Loaded(activity);
+                    Some(Ok(pulls)) => {
+                        this.github_activity = GitHubActivityState::Loaded(GitHubPullRequests {
+                            repo_name_with_owner: repo_name_string.into(),
+                            pulls,
+                        });
                     }
                     Some(Err(err)) => {
                         this.github_activity = GitHubActivityState::Error(err.to_string().into());
@@ -5920,6 +5994,127 @@ impl GitPanel {
     fn refresh_github_activity(&mut self, cx: &mut Context<Self>) {
         self.github_activity_repo = None;
         self.load_github_activity(cx);
+    }
+
+    fn checkout_github_pull_request(
+        &mut self,
+        repo_name_with_owner: SharedString,
+        pull: GitHubPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.changes_count > 0 {
+            self.show_error_toast(
+                "checkout pull request",
+                anyhow!("Commit or stash local changes before checking out a pull request"),
+                cx,
+            );
+            return;
+        }
+
+        let Some(repository) = self.active_repository.clone() else {
+            self.show_error_toast("checkout pull request", anyhow!("No active repository"), cx);
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let remote_name = "origin".to_string();
+        let local_branch = github_pull_request_local_branch(&pull);
+        let refspec = github_pull_request_refspec(pull.number, &local_branch);
+        let base_ref: SharedString = format!("{remote_name}/{}", pull.base.ref_name).into();
+        let askpass = self.askpass_delegate(format!("git fetch {remote_name}"), window, cx);
+
+        window
+            .spawn(cx, async move |cx| {
+                let fetch = repository.update(cx, |repository, cx| {
+                    repository.fetch_refspec(remote_name, refspec, askpass, cx)
+                });
+                fetch.await??;
+
+                let checkout = repository.update(cx, |repository, _| {
+                    repository.change_branch(local_branch.clone())
+                });
+                checkout.await??;
+
+                workspace.update_in(cx, |workspace, window, cx| {
+                    ProjectDiff::deploy_branch_diff_with_base_ref(
+                        workspace,
+                        workspace.project().clone(),
+                        repository,
+                        base_ref,
+                        window,
+                        cx,
+                    );
+                })?;
+
+                anyhow::Ok(())
+            })
+            .detach_and_prompt_err(
+                "Failed to checkout pull request",
+                window,
+                cx,
+                |error, _, _| Some(error.to_string()),
+            );
+
+        telemetry::event!(
+            "GitHub Pull Request Checkout Started",
+            repo = repo_name_with_owner.as_ref(),
+            pull_request = pull.number
+        );
+    }
+
+    fn preview_github_pull_request(
+        &mut self,
+        pull: GitHubPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(remote) = self.git_remote(cx) else {
+            self.show_error_toast(
+                "preview pull request",
+                anyhow!("No GitHub remote configured"),
+                cx,
+            );
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        let repo_name_with_owner = format!("{}/{}", remote.owner, remote.repo);
+        let http_client = cx.http_client();
+        window
+            .spawn(cx, async move |cx| {
+                let token = Self::github_token(cx).await.token;
+                let files = http_client::github::pull_request_files(
+                    &repo_name_with_owner,
+                    pull.number as u32,
+                    token.as_deref(),
+                    http_client,
+                )
+                .await?;
+                let patch = github_pull_request_patch_text(&pull, &files);
+
+                workspace.update_in(cx, |workspace, window, cx| {
+                    open_output(
+                        format!("GitHub PR #{}", pull.number),
+                        workspace,
+                        &patch,
+                        window,
+                        cx,
+                    );
+                })?;
+
+                anyhow::Ok(())
+            })
+            .detach_and_prompt_err(
+                "Failed to preview pull request",
+                window,
+                cx,
+                |error, _, _| Some(error.to_string()),
+            );
     }
 
     async fn github_token(cx: &mut AsyncApp) -> GitHubTokenSync {
@@ -6026,18 +6221,15 @@ impl GitPanel {
                                         .color(Color::Muted),
                                 ),
                         ),
-                        GitHubActivityState::Loaded(activity) => {
-                            if activity.issues.is_empty()
-                                && activity.pull_requests.is_empty()
-                                && activity.workflow_runs.is_empty()
-                            {
+                        GitHubActivityState::Loaded(pull_requests) => {
+                            if pull_requests.pulls.is_empty() {
                                 this.child(
                                     h_flex().flex_1().justify_center().child(
-                                        Label::new("No GitHub activity").color(Color::Muted),
+                                        Label::new("No open pull requests").color(Color::Muted),
                                     ),
                                 )
                             } else {
-                                this.child(self.render_github_activity(activity, cx))
+                                this.child(self.render_github_pull_requests(pull_requests, cx))
                             }
                         }
                     }),
@@ -6088,160 +6280,218 @@ impl GitPanel {
         }
     }
 
-    fn render_github_activity(
+    fn render_github_pull_requests(
         &self,
-        activity: &GitHubRepositoryActivity,
+        pull_requests: &GitHubPullRequests,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let activity_items = activity.to_activity_items();
+        let viewer_login = match &self.github_connection {
+            GitHubConnectionState::Connected(account) => Some(account.login.as_str()),
+            GitHubConnectionState::Unknown | GitHubConnectionState::Disconnected => None,
+        };
+        let waiting_for_review = pull_requests.pulls.iter().filter(|pull| {
+            viewer_login.is_some_and(|login| {
+                pull.requested_reviewers
+                    .iter()
+                    .any(|reviewer| reviewer.login.eq_ignore_ascii_case(login))
+            })
+        });
+        let created_by_me = pull_requests.pulls.iter().filter(|pull| {
+            viewer_login.is_some_and(|login| pull.user.login.eq_ignore_ascii_case(login))
+        });
+
         v_flex()
             .gap_3()
-            .child(
-                self.render_github_section(
-                    "Pull Requests",
-                    IconName::PullRequest,
-                    activity_items
-                        .iter()
-                        .filter(|item| item.kind == GitHubActivityKind::PullRequest)
-                        .map(Self::github_activity_row),
-                    cx,
-                ),
-            )
-            .child(
-                self.render_github_section(
-                    "Issues",
-                    IconName::Circle,
-                    activity_items
-                        .iter()
-                        .filter(|item| item.kind == GitHubActivityKind::Issue)
-                        .map(Self::github_activity_row),
-                    cx,
-                ),
-            )
-            .child(
-                self.render_github_section(
-                    "Actions",
-                    IconName::PlayOutlined,
-                    activity_items
-                        .iter()
-                        .filter(|item| item.kind == GitHubActivityKind::WorkflowRun)
-                        .map(Self::github_activity_row),
-                    cx,
-                ),
-            )
+            .child(self.render_github_pull_request_section(
+                "Waiting For My Review",
+                waiting_for_review,
+                pull_requests,
+                cx,
+            ))
+            .child(self.render_github_pull_request_section(
+                "Created By Me",
+                created_by_me,
+                pull_requests,
+                cx,
+            ))
+            .child(self.render_github_local_pull_request_branches(cx))
+            .child(self.render_github_pull_request_section(
+                "All Open",
+                pull_requests.pulls.iter(),
+                pull_requests,
+                cx,
+            ))
             .into_any_element()
     }
 
-    fn github_activity_row(item: &GitHubActivityItem) -> GitHubActivityRow {
-        let number = item
-            .issue_or_pull_request_number()
-            .map(|number| format!(" #{number}"))
-            .unwrap_or_default();
-        let labels = if item.labels.is_empty() {
-            String::new()
-        } else {
-            format!(" · {}", item.labels.iter().join(", "))
-        };
-        let author = item
-            .author_login
-            .as_ref()
-            .map(|author| format!(" · by {author}"))
-            .unwrap_or_default();
-        let updated_at = item
-            .updated_at
-            .as_ref()
-            .map(|updated_at| format!(" · updated {updated_at}"))
-            .unwrap_or_default();
-
-        let (kind, state) = match item.kind {
-            GitHubActivityKind::Issue => ("Issue", item.state.as_deref().unwrap_or("unknown")),
-            GitHubActivityKind::PullRequest => (
-                "Pull request",
-                if item.draft == Some(true) {
-                    "draft"
-                } else {
-                    item.state.as_deref().unwrap_or("unknown")
-                },
-            ),
-            GitHubActivityKind::WorkflowRun => {
-                ("Action", item.workflow_state().unwrap_or("unknown"))
-            }
-        };
-
-        let action_details = if item.kind == GitHubActivityKind::WorkflowRun {
-            format!(
-                " · {}{}{}",
-                item.workflow_event.as_deref().unwrap_or("unknown event"),
-                item.workflow_head_branch
-                    .as_ref()
-                    .map(|branch| format!(" · {branch}"))
-                    .unwrap_or_default(),
-                Self::github_activity_short_sha(item)
-                    .map(|sha| format!(" · {sha}"))
-                    .unwrap_or_default()
-            )
-        } else {
-            labels
-        };
-
-        GitHubActivityRow {
-            title: format!("{kind}{number} · {}", item.title).into(),
-            meta: format!("{state}{author}{action_details}{updated_at}").into(),
-            url: item.url.clone(),
-        }
-    }
-
-    fn github_activity_short_sha(item: &GitHubActivityItem) -> Option<&str> {
-        item.workflow_head_sha
-            .as_deref()
-            .map(|sha| &sha[..7.min(sha.len())])
-    }
-
-    fn render_github_section(
+    fn render_github_pull_request_section<'a>(
         &self,
         title: &'static str,
-        icon: IconName,
-        rows: impl Iterator<Item = GitHubActivityRow>,
+        pulls: impl Iterator<Item = &'a GitHubPullRequest>,
+        dashboard: &GitHubPullRequests,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rows = rows.collect::<Vec<_>>();
+        let pulls = pulls.collect::<Vec<_>>();
         v_flex()
             .gap_1()
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-                    .child(Label::new(format!("{title} ({})", rows.len())).color(Color::Muted)),
+                    .child(
+                        Icon::new(IconName::PullRequest)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(format!("{title} ({})", pulls.len())).color(Color::Muted)),
             )
-            .when(rows.is_empty(), |this| {
+            .when(pulls.is_empty(), |this| {
                 this.child(
                     Label::new(format!("No {}", title.to_lowercase()))
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
             })
-            .children(rows.into_iter().map(|row| self.render_github_row(row, cx)))
+            .children(
+                pulls
+                    .into_iter()
+                    .map(|pull| self.render_github_pull_request_row(pull, dashboard, cx)),
+            )
             .into_any_element()
     }
 
-    fn render_github_row(&self, row: GitHubActivityRow, cx: &mut Context<Self>) -> AnyElement {
-        let url = row.url.clone();
+    fn render_github_local_pull_request_branches(&self, cx: &mut Context<Self>) -> AnyElement {
+        let local_branches = self
+            .active_repository
+            .as_ref()
+            .map(|repository| {
+                repository.read_with(cx, |repository, _| {
+                    repository
+                        .branch_list
+                        .iter()
+                        .filter(|branch| branch.ref_name.starts_with("pr/"))
+                        .map(|branch| branch.ref_name.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
         v_flex()
-            .id(ElementId::Name(row.url.into()))
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "Local Pull Request Branches ({})",
+                            local_branches.len()
+                        ))
+                        .color(Color::Muted),
+                    ),
+            )
+            .when(local_branches.is_empty(), |this| {
+                this.child(
+                    Label::new("Checkout a pull request to create a local PR branch")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .children(local_branches.into_iter().map(|branch| {
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::GitBranch).size(IconSize::Small))
+                    .child(Label::new(branch).truncate())
+            }))
+            .into_any_element()
+    }
+
+    fn render_github_pull_request_row(
+        &self,
+        pull: &GitHubPullRequest,
+        dashboard: &GitHubPullRequests,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let number = pull.number;
+        let repo_name = dashboard.repo_name_with_owner.clone();
+        let title = format!("#{} {}", pull.number, pull.title);
+        let state = if pull.draft {
+            "draft"
+        } else {
+            pull.state.as_str()
+        };
+        let labels = if pull.labels.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · {}",
+                pull.labels
+                    .iter()
+                    .map(|label| label.name.as_str())
+                    .join(", ")
+            )
+        };
+        let changed_files = pull
+            .changed_files
+            .map(|count| format!(" · {count} files"))
+            .unwrap_or_default();
+        let meta = format!(
+            "{} · {} → {} · by @{}{}{}",
+            state, pull.head.ref_name, pull.base.ref_name, pull.user.login, changed_files, labels
+        );
+        let open_url = pull.html_url.clone();
+        let view_pull = pull.clone();
+        let preview_pull = pull.clone();
+
+        v_flex()
+            .id(ElementId::Name(format!("github-pr-{number}").into()))
             .w_full()
-            .cursor_pointer()
-            .gap_0p5()
+            .gap_1()
             .p_1()
             .rounded_sm()
             .hover(|this| this.bg(cx.theme().colors().element_hover))
-            .child(Label::new(row.title).truncate())
             .child(
-                Label::new(row.meta)
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::PullRequest).size(IconSize::Small))
+                    .child(Label::new(title).truncate()),
+            )
+            .child(
+                Label::new(meta)
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .truncate(),
             )
-            .on_click(move |_, _, cx| cx.open_url(&url))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new(("github-pr-view", number), "View Changes")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.checkout_github_pull_request(
+                                    repo_name.clone(),
+                                    view_pull.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(
+                        Button::new(("github-pr-preview", number), "Preview")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.preview_github_pull_request(preview_pull.clone(), window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new(("github-pr-open", number), "Open")
+                            .label_size(LabelSize::Small)
+                            .on_click(move |_, _, cx| cx.open_url(&open_url)),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -8478,26 +8728,41 @@ mod tests {
         })
     }
 
-    fn github_activity_item(kind: GitHubActivityKind) -> GitHubActivityItem {
-        GitHubActivityItem {
-            kind,
-            source_id: "github:owner/repo:item:1".to_string(),
-            repository_name_with_owner: "owner/repo".to_string(),
-            title: "Activity title".to_string(),
-            body: None,
-            author_login: Some("octo".to_string()),
-            labels: Vec::new(),
-            url: "https://github.com/owner/repo/issues/1".to_string(),
-            number: Some(1),
-            state: Some("open".to_string()),
-            draft: None,
+    fn github_pull_request() -> GitHubPullRequest {
+        GitHubPullRequest {
+            number: 42,
+            title: "Improve GitHub pull request flow".to_string(),
+            html_url: "https://github.com/owner/repo/pull/42".to_string(),
+            state: "open".to_string(),
+            user: http_client::github::GitHubUser {
+                login: "octo".to_string(),
+            },
+            base: http_client::github::GitHubPullRequestBranch {
+                ref_name: "main".to_string(),
+                sha: "base-sha".to_string(),
+                repo: Some(http_client::github::GitHubRepositoryRef {
+                    full_name: "owner/repo".to_string(),
+                    clone_url: Some("https://github.com/owner/repo.git".to_string()),
+                    ssh_url: Some("git@github.com:owner/repo.git".to_string()),
+                }),
+            },
+            head: http_client::github::GitHubPullRequestBranch {
+                ref_name: "Feature/PR Diff!".to_string(),
+                sha: "head-sha".to_string(),
+                repo: Some(http_client::github::GitHubRepositoryRef {
+                    full_name: "owner/repo".to_string(),
+                    clone_url: Some("https://github.com/owner/repo.git".to_string()),
+                    ssh_url: Some("git@github.com:owner/repo.git".to_string()),
+                }),
+            },
+            draft: false,
             updated_at: Some("2026-06-24T10:00:00Z".to_string()),
-            workflow_run_id: None,
-            workflow_status: None,
-            workflow_conclusion: None,
-            workflow_event: None,
-            workflow_head_branch: None,
-            workflow_head_sha: None,
+            labels: Vec::new(),
+            body: Some("Body".to_string()),
+            requested_reviewers: Vec::new(),
+            comments: 0,
+            commits: Some(2),
+            changed_files: Some(1),
         }
     }
 
@@ -8533,39 +8798,56 @@ mod tests {
     }
 
     #[test]
-    fn test_github_activity_row_formats_issue_pull_request_and_action() {
-        let mut issue = github_activity_item(GitHubActivityKind::Issue);
-        issue.labels = vec!["bug".to_string(), "regression".to_string()];
-        let issue_row = GitPanel::github_activity_row(&issue);
-        assert_eq!(issue_row.title.as_ref(), "Issue #1 · Activity title");
+    fn test_github_pull_request_checkout_refspec_uses_stable_local_branch() {
+        let pull_request = github_pull_request();
+
         assert_eq!(
-            issue_row.meta.as_ref(),
-            "open · by octo · bug, regression · updated 2026-06-24T10:00:00Z"
+            github_pull_request_local_branch(&pull_request),
+            "pr/42-feature-pr-diff"
+        );
+        assert_eq!(
+            github_pull_request_refspec(42, "pr/42-feature-pr-diff"),
+            "+refs/pull/42/head:refs/heads/pr/42-feature-pr-diff"
+        );
+    }
+
+    #[test]
+    fn test_github_pull_request_patch_text_includes_metadata_and_file_patches() {
+        let pull_request = github_pull_request();
+        let patch = github_pull_request_patch_text(
+            &pull_request,
+            &[
+                http_client::github::GitHubPullRequestFile {
+                    filename: "src/lib.rs".to_string(),
+                    status: "modified".to_string(),
+                    additions: 2,
+                    deletions: 1,
+                    changes: 3,
+                    patch: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+                    previous_filename: None,
+                },
+                http_client::github::GitHubPullRequestFile {
+                    filename: "assets/image.png".to_string(),
+                    status: "modified".to_string(),
+                    additions: 0,
+                    deletions: 0,
+                    changes: 0,
+                    patch: None,
+                    previous_filename: Some("assets/old.png".to_string()),
+                },
+            ],
         );
 
-        let mut pull_request = github_activity_item(GitHubActivityKind::PullRequest);
-        pull_request.draft = Some(true);
-        let pull_request_row = GitPanel::github_activity_row(&pull_request);
+        assert!(patch.contains("Pull Request #42: Improve GitHub pull request flow"));
+        assert!(patch.contains("Feature/PR Diff! -> main"));
+        assert!(patch.contains("diff --git a/src/lib.rs b/src/lib.rs"));
+        assert!(patch.contains("@@ -1 +1 @@\n-old\n+new"));
+        assert!(patch.contains("# renamed from assets/old.png"));
         assert_eq!(
-            pull_request_row.title.as_ref(),
-            "Pull request #1 · Activity title"
-        );
-        assert_eq!(
-            pull_request_row.meta.as_ref(),
-            "draft · by octo · updated 2026-06-24T10:00:00Z"
-        );
-
-        let mut workflow_run = github_activity_item(GitHubActivityKind::WorkflowRun);
-        workflow_run.number = None;
-        workflow_run.workflow_conclusion = Some("success".to_string());
-        workflow_run.workflow_event = Some("push".to_string());
-        workflow_run.workflow_head_branch = Some("main".to_string());
-        workflow_run.workflow_head_sha = Some("1234567890abcdef".to_string());
-        let workflow_run_row = GitPanel::github_activity_row(&workflow_run);
-        assert_eq!(workflow_run_row.title.as_ref(), "Action · Activity title");
-        assert_eq!(
-            workflow_run_row.meta.as_ref(),
-            "success · by octo · push · main · 1234567 · updated 2026-06-24T10:00:00Z"
+            patch
+                .matches("# binary or large file; patch unavailable")
+                .count(),
+            1
         );
     }
 

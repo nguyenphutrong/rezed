@@ -1145,6 +1145,15 @@ pub trait GitRepository: Send + Sync {
         cx: AsyncApp,
     ) -> BoxFuture<'_, Result<RemoteCommandOutput>>;
 
+    fn fetch_refspec(
+        &self,
+        remote_name: String,
+        refspec: String,
+        askpass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>>;
+
     fn get_push_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>>;
 
     fn get_branch_remote(&self, branch: String) -> BoxFuture<'_, Result<Option<Remote>>>;
@@ -3039,6 +3048,39 @@ impl GitRepository for RealGitRepository {
                 is_trusted,
             );
             let mut command = git.build_command(&["fetch", &remote_name]);
+            command
+                .envs(env.iter())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            run_git_command(env, ask_pass, command, executor).await
+        }
+        .boxed()
+    }
+
+    fn fetch_refspec(
+        &self,
+        remote_name: String,
+        refspec: String,
+        ask_pass: AskPassDelegate,
+        env: Arc<HashMap<String, String>>,
+        cx: AsyncApp,
+    ) -> BoxFuture<'_, Result<RemoteCommandOutput>> {
+        let working_directory = self.command_directory();
+        let git_directory = self.path();
+        let git_binary_path = self.system_git_binary_path.clone();
+        let executor = cx.background_executor().clone();
+        let is_trusted = self.is_trusted();
+        async move {
+            let git_binary_path = git_binary_path.context("git not found on $PATH, can't fetch")?;
+            let git = GitBinary::new(
+                git_binary_path,
+                working_directory,
+                git_directory,
+                executor.clone(),
+                is_trusted,
+            );
+            let mut command = git.build_command(&["fetch", &remote_name, &refspec]);
             command
                 .envs(env.iter())
                 .stdout(Stdio::piped())
