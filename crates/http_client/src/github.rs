@@ -369,17 +369,14 @@ pub async fn repository_activity(
         "{GITHUB_API_URL}/repos/{repo_name_with_owner}/actions/runs?per_page={GITHUB_ACTIVITY_PER_PAGE}&exclude_pull_requests=false"
     );
 
-    let issue_items: Vec<GitHubIssueItem> =
-        get_github_paginated_json(http.clone(), &issues_url, token).await?;
-    let pull_requests = get_github_paginated_json(http.clone(), &pulls_url, token).await?;
-    let mut workflow_runs = Vec::new();
-    let mut next_url = Some(workflow_runs_url);
-    while let Some(url) = next_url {
-        let (response, next) =
-            get_github_json_page::<GitHubWorkflowRunsResponse>(http.clone(), &url, token).await?;
-        workflow_runs.extend(response.workflow_runs);
-        next_url = next;
-    }
+    let (issue_items, _) =
+        get_github_json_page::<Vec<GitHubIssueItem>>(http.clone(), &issues_url, token).await?;
+    let (pull_requests, _) =
+        get_github_json_page::<Vec<GitHubPullRequest>>(http.clone(), &pulls_url, token).await?;
+    let (workflow_runs, _) =
+        get_github_json_page::<GitHubWorkflowRunsResponse>(http.clone(), &workflow_runs_url, token)
+            .await?;
+    let workflow_runs = workflow_runs.workflow_runs;
 
     Ok(GitHubRepositoryActivity {
         repository_name_with_owner: repo_name_with_owner.to_string(),
@@ -400,21 +397,6 @@ pub async fn repository_activity(
         pull_requests,
         workflow_runs,
     })
-}
-
-async fn get_github_paginated_json<T: for<'de> Deserialize<'de>>(
-    http: Arc<dyn HttpClient>,
-    url: &str,
-    token: Option<&str>,
-) -> anyhow::Result<Vec<T>> {
-    let mut items = Vec::new();
-    let mut next_url = Some(url.to_string());
-    while let Some(url) = next_url {
-        let (mut page, next) = get_github_json_page::<Vec<T>>(http.clone(), &url, token).await?;
-        items.append(&mut page);
-        next_url = next;
-    }
-    Ok(items)
 }
 
 async fn get_github_json_page<T: for<'de> Deserialize<'de>>(
@@ -866,22 +848,6 @@ mod tests {
                     headers: Vec::new(),
                     body: r#"[
                     {
-                        "number": 3,
-                        "title": "Closed issue",
-                        "html_url": "https://github.com/owner/repo/issues/3",
-                        "state": "closed",
-                        "user": { "login": "octo" },
-                        "updated_at": "2026-06-24T09:00:00Z",
-                        "labels": [],
-                        "body": null
-                    }
-                ]"#,
-                },
-                TestResponse {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: r#"[
-                    {
                         "number": 7,
                         "title": "Improve graph",
                         "html_url": "https://github.com/owner/repo/pull/7",
@@ -917,26 +883,6 @@ mod tests {
                     ]
                 }"#,
                 },
-                TestResponse {
-                    status: 200,
-                    headers: Vec::new(),
-                    body: r#"{
-                    "workflow_runs": [
-                        {
-                            "id": 43,
-                            "name": "Deploy",
-                            "html_url": "https://github.com/owner/repo/actions/runs/43",
-                            "status": "completed",
-                            "conclusion": "failure",
-                            "head_branch": "main",
-                            "head_sha": "abcdef1234567890",
-                            "actor": { "login": "deploy-user" },
-                            "updated_at": "2026-06-24T13:00:00Z",
-                            "event": "workflow_dispatch"
-                        }
-                    ]
-                }"#,
-                },
             ]));
 
             let activity = repository_activity("owner/repo", Some("secret"), http.clone())
@@ -944,9 +890,8 @@ mod tests {
                 .expect("activity should parse");
 
             assert_eq!(activity.repository_name_with_owner, "owner/repo");
-            assert_eq!(activity.issues.len(), 2);
+            assert_eq!(activity.issues.len(), 1);
             assert_eq!(activity.issues[0].number, 1);
-            assert_eq!(activity.issues[1].number, 3);
             assert_eq!(activity.pull_requests.len(), 1);
             assert_eq!(activity.pull_requests[0].number, 7);
             assert_eq!(activity.pull_requests[0].labels[0].name, "enhancement");
@@ -954,9 +899,8 @@ mod tests {
                 activity.pull_requests[0].body.as_deref(),
                 Some("pull request body")
             );
-            assert_eq!(activity.workflow_runs.len(), 2);
+            assert_eq!(activity.workflow_runs.len(), 1);
             assert_eq!(activity.workflow_runs[0].id, 42);
-            assert_eq!(activity.workflow_runs[1].id, 43);
 
             let sync_batch = activity.to_sync_batch();
             assert_eq!(sync_batch.repository_name_with_owner, "owner/repo");
@@ -967,27 +911,23 @@ mod tests {
                     .map(|item| item.source_id.as_str())
                     .collect::<Vec<_>>(),
                 vec![
-                    "github:owner/repo:workflow_run:43",
                     "github:owner/repo:workflow_run:42",
                     "github:owner/repo:pull_request:7",
                     "github:owner/repo:issue:1",
-                    "github:owner/repo:issue:3",
                 ]
             );
 
             let items = activity.to_activity_items();
-            assert_eq!(items.len(), 5);
+            assert_eq!(items.len(), 3);
             assert_eq!(
                 items
                     .iter()
                     .map(|item| item.source_id.as_str())
                     .collect::<Vec<_>>(),
                 vec![
-                    "github:owner/repo:workflow_run:43",
                     "github:owner/repo:workflow_run:42",
                     "github:owner/repo:pull_request:7",
                     "github:owner/repo:issue:1",
-                    "github:owner/repo:issue:3",
                 ]
             );
 
@@ -1004,13 +944,6 @@ mod tests {
             assert_eq!(issue.number, Some(1));
             assert_eq!(issue.state.as_deref(), Some("open"));
             assert_eq!(issue.updated_at.as_deref(), Some("2026-06-24T10:00:00Z"));
-
-            let closed_issue = items
-                .iter()
-                .find(|item| item.source_id == "github:owner/repo:issue:3")
-                .expect("closed issue item should exist");
-            assert_eq!(closed_issue.kind, GitHubActivityKind::Issue);
-            assert_eq!(closed_issue.state.as_deref(), Some("closed"));
 
             let pull_request = items
                 .iter()
@@ -1050,38 +983,25 @@ mod tests {
                 Some("1234567890abcdef")
             );
 
-            let deploy_run = items
-                .iter()
-                .find(|item| item.source_id == "github:owner/repo:workflow_run:43")
-                .expect("deploy workflow run item should exist");
-            assert_eq!(deploy_run.workflow_conclusion.as_deref(), Some("failure"));
-
             let requests = http.requests.lock();
-            assert_eq!(requests.len(), 5);
+            assert_eq!(requests.len(), 3);
             assert!(
                 requests[0]
                     .uri()
                     .to_string()
                     .ends_with("/issues?state=all&per_page=100&sort=updated&direction=desc")
             );
-            assert!(requests[1].uri().to_string().ends_with("/issues?page=2"));
             assert!(
-                requests[2]
+                requests[1]
                     .uri()
                     .to_string()
                     .ends_with("/pulls?state=all&per_page=100&sort=updated&direction=desc")
             );
             assert!(
-                requests[3]
+                requests[2]
                     .uri()
                     .to_string()
                     .ends_with("/actions/runs?per_page=100&exclude_pull_requests=false")
-            );
-            assert!(
-                requests[4]
-                    .uri()
-                    .to_string()
-                    .ends_with("/actions/runs?page=2")
             );
             assert!(requests.iter().all(|request| {
                 request
