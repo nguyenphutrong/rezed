@@ -3,6 +3,7 @@ use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
+use crate::github_pr_view::{GitHubPullRequestView, github_pull_request_row_meta};
 use crate::project_diff::{BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
@@ -422,6 +423,12 @@ enum GitHubActivityState {
 struct GitHubPullRequests {
     repo_name_with_owner: SharedString,
     pulls: Vec<GitHubPullRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedGitHubPullRequest {
+    repo_name_with_owner: SharedString,
+    number: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -844,6 +851,7 @@ pub struct GitPanel {
     github_activity: GitHubActivityState,
     github_connection: GitHubConnectionState,
     github_activity_repo: Option<SharedString>,
+    selected_github_pull_request: Option<SelectedGitHubPullRequest>,
     github_activity_task: Option<Task<()>>,
     github_activity_scroll_handle: ScrollHandle,
     _repo_subscriptions: Vec<Subscription>,
@@ -1265,6 +1273,7 @@ impl GitPanel {
                 github_activity: GitHubActivityState::Idle,
                 github_connection: GitHubConnectionState::Unknown,
                 github_activity_repo: None,
+                selected_github_pull_request: None,
                 github_activity_task: None,
                 github_activity_scroll_handle: ScrollHandle::new(),
                 _repo_subscriptions: Vec::new(),
@@ -5996,7 +6005,32 @@ impl GitPanel {
         self.load_github_activity(cx);
     }
 
-    fn checkout_github_pull_request(
+    fn open_github_pull_request_detail(
+        &mut self,
+        repo_name_with_owner: SharedString,
+        pull: GitHubPullRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_github_pull_request = Some(SelectedGitHubPullRequest {
+            repo_name_with_owner: repo_name_with_owner.clone(),
+            number: pull.number,
+        });
+
+        let Some(workspace) = self.workspace.upgrade() else {
+            cx.notify();
+            return;
+        };
+        let git_panel = cx.entity().downgrade();
+        let item =
+            cx.new(|cx| GitHubPullRequestView::new(repo_name_with_owner, pull, git_panel, cx));
+        workspace.update(cx, |workspace, cx| {
+            workspace.add_item_to_center(Box::new(item), window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn checkout_github_pull_request(
         &mut self,
         repo_name_with_owner: SharedString,
         pull: GitHubPullRequest,
@@ -6066,7 +6100,7 @@ impl GitPanel {
         );
     }
 
-    fn preview_github_pull_request(
+    pub(crate) fn preview_github_pull_request(
         &mut self,
         pull: GitHubPullRequest,
         window: &mut Window,
@@ -6290,32 +6324,47 @@ impl GitPanel {
             GitHubConnectionState::Connected(account) => Some(account.login.as_str()),
             GitHubConnectionState::Unknown | GitHubConnectionState::Disconnected => None,
         };
-        let waiting_for_review = pull_requests.pulls.iter().filter(|pull| {
-            viewer_login.is_some_and(|login| {
-                pull.requested_reviewers
-                    .iter()
-                    .any(|reviewer| reviewer.login.eq_ignore_ascii_case(login))
+        let waiting_for_review = pull_requests
+            .pulls
+            .iter()
+            .filter(|pull| {
+                viewer_login.is_some_and(|login| {
+                    pull.requested_reviewers
+                        .iter()
+                        .any(|reviewer| reviewer.login.eq_ignore_ascii_case(login))
+                })
             })
-        });
-        let created_by_me = pull_requests.pulls.iter().filter(|pull| {
-            viewer_login.is_some_and(|login| pull.user.login.eq_ignore_ascii_case(login))
-        });
+            .collect::<Vec<_>>();
+        let created_by_me = pull_requests
+            .pulls
+            .iter()
+            .filter(|pull| {
+                viewer_login.is_some_and(|login| pull.user.login.eq_ignore_ascii_case(login))
+            })
+            .collect::<Vec<_>>();
 
         v_flex()
-            .gap_3()
-            .child(self.render_github_pull_request_section(
-                "Waiting For My Review",
-                waiting_for_review,
-                pull_requests,
-                cx,
-            ))
-            .child(self.render_github_pull_request_section(
-                "Created By Me",
-                created_by_me,
-                pull_requests,
-                cx,
-            ))
-            .child(self.render_github_local_pull_request_branches(cx))
+            .gap_2()
+            .when(!waiting_for_review.is_empty(), |this| {
+                this.child(self.render_github_pull_request_section(
+                    "Waiting For My Review",
+                    waiting_for_review.into_iter(),
+                    pull_requests,
+                    cx,
+                ))
+            })
+            .when(!created_by_me.is_empty(), |this| {
+                this.child(self.render_github_pull_request_section(
+                    "Created By Me",
+                    created_by_me.into_iter(),
+                    pull_requests,
+                    cx,
+                ))
+            })
+            .when_some(
+                self.render_github_local_pull_request_branches(cx),
+                |this, branches| this.child(branches),
+            )
             .child(self.render_github_pull_request_section(
                 "All Open",
                 pull_requests.pulls.iter(),
@@ -6345,13 +6394,6 @@ impl GitPanel {
                     )
                     .child(Label::new(format!("{title} ({})", pulls.len())).color(Color::Muted)),
             )
-            .when(pulls.is_empty(), |this| {
-                this.child(
-                    Label::new(format!("No {}", title.to_lowercase()))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
             .children(
                 pulls
                     .into_iter()
@@ -6360,7 +6402,10 @@ impl GitPanel {
             .into_any_element()
     }
 
-    fn render_github_local_pull_request_branches(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_github_local_pull_request_branches(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let local_branches = self
             .active_repository
             .as_ref()
@@ -6375,6 +6420,9 @@ impl GitPanel {
                 })
             })
             .unwrap_or_default();
+        if local_branches.is_empty() {
+            return None;
+        }
         v_flex()
             .gap_1()
             .child(
@@ -6393,13 +6441,6 @@ impl GitPanel {
                         .color(Color::Muted),
                     ),
             )
-            .when(local_branches.is_empty(), |this| {
-                this.child(
-                    Label::new("Checkout a pull request to create a local PR branch")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            })
             .children(local_branches.into_iter().map(|branch| {
                 h_flex()
                     .gap_1()
@@ -6407,6 +6448,7 @@ impl GitPanel {
                     .child(Label::new(branch).truncate())
             }))
             .into_any_element()
+            .into()
     }
 
     fn render_github_pull_request_row(
@@ -6417,82 +6459,77 @@ impl GitPanel {
     ) -> AnyElement {
         let number = pull.number;
         let repo_name = dashboard.repo_name_with_owner.clone();
-        let title = format!("#{} {}", pull.number, pull.title);
-        let state = if pull.draft {
-            "draft"
+        let row_meta = github_pull_request_row_meta(&repo_name, pull);
+        let state_color = if pull.draft {
+            Color::Warning
+        } else if pull.state == "open" {
+            Color::Success
         } else {
-            pull.state.as_str()
+            Color::Muted
         };
-        let labels = if pull.labels.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " · {}",
-                pull.labels
-                    .iter()
-                    .map(|label| label.name.as_str())
-                    .join(", ")
-            )
-        };
-        let changed_files = pull
-            .changed_files
-            .map(|count| format!(" · {count} files"))
-            .unwrap_or_default();
-        let meta = format!(
-            "{} · {} → {} · by @{}{}{}",
-            state, pull.head.ref_name, pull.base.ref_name, pull.user.login, changed_files, labels
-        );
-        let open_url = pull.html_url.clone();
-        let view_pull = pull.clone();
-        let preview_pull = pull.clone();
+        let is_selected = self
+            .selected_github_pull_request
+            .as_ref()
+            .is_some_and(|selected| {
+                selected.repo_name_with_owner == repo_name && selected.number == pull.number
+            });
+        let pull = pull.clone();
 
-        v_flex()
+        h_flex()
             .id(ElementId::Name(format!("github-pr-{number}").into()))
             .w_full()
-            .gap_1()
-            .p_1()
+            .items_start()
+            .gap_2()
+            .px_2()
+            .py_1p5()
             .rounded_sm()
+            .cursor_pointer()
+            .when(is_selected, |this| {
+                this.bg(cx.theme().colors().element_selected)
+            })
             .hover(|this| this.bg(cx.theme().colors().element_hover))
             .child(
-                h_flex()
-                    .gap_1()
-                    .child(Icon::new(IconName::PullRequest).size(IconSize::Small))
-                    .child(Label::new(title).truncate()),
+                Icon::new(IconName::PullRequest)
+                    .size(IconSize::Small)
+                    .color(state_color),
             )
             .child(
-                Label::new(meta)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .truncate(),
-            )
-            .child(
-                h_flex()
+                v_flex()
+                    .min_w_0()
+                    .flex_1()
                     .gap_1()
                     .child(
-                        Button::new(("github-pr-view", number), "View Changes")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.checkout_github_pull_request(
-                                    repo_name.clone(),
-                                    view_pull.clone(),
-                                    window,
-                                    cx,
-                                );
-                            })),
+                        Label::new(row_meta.title)
+                            .size(LabelSize::Small)
+                            .color(Color::Default)
+                            .truncate(),
                     )
                     .child(
-                        Button::new(("github-pr-preview", number), "Preview")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.preview_github_pull_request(preview_pull.clone(), window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new(("github-pr-open", number), "Open")
-                            .label_size(LabelSize::Small)
-                            .on_click(move |_, _, cx| cx.open_url(&open_url)),
+                        Label::new(row_meta.metadata)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate(),
                     ),
             )
+            .when(pull.comments > 0, |this| {
+                this.child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            Icon::new(IconName::Chat)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(pull.comments.to_string())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_github_pull_request_detail(repo_name.clone(), pull.clone(), window, cx);
+            }))
             .into_any_element()
     }
 
@@ -8758,12 +8795,16 @@ mod tests {
             },
             draft: false,
             updated_at: Some("2026-06-24T10:00:00Z".to_string()),
+            created_at: Some("2026-06-20T10:00:00Z".to_string()),
             labels: Vec::new(),
             body: Some("Body".to_string()),
             requested_reviewers: Vec::new(),
             comments: 0,
+            review_comments: 0,
             commits: Some(2),
             changed_files: Some(1),
+            additions: Some(10),
+            deletions: Some(2),
         }
     }
 

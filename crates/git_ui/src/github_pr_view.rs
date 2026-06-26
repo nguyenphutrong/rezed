@@ -1,0 +1,594 @@
+use crate::git_panel::GitPanel;
+use gpui::{
+    App, Context, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, Styled, WeakEntity, Window,
+};
+use http_client::github::GitHubPullRequest;
+use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, UtcOffset};
+use time_format::{TimestampFormat, format_localized_timestamp};
+use ui::{
+    Button, ButtonSize, ButtonStyle, Color, Icon, IconName, IconSize, Label, LabelSize, div,
+    h_flex, prelude::*, v_flex,
+};
+use workspace::item::{Item, TabContentParams};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GitHubPullRequestRowMeta {
+    pub title: SharedString,
+    pub metadata: SharedString,
+}
+
+pub(crate) struct GitHubPullRequestView {
+    repo_name_with_owner: SharedString,
+    pull: GitHubPullRequest,
+    git_panel: WeakEntity<GitPanel>,
+    focus_handle: FocusHandle,
+}
+
+impl GitHubPullRequestView {
+    pub(crate) fn new(
+        repo_name_with_owner: SharedString,
+        pull: GitHubPullRequest,
+        git_panel: WeakEntity<GitPanel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            repo_name_with_owner,
+            pull,
+            git_panel,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn review_changes(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo_name = self.repo_name_with_owner.clone();
+        let pull = self.pull.clone();
+        self.git_panel
+            .update(cx, |git_panel, cx| {
+                git_panel.checkout_github_pull_request(repo_name, pull, window, cx);
+            })
+            .ok();
+    }
+
+    fn preview_changes(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let pull = self.pull.clone();
+        self.git_panel
+            .update(cx, |git_panel, cx| {
+                git_panel.preview_github_pull_request(pull, window, cx);
+            })
+            .ok();
+    }
+}
+
+pub(crate) fn github_pull_request_row_meta(
+    repo_name_with_owner: &str,
+    pull: &GitHubPullRequest,
+) -> GitHubPullRequestRowMeta {
+    let updated = pull
+        .updated_at
+        .as_deref()
+        .and_then(github_format_timestamp)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    GitHubPullRequestRowMeta {
+        title: pull.title.clone().into(),
+        metadata: format!(
+            "{} #{} · @{} · {}",
+            repo_name_with_owner, pull.number, pull.user.login, updated
+        )
+        .into(),
+    }
+}
+
+pub(crate) fn github_pull_request_state_label(pull: &GitHubPullRequest) -> &'static str {
+    if pull.draft {
+        "Draft"
+    } else {
+        match pull.state.as_str() {
+            "closed" => "Closed",
+            "open" => "Open",
+            _ => "Unknown",
+        }
+    }
+}
+
+pub(crate) fn github_pull_request_diff_boxes(additions: u32, deletions: u32) -> (usize, usize) {
+    const BOX_COUNT: usize = 5;
+    let total = additions + deletions;
+    if total == 0 {
+        return (0, 0);
+    }
+
+    let added = ((additions as f32 / total as f32) * BOX_COUNT as f32).round() as usize;
+    let added = added.min(BOX_COUNT);
+    (added, BOX_COUNT - added)
+}
+
+pub(crate) fn github_format_timestamp(timestamp: &str) -> Option<String> {
+    let timestamp = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
+    let timezone = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    Some(format_localized_timestamp(
+        timestamp,
+        OffsetDateTime::now_utc(),
+        timezone,
+        TimestampFormat::Relative,
+    ))
+}
+
+impl Render for GitHubPullRequestView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pull = &self.pull;
+        let row_meta = github_pull_request_row_meta(&self.repo_name_with_owner, pull);
+        let state_label = github_pull_request_state_label(pull);
+        let state_color = if pull.draft {
+            Color::Warning
+        } else if pull.state == "open" {
+            Color::Success
+        } else {
+            Color::Muted
+        };
+        let created = pull
+            .created_at
+            .as_deref()
+            .and_then(github_format_timestamp)
+            .unwrap_or_else(|| "unknown".to_string());
+        let updated = pull
+            .updated_at
+            .as_deref()
+            .and_then(github_format_timestamp)
+            .unwrap_or_else(|| "unknown".to_string());
+        let commits = pull.commits.unwrap_or_default();
+        let changed_files = pull.changed_files.unwrap_or_default();
+        let additions = pull.additions.unwrap_or_default();
+        let deletions = pull.deletions.unwrap_or_default();
+        let (added_boxes, deleted_boxes) = github_pull_request_diff_boxes(additions, deletions);
+
+        v_flex()
+            .id("github-pr-detail")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                h_flex()
+                    .items_start()
+                    .gap_8()
+                    .p_8()
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_6()
+                            .child(self.render_header(row_meta, state_label, state_color, cx))
+                            .child(self.render_stats_bar(
+                                commits,
+                                changed_files,
+                                additions,
+                                deletions,
+                                added_boxes,
+                                deleted_boxes,
+                                window,
+                                cx,
+                            ))
+                            .child(self.render_body(cx)),
+                    )
+                    .child(self.render_sidebar(created, updated, cx)),
+            )
+    }
+}
+
+impl GitHubPullRequestView {
+    fn render_header(
+        &self,
+        row_meta: GitHubPullRequestRowMeta,
+        state_label: &'static str,
+        state_color: Color,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Pull Requests")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new(self.repo_name_with_owner.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new("/").size(LabelSize::Small).color(Color::Muted))
+                    .child(
+                        Label::new(format!("#{}", self.pull.number))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::PullRequest)
+                            .size(IconSize::Medium)
+                            .color(state_color),
+                    )
+                    .child(Label::new(row_meta.title).size(LabelSize::Large).truncate()),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .child(self.render_pill(state_label, state_color, cx))
+                    .child(Label::new(format!("@{}", self.pull.user.login)).color(Color::Default))
+                    .child(Label::new("wants to merge into").color(Color::Muted))
+                    .child(self.render_ref_pill(self.pull.base.ref_name.as_str(), cx))
+                    .child(Label::new("from").color(Color::Muted))
+                    .child(self.render_ref_pill(self.pull.head.ref_name.as_str(), cx)),
+            )
+    }
+
+    fn render_stats_bar(
+        &self,
+        commits: u32,
+        changed_files: u32,
+        additions: u32,
+        deletions: u32,
+        added_boxes: usize,
+        deleted_boxes: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .justify_between()
+            .gap_3()
+            .rounded_lg()
+            .bg(cx.theme().colors().element_background)
+            .border_1()
+            .border_color(cx.theme().colors().border.opacity(0.5))
+            .px_4()
+            .py_2()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(self.render_stat(IconName::GitCommit, commits, "commits"))
+                    .child(self.render_stat(IconName::File, changed_files, "files changed"))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(Label::new(format!("+{additions}")).color(Color::Success))
+                            .child(Label::new(format!("-{deletions}")).color(Color::Error))
+                            .child(self.render_diff_boxes(added_boxes, deleted_boxes, cx)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Button::new("github-pr-review-changes", "Review changes")
+                            .style(ButtonStyle::Filled)
+                            .size(ButtonSize::Compact)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.review_changes(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("github-pr-preview-changes", "Preview")
+                            .size(ButtonSize::Compact)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.preview_changes(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("github-pr-open-browser", "Open")
+                            .size(ButtonSize::Compact)
+                            .on_click({
+                                let url = self.pull.html_url.clone();
+                                move |_, _, cx| cx.open_url(&url)
+                            }),
+                    ),
+            )
+    }
+
+    fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = self
+            .pull
+            .body
+            .as_deref()
+            .filter(|body| !body.trim().is_empty())
+            .unwrap_or("No description provided.");
+
+        v_flex()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border.opacity(0.5))
+            .p_4()
+            .child(Label::new("Summary").size(LabelSize::Large))
+            .child(
+                Label::new(body.to_string())
+                    .color(Color::Default)
+                    .line_height_style(ui::LineHeightStyle::UiLabel),
+            )
+    }
+
+    fn render_sidebar(
+        &self,
+        created: String,
+        updated: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .w_64()
+            .gap_5()
+            .child(self.render_label_section(cx))
+            .child(self.render_user_section("Reviewers", &self.pull.requested_reviewers, cx))
+            .child(self.render_participants(cx))
+            .child(self.render_details(created, updated, cx))
+    }
+
+    fn render_label_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(self.render_sidebar_heading("Labels"))
+            .when(self.pull.labels.is_empty(), |this| {
+                this.child(
+                    Label::new("No labels")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(self.pull.labels.iter().map(|label| {
+                        div()
+                            .rounded_md()
+                            .bg(cx.theme().colors().element_background)
+                            .px_2()
+                            .py_0p5()
+                            .child(Label::new(label.name.clone()).size(LabelSize::Small))
+                    })),
+            )
+    }
+
+    fn render_user_section(
+        &self,
+        title: &'static str,
+        users: &[http_client::github::GitHubUser],
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(self.render_sidebar_heading(title))
+            .when(users.is_empty(), |this| {
+                this.child(
+                    Label::new(format!("No {}", title.to_lowercase()))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .children(users.iter().map(|user| {
+                Label::new(format!("@{}", user.login))
+                    .size(LabelSize::Small)
+                    .color(Color::Default)
+            }))
+    }
+
+    fn render_participants(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(self.render_sidebar_heading("Participants"))
+            .child(Label::new(format!("@{}", self.pull.user.login)).size(LabelSize::Small))
+    }
+
+    fn render_details(
+        &self,
+        created: String,
+        updated: String,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        v_flex()
+            .gap_2()
+            .child(self.render_sidebar_heading("Details"))
+            .child(self.render_detail_row("Created", created))
+            .child(self.render_detail_row("Updated", updated))
+            .child(self.render_detail_row("Comments", self.pull.comments.to_string()))
+            .child(self.render_detail_row("Review comments", self.pull.review_comments.to_string()))
+    }
+
+    fn render_sidebar_heading(&self, title: &'static str) -> impl IntoElement {
+        Label::new(title)
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+            .weight(FontWeight::BOLD)
+    }
+
+    fn render_detail_row(&self, label: &'static str, value: String) -> impl IntoElement {
+        h_flex()
+            .justify_between()
+            .gap_3()
+            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted))
+            .child(
+                Label::new(value)
+                    .size(LabelSize::Small)
+                    .color(Color::Default),
+            )
+    }
+
+    fn render_stat(&self, icon: IconName, count: u32, label: &'static str) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+            .child(Label::new(count.to_string()).color(Color::Default))
+            .child(Label::new(label).color(Color::Muted))
+    }
+
+    fn render_pill(
+        &self,
+        label: &'static str,
+        color: Color,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .rounded_md()
+            .bg(cx.theme().colors().element_background)
+            .px_2()
+            .py_0p5()
+            .child(Label::new(label).size(LabelSize::Small).color(color))
+    }
+
+    fn render_ref_pill(&self, label: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .rounded_md()
+            .bg(cx.theme().colors().element_background)
+            .px_2()
+            .py_0p5()
+            .child(
+                Label::new(label.to_string())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+    }
+
+    fn render_diff_boxes(
+        &self,
+        added_boxes: usize,
+        deleted_boxes: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let muted_boxes = 5usize.saturating_sub(added_boxes + deleted_boxes);
+        h_flex()
+            .gap_0p5()
+            .children(
+                (0..added_boxes)
+                    .map(|_| div().size_2().rounded_sm().bg(cx.theme().status().created)),
+            )
+            .children(
+                (0..deleted_boxes)
+                    .map(|_| div().size_2().rounded_sm().bg(cx.theme().status().deleted)),
+            )
+            .children((0..muted_boxes).map(|_| {
+                div()
+                    .size_2()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().text_muted.opacity(0.3))
+            }))
+    }
+}
+
+impl Focusable for GitHubPullRequestView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<()> for GitHubPullRequestView {}
+
+impl Item for GitHubPullRequestView {
+    type Event = ();
+
+    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        Some(Icon::new(IconName::PullRequest).color(Color::Muted))
+    }
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        format!("#{} {}", self.pull.number, self.pull.title).into()
+    }
+
+    fn tab_content(
+        &self,
+        params: TabContentParams,
+        _window: &Window,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        Label::new(self.tab_content_text(params.detail.unwrap_or_default(), cx))
+            .color(params.text_color())
+            .into_any_element()
+    }
+
+    fn tab_tooltip_text(&self, _cx: &App) -> Option<SharedString> {
+        Some(self.pull.html_url.clone().into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_client::github::{GitHubPullRequestBranch, GitHubRepositoryRef, GitHubUser};
+
+    fn pull_request() -> GitHubPullRequest {
+        GitHubPullRequest {
+            number: 42,
+            title: "Improve GitHub PR UI".to_string(),
+            html_url: "https://github.com/owner/repo/pull/42".to_string(),
+            state: "open".to_string(),
+            user: GitHubUser {
+                login: "octo".to_string(),
+            },
+            base: GitHubPullRequestBranch {
+                ref_name: "main".to_string(),
+                sha: "base-sha".to_string(),
+                repo: Some(GitHubRepositoryRef {
+                    full_name: "owner/repo".to_string(),
+                    clone_url: None,
+                    ssh_url: None,
+                }),
+            },
+            head: GitHubPullRequestBranch {
+                ref_name: "feature/pr-ui".to_string(),
+                sha: "head-sha".to_string(),
+                repo: Some(GitHubRepositoryRef {
+                    full_name: "owner/repo".to_string(),
+                    clone_url: None,
+                    ssh_url: None,
+                }),
+            },
+            draft: false,
+            updated_at: None,
+            created_at: None,
+            labels: Vec::new(),
+            body: None,
+            requested_reviewers: Vec::new(),
+            comments: 3,
+            review_comments: 2,
+            commits: Some(4),
+            changed_files: Some(5),
+            additions: Some(12),
+            deletions: Some(4),
+        }
+    }
+
+    #[test]
+    fn test_github_pull_request_row_meta_is_compact() {
+        let pull = pull_request();
+        let row = github_pull_request_row_meta("owner/repo", &pull);
+
+        assert_eq!(row.title.as_ref(), "Improve GitHub PR UI");
+        assert_eq!(row.metadata.as_ref(), "owner/repo #42 · @octo · unknown");
+    }
+
+    #[test]
+    fn test_github_pull_request_state_label_prefers_draft() {
+        let mut pull = pull_request();
+        assert_eq!(github_pull_request_state_label(&pull), "Open");
+
+        pull.draft = true;
+        assert_eq!(github_pull_request_state_label(&pull), "Draft");
+
+        pull.draft = false;
+        pull.state = "closed".to_string();
+        assert_eq!(github_pull_request_state_label(&pull), "Closed");
+    }
+
+    #[test]
+    fn test_github_pull_request_diff_boxes_splits_additions_and_deletions() {
+        assert_eq!(github_pull_request_diff_boxes(0, 0), (0, 0));
+        assert_eq!(github_pull_request_diff_boxes(12, 4), (4, 1));
+        assert_eq!(github_pull_request_diff_boxes(0, 7), (0, 5));
+    }
+}

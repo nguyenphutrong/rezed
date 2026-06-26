@@ -355,6 +355,8 @@ pub struct GitHubPullRequest {
     #[serde(default)]
     pub updated_at: Option<String>,
     #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
     pub labels: Vec<GitHubLabel>,
     #[serde(default)]
     pub body: Option<String>,
@@ -363,9 +365,15 @@ pub struct GitHubPullRequest {
     #[serde(default)]
     pub comments: u32,
     #[serde(default)]
+    pub review_comments: u32,
+    #[serde(default)]
     pub commits: Option<u32>,
     #[serde(default)]
     pub changed_files: Option<u32>,
+    #[serde(default)]
+    pub additions: Option<u32>,
+    #[serde(default)]
+    pub deletions: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -913,10 +921,14 @@ mod tests {
                         },
                         "draft": true,
                         "updated_at": "2026-06-24T11:00:00Z",
+                        "created_at": "2026-06-20T11:00:00Z",
                         "labels": [{ "name": "enhancement" }],
                         "requested_reviewers": [{ "login": "octo" }],
                         "changed_files": 3,
-                        "commits": 2
+                        "commits": 2,
+                        "additions": 12,
+                        "deletions": 4,
+                        "review_comments": 5
                     }
                 ]"#,
             }]));
@@ -931,6 +943,10 @@ mod tests {
             assert_eq!(pulls[0].head.ref_name, "feature/pr-diff");
             assert_eq!(pulls[0].requested_reviewers[0].login, "octo");
             assert_eq!(pulls[0].changed_files, Some(3));
+            assert_eq!(pulls[0].additions, Some(12));
+            assert_eq!(pulls[0].deletions, Some(4));
+            assert_eq!(pulls[0].review_comments, 5);
+            assert_eq!(pulls[0].created_at.as_deref(), Some("2026-06-20T11:00:00Z"));
 
             let requests = http.requests.lock();
             assert_eq!(requests.len(), 1);
@@ -1057,8 +1073,12 @@ mod tests {
                         },
                         "draft": true,
                         "updated_at": "2026-06-24T11:00:00Z",
+                        "created_at": "2026-06-20T11:00:00Z",
                         "labels": [{ "name": "enhancement" }],
-                        "body": "pull request body"
+                        "body": "pull request body",
+                        "additions": 12,
+                        "deletions": 4,
+                        "review_comments": 5
                     }
                 ]"#,
                 },
@@ -1448,12 +1468,16 @@ mod tests {
                 },
                 draft: false,
                 updated_at: Some("2026-06-24T11:00:00Z".to_string()),
+                created_at: Some("2026-06-20T11:00:00Z".to_string()),
                 labels: Vec::new(),
                 body: None,
                 requested_reviewers: Vec::new(),
                 comments: 0,
+                review_comments: 0,
                 commits: None,
                 changed_files: None,
+                additions: None,
+                deletions: None,
             }],
             workflow_runs: vec![super::GitHubWorkflowRun {
                 id: 42,
