@@ -37,11 +37,11 @@ use git::{
     ViewFile, parse_git_remote_url,
 };
 use gpui::{
-    AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, DismissEvent,
-    Empty, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, KeyContext,
-    MouseButton, MouseDownEvent, Point, PromptLevel, ScrollHandle, ScrollStrategy, Subscription,
-    Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, actions, anchored, deferred,
-    point, size, uniform_list,
+    AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent,
+    ClipboardItem, DismissEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement, KeyContext, MouseButton, MouseDownEvent, Point, PromptLevel, ScrollHandle,
+    ScrollStrategy, Subscription, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity,
+    actions, anchored, deferred, point, size, uniform_list,
 };
 use http_client::github::{GitHubActivityItem, GitHubActivityKind, GitHubRepositoryActivity};
 use itertools::Itertools;
@@ -64,7 +64,6 @@ use project::{
 };
 use prompt_store::RULES_FILE_NAMES;
 use proto::RpcError;
-use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use settings::{
     GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore, StatusStyle,
@@ -328,10 +327,20 @@ pub fn register(workspace: &mut Workspace) {
             });
         }
     });
-    workspace.register_action(|_, _: &ConnectGitHub, window, cx| {
-        let client = client::Client::global(cx);
-        cx.spawn(async move |_, cx| {
-            github_oauth_flow(client, cx).await?;
+    workspace.register_action(|workspace, _: &ConnectGitHub, window, cx| {
+        let http_client = cx.http_client();
+        let workspace = workspace.weak_handle();
+        cx.spawn_in(window, async move |_, cx| {
+            let status = github_device_flow(http_client, cx).await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+                    panel.update(cx, |panel, cx| {
+                        panel.github_connection = GitHubConnectionState::Connected(status);
+                        panel.github_activity_repo = None;
+                        panel.activate_github_activity(true, window, cx);
+                    });
+                }
+            })?;
             anyhow::Ok(())
         })
         .detach_and_prompt_err("Failed to connect GitHub", window, cx, |error, _, _| {
@@ -339,10 +348,8 @@ pub fn register(workspace: &mut Workspace) {
         });
     });
     workspace.register_action(|workspace, _: &DisconnectGitHub, window, cx| {
-        let client = client::Client::global(cx);
         let workspace = workspace.weak_handle();
         cx.spawn_in(window, async move |_, cx| {
-            client.disconnect_github_integration(cx).await?;
             cx.update(|_, cx| cx.delete_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))?
                 .await?;
             workspace.update_in(cx, |workspace, window, cx| {
@@ -853,64 +860,116 @@ struct BulkStaging {
 
 const MAX_PANEL_EDITOR_LINES: usize = 6;
 const GITHUB_TOKEN_KEYCHAIN_KEY: &str = "github:api-token";
-const GITHUB_OAUTH_CALLBACK_HOST: &str = "127.0.0.1";
-const GITHUB_OAUTH_CALLBACK_PORT: u16 = 48176;
-const GITHUB_OAUTH_CALLBACK_PATH: &str = "/github/callback";
+const GITHUB_OAUTH_CLIENT_ID_ENV: &str = "GITHUB_OAUTH_CLIENT_ID";
+const GITHUB_DEVICE_SCOPE: &str = "repo read:user";
 
-async fn github_oauth_flow(
-    client: Arc<client::Client>,
-    cx: &mut AsyncApp,
+async fn github_device_flow(
+    http_client: Arc<dyn http_client::HttpClient>,
+    cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<GitHubIntegrationStatus> {
-    client.sign_in(true, cx).await?;
-
-    let (redirect_uri, callback_rx) =
-        oauth_callback_server::start_oauth_callback_server_with_config(
-            oauth_callback_server::OAuthCallbackServerConfig {
-                host: GITHUB_OAUTH_CALLBACK_HOST,
-                preferred_port: GITHUB_OAUTH_CALLBACK_PORT,
-                fallback_port: None,
-                path: GITHUB_OAUTH_CALLBACK_PATH,
-            },
+    let client_id = cx.update(|_, cx| github_oauth_client_id(cx))??;
+    let device_code = http_client::github::request_device_code(
+        &client_id,
+        GITHUB_DEVICE_SCOPE,
+        http_client.clone(),
+    )
+    .await?;
+    let verification_url = device_code
+        .verification_uri_complete
+        .clone()
+        .unwrap_or_else(|| device_code.verification_uri.clone());
+    let prompt = cx.update(|window, cx| {
+        cx.open_url(&verification_url);
+        cx.write_to_clipboard(ClipboardItem::new_string(device_code.user_code.clone()));
+        window.prompt(
+            PromptLevel::Info,
+            "Connect GitHub",
+            Some(&format!(
+                "A browser window has been opened. If GitHub asks for a code, use {}. The code has also been copied to your clipboard.",
+                device_code.user_code
+            )),
+            &["Continue", "Cancel"],
+            cx,
         )
-        .context("Failed to start GitHub OAuth callback server")?;
+    })?;
 
-    let state = github_oauth_state();
-    let authorize_url =
-        github_oauth_authorize_url(client.clone(), redirect_uri.clone(), state.clone(), cx).await?;
-
-    cx.update(|cx| cx.open_url(&authorize_url.url));
-
-    let callback = callback_rx
-        .await
-        .map_err(|_| anyhow!("GitHub OAuth callback was cancelled"))?
-        .context("GitHub OAuth callback failed")?;
-
-    if callback.state != state {
-        anyhow::bail!("GitHub OAuth state mismatch");
+    if prompt.await? != 0 {
+        anyhow::bail!("GitHub connection cancelled");
     }
 
-    client
-        .exchange_github_oauth_code(callback.code, redirect_uri, cx)
-        .await
+    let mut interval = Duration::from_secs(device_code.interval.max(1));
+    let expires_at = std::time::Instant::now() + Duration::from_secs(device_code.expires_in);
+    let token = loop {
+        if std::time::Instant::now() >= expires_at {
+            anyhow::bail!("GitHub device authorization expired");
+        }
+        cx.background_executor().timer(interval).await;
+        match http_client::github::poll_device_access_token(
+            &client_id,
+            &device_code.device_code,
+            http_client.clone(),
+        )
+        .await?
+        {
+            http_client::github::GitHubDeviceAccessTokenPoll::Pending => {}
+            http_client::github::GitHubDeviceAccessTokenPoll::SlowDown => {
+                interval += Duration::from_secs(5);
+            }
+            http_client::github::GitHubDeviceAccessTokenPoll::Complete(token) => break token,
+        }
+    };
+
+    let viewer = http_client::github::viewer(&token.access_token, http_client.clone()).await?;
+    cx.update(|_, cx| {
+        cx.write_credentials(
+            GITHUB_TOKEN_KEYCHAIN_KEY,
+            &viewer.login,
+            token.access_token.as_bytes(),
+        )
+    })?
+    .await?;
+
+    let scopes = github_oauth_scopes(&token.scope);
+    Ok(GitHubIntegrationStatus {
+        login: viewer.login,
+        missing_scopes: github_missing_oauth_scopes(&scopes),
+        scopes,
+    })
 }
 
-async fn github_oauth_authorize_url(
-    client: Arc<client::Client>,
-    redirect_uri: String,
-    state: String,
-    cx: &AsyncApp,
-) -> anyhow::Result<client::GitHubOAuthAuthorizeUrlResponse> {
-    client
-        .fetch_github_oauth_authorize_url(redirect_uri, Some(state), cx)
-        .await
+fn github_oauth_client_id(cx: &App) -> anyhow::Result<String> {
+    github_oauth_client_id_from(
+        GitPanelSettings::get_global(cx)
+            .github_oauth_client_id
+            .clone(),
+        std::env::var(GITHUB_OAUTH_CLIENT_ID_ENV).ok(),
+    )
 }
 
-fn github_oauth_state() -> String {
-    let mut state_bytes = [0u8; 16];
-    rand::rng().fill(&mut state_bytes);
-    state_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
+fn github_oauth_client_id_from(
+    setting_client_id: Option<String>,
+    env_client_id: Option<String>,
+) -> anyhow::Result<String> {
+    setting_client_id
+        .and_then(non_empty_token)
+        .or_else(|| env_client_id.and_then(non_empty_token))
+        .context(
+            "GitHub OAuth Client ID is not configured. Set git_panel.github_oauth_client_id or GITHUB_OAUTH_CLIENT_ID.",
+        )
+}
+
+fn github_oauth_scopes(scope: &str) -> Vec<String> {
+    scope
+        .split([',', ' '])
+        .filter_map(|scope| non_empty_token(scope.to_string()))
+        .collect()
+}
+
+fn github_missing_oauth_scopes(scopes: &[String]) -> Vec<String> {
+    GITHUB_DEVICE_SCOPE
+        .split_whitespace()
+        .filter(|required_scope| !scopes.iter().any(|scope| scope == required_scope))
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -5832,15 +5891,6 @@ impl GitPanel {
                         http_client,
                     )
                     .await;
-                    if let Ok(activity) = &activity {
-                        let client = cx.update(|cx| client::Client::global(cx));
-                        if let Err(error) = client
-                            .sync_github_activity(activity.to_sync_batch(), cx)
-                            .await
-                        {
-                            log::debug!("failed to sync GitHub activity to Rezed: {error:?}");
-                        }
-                    }
                     Some(activity)
                 }
             };
@@ -5873,69 +5923,37 @@ impl GitPanel {
     }
 
     async fn github_token(cx: &mut AsyncApp) -> GitHubTokenSync {
-        let client = cx.update(|cx| client::Client::global(cx));
-        match client.fetch_github_connected_account(cx).await {
-            Ok(Some(account)) => {
-                let token = non_empty_token(account.access_token.clone());
-                let status = account.to_status();
-                if let Some(token) = token.as_ref() {
-                    cx.update(|cx| {
-                        cx.write_credentials(
-                            GITHUB_TOKEN_KEYCHAIN_KEY,
-                            &account.login,
-                            token.as_bytes(),
-                        )
-                    })
-                    .await
-                    .log_err();
-                    telemetry::event!(
-                        "GitHub Token Synced",
-                        login = account.login.as_str(),
-                        scopes = &account.scopes
-                    );
-                } else {
-                    cx.update(|cx| cx.delete_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
-                        .await
-                        .log_err();
-                }
-                return GitHubTokenSync {
-                    token,
-                    connection: GitHubConnectionState::Connected(status),
-                };
-            }
-            Ok(None) => {
-                cx.update(|cx| cx.delete_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
-                    .await
-                    .log_err();
-                telemetry::event!("GitHub Integration Disconnected");
-                return GitHubTokenSync {
-                    token: None,
-                    connection: GitHubConnectionState::Disconnected,
-                };
-            }
-            Err(error) => {
-                log::debug!("failed to sync GitHub integration from Rezed: {error:?}");
-            }
-        }
-
         let keychain_token = cx
             .update(|cx| cx.read_credentials(GITHUB_TOKEN_KEYCHAIN_KEY))
             .await
             .ok()
             .flatten()
-            .and_then(|(_, password)| String::from_utf8(password).ok())
-            .and_then(non_empty_token);
+            .and_then(|(login, password)| {
+                let token = String::from_utf8(password).ok().and_then(non_empty_token)?;
+                Some((login, token))
+            });
 
-        if keychain_token.is_some() {
+        if let Some((login, token)) = keychain_token {
             return GitHubTokenSync {
-                token: keychain_token,
+                token: Some(token),
+                connection: GitHubConnectionState::Connected(GitHubIntegrationStatus {
+                    login,
+                    scopes: Vec::new(),
+                    missing_scopes: Vec::new(),
+                }),
+            };
+        }
+
+        if let Some(token) = std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token) {
+            return GitHubTokenSync {
+                token: Some(token),
                 connection: GitHubConnectionState::Unknown,
             };
         }
 
         GitHubTokenSync {
-            token: std::env::var("GITHUB_TOKEN").ok().and_then(non_empty_token),
-            connection: GitHubConnectionState::Unknown,
+            token: None,
+            connection: GitHubConnectionState::Disconnected,
         }
     }
 
@@ -8422,18 +8440,15 @@ pub(crate) fn commit_title_exceeds_limit(title: &str, max_length: usize) -> bool
 
 #[cfg(test)]
 mod tests {
-    use clock::FakeSystemClock;
     use git::{
         repository::repo_path,
         status::{StatusCode, UnmergedStatus, UnmergedStatusCode},
     };
     use gpui::{TestAppContext, UpdateGlobal, VisualTestContext, px};
-    use http_client::FakeHttpClient;
     use indoc::indoc;
     use project::FakeFs;
     use serde_json::json;
     use settings::SettingsStore;
-    use std::sync::Mutex;
     use theme::LoadThemes;
     use util::path;
     use util::rel_path::rel_path;
@@ -8487,75 +8502,34 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_github_connect_fetches_authorize_url_with_local_callback(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_github_connect_reports_missing_client_id(cx: &mut TestAppContext) {
         init_test(cx);
 
-        let request_count = Arc::new(Mutex::new(0));
-        let http_client = FakeHttpClient::create({
-            let request_count = request_count.clone();
-            move |request| {
-                let request_count = request_count.clone();
-                async move {
-                    *request_count.lock().unwrap() += 1;
-                    assert_eq!(
-                        request.uri().path(),
-                        "/client/integrations/github/oauth/authorize_url"
-                    );
-                    assert_eq!(
-                        request.uri().query(),
-                        Some(
-                            "redirect_uri=http%3A%2F%2F127.0.0.1%3A48176%2Fgithub%2Fcallback&state=test-state"
-                        )
-                    );
-                    assert_eq!(
-                        request
-                            .headers()
-                            .get("Authorization")
-                            .and_then(|header| header.to_str().ok()),
-                        Some("42 rezed-token")
-                    );
+        let error = github_oauth_client_id_from(None, None)
+            .expect_err("missing GitHub OAuth client id should fail");
 
-                    Ok(http_client::Response::builder()
-                        .status(200)
-                        .body(
-                            serde_json::json!({
-                                "url": "https://github.com/login/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A48176%2Fgithub%2Fcallback&state=test-state"
-                            })
-                            .to_string()
-                            .into(),
-                        )
-                        .unwrap())
-                }
-            }
-        });
-        let client =
-            cx.update(|cx| client::Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
-        client.override_authenticate(|cx| {
-            cx.background_spawn(async {
-                Ok(client::Credentials {
-                    user_id: 42,
-                    access_token: "rezed-token".into(),
-                })
-            })
-        });
-
-        client.sign_in(true, &mut cx.to_async()).await.unwrap();
-        let response = github_oauth_authorize_url(
-            client,
-            "http://127.0.0.1:48176/github/callback".to_string(),
-            "test-state".to_string(),
-            &cx.to_async(),
-        )
-        .await
-        .expect("authorize URL should use local callback");
-
-        assert_eq!(
-            response.url,
-            "https://github.com/login/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A48176%2Fgithub%2Fcallback&state=test-state"
+        assert!(
+            error
+                .to_string()
+                .contains("GitHub OAuth Client ID is not configured")
         );
-        assert_eq!(*request_count.lock().unwrap(), 1);
+        assert_eq!(
+            github_oauth_client_id_from(Some(" ".to_string()), Some("env-client-id".to_string()))
+                .expect("env GitHub OAuth client id should be used"),
+            "env-client-id"
+        );
+    }
+
+    #[test]
+    fn test_github_oauth_scopes_parse_and_report_missing_scopes() {
+        let scopes = github_oauth_scopes("repo,read:user workflow");
+
+        assert_eq!(scopes, vec!["repo", "read:user", "workflow"]);
+        assert!(github_missing_oauth_scopes(&scopes).is_empty());
+        assert_eq!(
+            github_missing_oauth_scopes(&["repo".to_string()]),
+            vec!["read:user".to_string()]
+        );
     }
 
     #[test]

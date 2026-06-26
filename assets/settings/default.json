@@ -1019,6 +1019,11 @@
     // Choices: project_diff, file_diff, view_file
     // Default: project_diff
     "entry_primary_click_action": "project_diff",
+    // GitHub OAuth App client id used by desktop-only GitHub device authorization.
+    // Can also be provided with the GITHUB_OAUTH_CLIENT_ID environment variable.
+    //
+    // Default: null
+    "github_oauth_client_id": null,
   },
   "message_editor": {
     // Whether to automatically replace emoji shortcodes with emoji characters.

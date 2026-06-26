@@ -8,12 +8,53 @@ use std::sync::Arc;
 use url::Url;
 
 const GITHUB_API_URL: &str = "https://api.github.com";
+const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const GITHUB_DEVICE_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_ACTIVITY_PER_PAGE: usize = 100;
 
 pub struct GitHubLspBinaryVersion {
     pub name: String,
     pub url: String,
     pub digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GitHubDeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(default)]
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GitHubDeviceAccessToken {
+    pub access_token: String,
+    pub token_type: String,
+    pub scope: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitHubDeviceAccessTokenPoll {
+    Pending,
+    SlowDown,
+    Complete(GitHubDeviceAccessToken),
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GitHubViewer {
+    pub login: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubDeviceAccessTokenResponse {
+    access_token: Option<String>,
+    token_type: Option<String>,
+    scope: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -31,6 +72,90 @@ pub struct GithubReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
     pub digest: Option<String>,
+}
+
+pub async fn request_device_code(
+    client_id: &str,
+    scope: &str,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<GitHubDeviceCode> {
+    let body = serde_urlencoded::to_string([("client_id", client_id), ("scope", scope)])?;
+    let request = Request::post(GITHUB_DEVICE_CODE_URL)
+        .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .header("User-Agent", "Rezed")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(AsyncBody::from(body))?;
+
+    let mut response = http.send(request).await?;
+    read_github_json_response(&mut response)
+        .await
+        .context("error requesting GitHub device code")
+}
+
+pub async fn poll_device_access_token(
+    client_id: &str,
+    device_code: &str,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<GitHubDeviceAccessTokenPoll> {
+    let body = serde_urlencoded::to_string([
+        ("client_id", client_id),
+        ("device_code", device_code),
+        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+    ])?;
+    let request = Request::post(GITHUB_DEVICE_ACCESS_TOKEN_URL)
+        .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .header("User-Agent", "Rezed")
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(AsyncBody::from(body))?;
+
+    let mut response = http.send(request).await?;
+    let payload: GitHubDeviceAccessTokenResponse = read_github_json_response(&mut response)
+        .await
+        .context("error polling GitHub device token")?;
+
+    match payload.error.as_deref() {
+        Some("authorization_pending") => Ok(GitHubDeviceAccessTokenPoll::Pending),
+        Some("slow_down") => Ok(GitHubDeviceAccessTokenPoll::SlowDown),
+        Some(error) => {
+            let description = payload
+                .error_description
+                .unwrap_or_else(|| error.to_string());
+            bail!("GitHub device authorization failed: {description}")
+        }
+        None => {
+            let access_token = payload
+                .access_token
+                .context("GitHub device authorization did not return an access token")?;
+            let token_type = payload
+                .token_type
+                .context("GitHub device authorization did not return a token type")?;
+            let scope = payload.scope.unwrap_or_default();
+            Ok(GitHubDeviceAccessTokenPoll::Complete(
+                GitHubDeviceAccessToken {
+                    access_token,
+                    token_type,
+                    scope,
+                },
+            ))
+        }
+    }
+}
+
+pub async fn viewer(token: &str, http: Arc<dyn HttpClient>) -> anyhow::Result<GitHubViewer> {
+    let request = Request::get(format!("{GITHUB_API_URL}/user"))
+        .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .header("User-Agent", "Rezed")
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("Authorization", format!("Bearer {}", token))
+        .body(AsyncBody::default())?;
+
+    let mut response = http.send(request).await?;
+    read_github_json_response(&mut response)
+        .await
+        .context("error fetching GitHub user")
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,6 +461,31 @@ async fn get_github_json_page<T: for<'de> Deserialize<'de>>(
     Ok((value, next_url))
 }
 
+async fn read_github_json_response<T: for<'de> Deserialize<'de>>(
+    response: &mut crate::Response<AsyncBody>,
+) -> anyhow::Result<T> {
+    let status = response.status();
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .read_to_end(&mut body)
+        .await
+        .context("error reading GitHub API response")?;
+
+    if !status.is_success() {
+        return Err(github_status_error(status, &body));
+    }
+
+    serde_json::from_slice(&body).map_err(|err| {
+        log::error!("Error deserializing GitHub API response: {err:?}");
+        log::error!(
+            "GitHub API response text: {:?}",
+            String::from_utf8_lossy(body.as_slice())
+        );
+        anyhow!("error deserializing GitHub API response: {err:?}")
+    })
+}
+
 fn github_next_link(link_header: &str) -> Option<String> {
     link_header.split(',').find_map(|link| {
         let (url, params) = link.split_once(';')?;
@@ -500,9 +650,13 @@ pub fn build_asset_url(repo_name_with_owner: &str, tag: &str, kind: AssetKind) -
 mod tests {
     use crate::{
         AsyncBody, HttpClient, RedirectPolicy, Response, StatusCode,
-        github::{AssetKind, GitHubActivityKind, build_asset_url, repository_activity},
+        github::{
+            AssetKind, GitHubActivityKind, GitHubDeviceAccessTokenPoll, build_asset_url,
+            poll_device_access_token, repository_activity, request_device_code, viewer,
+        },
     };
     use anyhow::Result;
+    use futures::AsyncReadExt as _;
     use futures::future::BoxFuture;
     use http::Request;
     use parking_lot::Mutex;
@@ -525,6 +679,155 @@ mod tests {
             zip,
             "https://github.com/microsoft/vscode-eslint/archive/refs/tags/release%2F2.3.5.zip"
         );
+    }
+
+    #[test]
+    fn test_request_device_code_posts_client_id_and_scope() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{
+                    "device_code": "device-code",
+                    "user_code": "ABCD-1234",
+                    "verification_uri": "https://github.com/login/device",
+                    "verification_uri_complete": "https://github.com/login/device?user_code=ABCD-1234",
+                    "expires_in": 900,
+                    "interval": 5
+                }"#,
+            }]));
+
+            let response = request_device_code("client-id", "repo read:user", http.clone())
+                .await
+                .expect("device code request should succeed");
+
+            assert_eq!(response.device_code, "device-code");
+            assert_eq!(response.user_code, "ABCD-1234");
+            assert_eq!(response.expires_in, 900);
+            assert_eq!(response.interval, 5);
+
+            let mut requests = http.requests.lock();
+            assert_eq!(requests.len(), 1);
+            let request = requests.first_mut().unwrap();
+            assert_eq!(request.method(), http::Method::POST);
+            assert_eq!(request.uri(), "https://github.com/login/device/code");
+            assert_eq!(
+                request
+                    .headers()
+                    .get("Accept")
+                    .and_then(|header| header.to_str().ok()),
+                Some("application/json")
+            );
+            let mut body = String::new();
+            request.body_mut().read_to_string(&mut body).await.unwrap();
+            assert_eq!(body, "client_id=client-id&scope=repo+read%3Auser");
+        });
+    }
+
+    #[test]
+    fn test_poll_device_access_token_handles_pending_slow_down_and_success() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"{"error":"authorization_pending"}"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"{"error":"slow_down"}"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"{
+                        "access_token": "github-token",
+                        "token_type": "bearer",
+                        "scope": "repo,read:user"
+                    }"#,
+                },
+            ]));
+
+            assert_eq!(
+                poll_device_access_token("client-id", "device-code", http.clone())
+                    .await
+                    .unwrap(),
+                GitHubDeviceAccessTokenPoll::Pending
+            );
+            assert_eq!(
+                poll_device_access_token("client-id", "device-code", http.clone())
+                    .await
+                    .unwrap(),
+                GitHubDeviceAccessTokenPoll::SlowDown
+            );
+            let GitHubDeviceAccessTokenPoll::Complete(token) =
+                poll_device_access_token("client-id", "device-code", http.clone())
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected device flow to complete");
+            };
+            assert_eq!(token.access_token, "github-token");
+            assert_eq!(token.scope, "repo,read:user");
+
+            let mut requests = http.requests.lock();
+            assert_eq!(requests.len(), 3);
+            let request = requests.first_mut().unwrap();
+            let mut body = String::new();
+            request.body_mut().read_to_string(&mut body).await.unwrap();
+            assert_eq!(
+                body,
+                "client_id=client-id&device_code=device-code&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+            );
+        });
+    }
+
+    #[test]
+    fn test_poll_device_access_token_rejects_terminal_errors() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{
+                    "error": "expired_token",
+                    "error_description": "The device code has expired."
+                }"#,
+            }]));
+
+            let error = poll_device_access_token("client-id", "device-code", http.clone())
+                .await
+                .expect_err("expired token should fail");
+
+            assert!(error.to_string().contains("The device code has expired."));
+        });
+    }
+
+    #[test]
+    fn test_viewer_fetches_authenticated_github_user() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{"login":"octo"}"#,
+            }]));
+
+            let user = viewer("github-token", http.clone())
+                .await
+                .expect("viewer request should succeed");
+
+            assert_eq!(user.login, "octo");
+            let requests = http.requests.lock();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].uri(), "https://api.github.com/user");
+            assert_eq!(
+                requests[0]
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("Bearer github-token")
+            );
+        });
     }
 
     #[test]

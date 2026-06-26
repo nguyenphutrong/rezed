@@ -723,6 +723,11 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: project_diff
     pub entry_primary_click_action: Option<GitPanelClickBehavior>,
+
+    /// GitHub OAuth App client id used for desktop-only device authorization.
+    ///
+    /// Default: null
+    pub github_oauth_client_id: Option<String>,
 }
 
 #[derive(

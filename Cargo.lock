@@ -7432,7 +7432,6 @@ dependencies = [
  "menu",
  "multi_buffer",
  "notifications",
- "oauth_callback_server",
  "panel",
  "picker",
  "pretty_assertions",

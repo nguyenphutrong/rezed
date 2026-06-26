@@ -45,7 +45,6 @@ markdown.workspace = true
 menu.workspace = true
 multi_buffer.workspace = true
 notifications.workspace = true
-oauth_callback_server.workspace = true
 panel.workspace = true
 picker.workspace = true
 project.workspace = true
