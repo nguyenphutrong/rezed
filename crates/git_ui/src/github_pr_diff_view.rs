@@ -965,7 +965,8 @@ impl GitHubPrDiffView {
         let (file_count, additions, deletions) = github_pr_diff_totals(&self.files);
         h_flex()
             .w_full()
-            .min_h(rems(2.75))
+            .h(rems(2.))
+            .flex_none()
             .px_3()
             .gap_3()
             .border_b_1()
@@ -1123,6 +1124,8 @@ impl GitHubPrDiffView {
                                     .collect::<Vec<_>>()
                             },
                         )
+                        .size_full()
+                        .flex_grow_1()
                         .track_scroll(&self.files_scroll_handle),
                     ),
             )
