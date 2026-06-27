@@ -1,14 +1,19 @@
 use crate::{git_panel::GitPanel, github_pr_diff_view::GitHubPrDiffView};
-use editor::{Editor, EditorElement, EditorStyle};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, TextStyle,
-    WeakEntity, Window, relative, rems,
+    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, WeakEntity,
+    Window,
 };
-use http_client::github::GitHubPullRequest;
-use language::Buffer;
-use settings::Settings;
-use theme_settings::ThemeSettings;
+use http_client::{
+    HttpClient,
+    github::{
+        GitHubCheckRun, GitHubCombinedStatus, GitHubCommitStatus, GitHubIssueComment,
+        GitHubPullRequest, GitHubPullRequestCommit, GitHubPullRequestReview,
+        GitHubPullRequestReviewComment,
+    },
+};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 use time_format::{TimestampFormat, format_localized_timestamp};
@@ -29,10 +34,82 @@ pub(crate) struct GitHubPullRequestView {
     repo_name_with_owner: SharedString,
     pull: GitHubPullRequest,
     git_panel: WeakEntity<GitPanel>,
-    body_editor: Entity<Editor>,
+    body_markdown: Entity<Markdown>,
+    review_detail: GitHubPullRequestReviewDetailState,
+    review_detail_task: Option<gpui::Task<()>>,
     checking_out: bool,
     viewing_changes: bool,
     focus_handle: FocusHandle,
+}
+
+enum GitHubPullRequestReviewDetailState {
+    NotLoaded,
+    Loading,
+    Loaded(GitHubPullRequestReviewDetail),
+    Error(SharedString),
+}
+
+struct GitHubPullRequestReviewDetail {
+    timeline: Vec<GitHubPullRequestTimelineItem>,
+    review_summary: GitHubPullRequestReviewSummary,
+    checks_summary: GitHubPullRequestChecksSummary,
+    errors: Vec<SharedString>,
+}
+
+#[derive(Default)]
+struct GitHubPullRequestReviewSummary {
+    approved: usize,
+    changes_requested: usize,
+    commented: usize,
+    pending_reviewers: usize,
+}
+
+struct GitHubPullRequestChecksSummary {
+    overall: GitHubPullRequestCheckState,
+    items: Vec<GitHubPullRequestCheckItem>,
+}
+
+struct GitHubPullRequestCheckItem {
+    name: SharedString,
+    state: GitHubPullRequestCheckState,
+    description: Option<SharedString>,
+    url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitHubPullRequestCheckState {
+    Passed,
+    Failed,
+    Pending,
+    Skipped,
+    Missing,
+}
+
+struct GitHubPullRequestTimelineItem {
+    kind: GitHubPullRequestTimelineItemKind,
+    author: SharedString,
+    timestamp: Option<String>,
+    title: SharedString,
+    metadata: Option<SharedString>,
+    markdown: Option<Entity<Markdown>>,
+    url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitHubPullRequestTimelineItemKind {
+    Commit,
+    Comment,
+    Review,
+    ReviewComment,
+}
+
+struct GitHubPullRequestReviewDetailLoad {
+    commits: Result<Vec<GitHubPullRequestCommit>, String>,
+    issue_comments: Result<Vec<GitHubIssueComment>, String>,
+    reviews: Result<Vec<GitHubPullRequestReview>, String>,
+    review_comments: Result<Vec<GitHubPullRequestReviewComment>, String>,
+    check_runs: Result<Vec<GitHubCheckRun>, String>,
+    combined_status: Result<GitHubCombinedStatus, String>,
 }
 
 impl GitHubPullRequestView {
@@ -40,15 +117,17 @@ impl GitHubPullRequestView {
         repo_name_with_owner: SharedString,
         pull: GitHubPullRequest,
         git_panel: WeakEntity<GitPanel>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let body_editor = Self::new_body_editor(&pull, window, cx);
+        let body_markdown = Self::new_body_markdown(&pull, cx);
         Self {
             repo_name_with_owner,
             pull,
             git_panel,
-            body_editor,
+            body_markdown,
+            review_detail: GitHubPullRequestReviewDetailState::NotLoaded,
+            review_detail_task: None,
             checking_out: false,
             viewing_changes: false,
             focus_handle: cx.focus_handle(),
@@ -59,32 +138,64 @@ impl GitHubPullRequestView {
         &mut self,
         repo_name_with_owner: SharedString,
         pull: GitHubPullRequest,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.repo_name_with_owner = repo_name_with_owner;
         self.pull = pull;
         self.checking_out = false;
         self.viewing_changes = false;
-        self.body_editor = Self::new_body_editor(&self.pull, window, cx);
+        self.body_markdown = Self::new_body_markdown(&self.pull, cx);
+        self.review_detail = GitHubPullRequestReviewDetailState::NotLoaded;
+        self.review_detail_task = None;
         cx.notify();
     }
 
-    fn new_body_editor(
-        pull: &GitHubPullRequest,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<Editor> {
+    fn new_body_markdown(pull: &GitHubPullRequest, cx: &mut Context<Self>) -> Entity<Markdown> {
         let body = github_pull_request_body_text(pull);
-        let buffer = cx.new(|cx| Buffer::local(body.as_ref(), cx));
-        buffer.update(cx, |buffer, cx| {
-            buffer.set_capability(language::Capability::ReadOnly, cx);
-        });
-        cx.new(|cx| {
-            let mut editor = Editor::for_buffer(buffer, None, window, cx);
-            editor.set_read_only(true);
-            editor
-        })
+        cx.new(|cx| Markdown::new(body, None, None, cx))
+    }
+
+    pub(crate) fn load_review_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(
+            self.review_detail,
+            GitHubPullRequestReviewDetailState::Loading
+        ) {
+            return;
+        }
+
+        let repo_name = self.repo_name_with_owner.to_string();
+        let pull = self.pull.clone();
+        let http_client = cx.http_client();
+        self.review_detail = GitHubPullRequestReviewDetailState::Loading;
+        self.review_detail_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let token = GitPanel::github_token(cx).await.token;
+            let detail = load_github_pull_request_review_detail(
+                &repo_name,
+                &pull,
+                token.as_deref(),
+                http_client,
+            )
+            .await;
+
+            this.update(cx, |this, cx| {
+                this.review_detail_task = None;
+                match detail {
+                    Ok(detail) => {
+                        this.review_detail = GitHubPullRequestReviewDetailState::Loaded(
+                            this.build_review_detail(detail, cx),
+                        );
+                    }
+                    Err(error) => {
+                        this.review_detail =
+                            GitHubPullRequestReviewDetailState::Error(error.to_string().into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn checkout_pull_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -285,6 +396,388 @@ pub(crate) fn github_format_timestamp(timestamp: &str) -> Option<String> {
     ))
 }
 
+async fn load_github_pull_request_review_detail(
+    repo_name_with_owner: &str,
+    pull: &GitHubPullRequest,
+    token: Option<&str>,
+    http_client: Arc<dyn HttpClient>,
+) -> anyhow::Result<GitHubPullRequestReviewDetailLoad> {
+    let commits = http_client::github::pull_request_commits(
+        repo_name_with_owner,
+        pull.number,
+        token,
+        http_client.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string());
+    let issue_comments = http_client::github::pull_request_issue_comments(
+        repo_name_with_owner,
+        pull.number,
+        token,
+        http_client.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string());
+    let reviews = http_client::github::pull_request_reviews(
+        repo_name_with_owner,
+        pull.number,
+        token,
+        http_client.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string());
+    let review_comments = http_client::github::pull_request_review_comments(
+        repo_name_with_owner,
+        pull.number,
+        token,
+        http_client.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string());
+    let check_runs = http_client::github::commit_check_runs(
+        repo_name_with_owner,
+        &pull.head.sha,
+        token,
+        http_client.clone(),
+    )
+    .await
+    .map_err(|error| error.to_string());
+    let combined_status = http_client::github::commit_status(
+        repo_name_with_owner,
+        &pull.head.sha,
+        token,
+        http_client,
+    )
+    .await
+    .map_err(|error| error.to_string());
+
+    Ok(GitHubPullRequestReviewDetailLoad {
+        commits,
+        issue_comments,
+        reviews,
+        review_comments,
+        check_runs,
+        combined_status,
+    })
+}
+
+impl GitHubPullRequestView {
+    fn build_review_detail(
+        &self,
+        detail: GitHubPullRequestReviewDetailLoad,
+        cx: &mut Context<Self>,
+    ) -> GitHubPullRequestReviewDetail {
+        let mut errors = Vec::new();
+        let mut timeline = Vec::new();
+
+        match detail.commits {
+            Ok(commits) => timeline.extend(commits.into_iter().map(github_pr_commit_timeline_item)),
+            Err(error) => errors.push(format!("Commits: {error}").into()),
+        }
+
+        match detail.issue_comments {
+            Ok(comments) => timeline.extend(
+                comments
+                    .into_iter()
+                    .map(|comment| github_pr_issue_comment_timeline_item(comment, cx)),
+            ),
+            Err(error) => errors.push(format!("Comments: {error}").into()),
+        }
+
+        let reviews = match detail.reviews {
+            Ok(reviews) => {
+                timeline.extend(
+                    reviews
+                        .iter()
+                        .cloned()
+                        .map(|review| github_pr_review_timeline_item(review, cx)),
+                );
+                reviews
+            }
+            Err(error) => {
+                errors.push(format!("Reviews: {error}").into());
+                Vec::new()
+            }
+        };
+
+        match detail.review_comments {
+            Ok(comments) => timeline.extend(
+                comments
+                    .into_iter()
+                    .map(|comment| github_pr_review_comment_timeline_item(comment, cx)),
+            ),
+            Err(error) => errors.push(format!("Review comments: {error}").into()),
+        }
+
+        let check_runs = match detail.check_runs {
+            Ok(check_runs) => check_runs,
+            Err(error) => {
+                errors.push(format!("Check runs: {error}").into());
+                Vec::new()
+            }
+        };
+        let combined_status = match detail.combined_status {
+            Ok(status) => Some(status),
+            Err(error) => {
+                errors.push(format!("Commit status: {error}").into());
+                None
+            }
+        };
+
+        timeline.sort_by(|left, right| {
+            left.timestamp
+                .as_deref()
+                .unwrap_or_default()
+                .cmp(right.timestamp.as_deref().unwrap_or_default())
+        });
+
+        GitHubPullRequestReviewDetail {
+            timeline,
+            review_summary: github_pr_review_summary(&reviews, self.pull.requested_reviewers.len()),
+            checks_summary: github_pr_checks_summary(check_runs, combined_status),
+            errors,
+        }
+    }
+}
+
+fn markdown_entity(text: String, cx: &mut Context<GitHubPullRequestView>) -> Entity<Markdown> {
+    cx.new(|cx| Markdown::new(text.into(), None, None, cx))
+}
+
+fn github_pr_commit_timeline_item(
+    commit: GitHubPullRequestCommit,
+) -> GitHubPullRequestTimelineItem {
+    let title = commit
+        .commit
+        .message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let author = commit
+        .author
+        .map(|author| author.login)
+        .or_else(|| {
+            commit
+                .commit
+                .author
+                .as_ref()
+                .and_then(|author| author.name.clone())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let short_sha = commit
+        .sha
+        .get(0..7)
+        .unwrap_or(commit.sha.as_str())
+        .to_string();
+
+    GitHubPullRequestTimelineItem {
+        kind: GitHubPullRequestTimelineItemKind::Commit,
+        author: author.into(),
+        timestamp: commit.commit.author.and_then(|author| author.date),
+        title: title.into(),
+        metadata: Some(short_sha.into()),
+        markdown: None,
+        url: Some(commit.html_url),
+    }
+}
+
+fn github_pr_issue_comment_timeline_item(
+    comment: GitHubIssueComment,
+    cx: &mut Context<GitHubPullRequestView>,
+) -> GitHubPullRequestTimelineItem {
+    GitHubPullRequestTimelineItem {
+        kind: GitHubPullRequestTimelineItemKind::Comment,
+        author: comment.user.login.into(),
+        timestamp: Some(comment.created_at),
+        title: "Commented".into(),
+        metadata: None,
+        markdown: Some(markdown_entity(comment.body, cx)),
+        url: Some(comment.html_url),
+    }
+}
+
+fn github_pr_review_timeline_item(
+    review: GitHubPullRequestReview,
+    cx: &mut Context<GitHubPullRequestView>,
+) -> GitHubPullRequestTimelineItem {
+    let title = github_pr_review_state_label(&review.state).to_string();
+    let markdown = review
+        .body
+        .filter(|body| !body.trim().is_empty())
+        .map(|body| markdown_entity(body, cx));
+
+    GitHubPullRequestTimelineItem {
+        kind: GitHubPullRequestTimelineItemKind::Review,
+        author: review.user.login.into(),
+        timestamp: review.submitted_at,
+        title: title.into(),
+        metadata: Some(review.state.into()),
+        markdown,
+        url: review.html_url,
+    }
+}
+
+fn github_pr_review_comment_timeline_item(
+    comment: GitHubPullRequestReviewComment,
+    cx: &mut Context<GitHubPullRequestView>,
+) -> GitHubPullRequestTimelineItem {
+    let line = comment
+        .line
+        .or(comment.original_line)
+        .map(|line| format!(":{}", line))
+        .unwrap_or_default();
+    GitHubPullRequestTimelineItem {
+        kind: GitHubPullRequestTimelineItemKind::ReviewComment,
+        author: comment.user.login.into(),
+        timestamp: Some(comment.created_at),
+        title: "Review comment".into(),
+        metadata: Some(format!("{}{}", comment.path, line).into()),
+        markdown: Some(markdown_entity(comment.body, cx)),
+        url: Some(comment.html_url),
+    }
+}
+
+fn github_pr_review_state_label(state: &str) -> &'static str {
+    match state {
+        "APPROVED" => "Approved",
+        "CHANGES_REQUESTED" => "Requested changes",
+        "COMMENTED" => "Reviewed",
+        "DISMISSED" => "Review dismissed",
+        "PENDING" => "Review pending",
+        _ => "Reviewed",
+    }
+}
+
+fn github_pr_review_summary(
+    reviews: &[GitHubPullRequestReview],
+    pending_reviewers: usize,
+) -> GitHubPullRequestReviewSummary {
+    let mut summary = GitHubPullRequestReviewSummary {
+        pending_reviewers,
+        ..Default::default()
+    };
+    for review in reviews {
+        match review.state.as_str() {
+            "APPROVED" => summary.approved += 1,
+            "CHANGES_REQUESTED" => summary.changes_requested += 1,
+            "COMMENTED" => summary.commented += 1,
+            _ => {}
+        }
+    }
+    summary
+}
+
+fn github_pr_checks_summary(
+    check_runs: Vec<GitHubCheckRun>,
+    combined_status: Option<GitHubCombinedStatus>,
+) -> GitHubPullRequestChecksSummary {
+    let mut items = Vec::new();
+    items.extend(check_runs.into_iter().map(|run| {
+        let state = check_run_state(&run);
+        GitHubPullRequestCheckItem {
+            name: run.name.into(),
+            state,
+            description: run.conclusion.or(Some(run.status)).map(SharedString::from),
+            url: Some(run.html_url),
+        }
+    }));
+
+    if let Some(status) = combined_status {
+        items.extend(status.statuses.into_iter().map(|status| {
+            let state = commit_status_state(&status);
+            GitHubPullRequestCheckItem {
+                name: status.context.into(),
+                state,
+                description: status.description.map(SharedString::from),
+                url: status.target_url,
+            }
+        }));
+        if items.is_empty() && status.total_count > 0 {
+            items.push(GitHubPullRequestCheckItem {
+                name: "Commit status".into(),
+                state: combined_status_state(&status.state),
+                description: Some(status.state.into()),
+                url: None,
+            });
+        }
+    }
+
+    let overall = checks_overall_state(&items);
+    GitHubPullRequestChecksSummary { overall, items }
+}
+
+fn check_run_state(run: &GitHubCheckRun) -> GitHubPullRequestCheckState {
+    if run.status != "completed" {
+        return GitHubPullRequestCheckState::Pending;
+    }
+    match run.conclusion.as_deref() {
+        Some("success") | Some("neutral") => GitHubPullRequestCheckState::Passed,
+        Some("skipped") => GitHubPullRequestCheckState::Skipped,
+        Some("cancelled") | Some("timed_out") | Some("failure") | Some("action_required") => {
+            GitHubPullRequestCheckState::Failed
+        }
+        _ => GitHubPullRequestCheckState::Pending,
+    }
+}
+
+fn commit_status_state(status: &GitHubCommitStatus) -> GitHubPullRequestCheckState {
+    combined_status_state(&status.state)
+}
+
+fn combined_status_state(state: &str) -> GitHubPullRequestCheckState {
+    match state {
+        "success" => GitHubPullRequestCheckState::Passed,
+        "failure" | "error" => GitHubPullRequestCheckState::Failed,
+        "pending" => GitHubPullRequestCheckState::Pending,
+        _ => GitHubPullRequestCheckState::Missing,
+    }
+}
+
+fn checks_overall_state(items: &[GitHubPullRequestCheckItem]) -> GitHubPullRequestCheckState {
+    if items.is_empty() {
+        return GitHubPullRequestCheckState::Missing;
+    }
+    if items
+        .iter()
+        .any(|item| item.state == GitHubPullRequestCheckState::Failed)
+    {
+        return GitHubPullRequestCheckState::Failed;
+    }
+    if items
+        .iter()
+        .any(|item| item.state == GitHubPullRequestCheckState::Pending)
+    {
+        return GitHubPullRequestCheckState::Pending;
+    }
+    if items
+        .iter()
+        .all(|item| item.state == GitHubPullRequestCheckState::Skipped)
+    {
+        return GitHubPullRequestCheckState::Skipped;
+    }
+    GitHubPullRequestCheckState::Passed
+}
+
+fn check_state_label(state: GitHubPullRequestCheckState) -> &'static str {
+    match state {
+        GitHubPullRequestCheckState::Passed => "Passed",
+        GitHubPullRequestCheckState::Failed => "Failed",
+        GitHubPullRequestCheckState::Pending => "Pending",
+        GitHubPullRequestCheckState::Skipped => "Skipped",
+        GitHubPullRequestCheckState::Missing => "Missing",
+    }
+}
+
+fn check_state_color(state: GitHubPullRequestCheckState) -> Color {
+    match state {
+        GitHubPullRequestCheckState::Passed => Color::Success,
+        GitHubPullRequestCheckState::Failed => Color::Error,
+        GitHubPullRequestCheckState::Pending => Color::Warning,
+        GitHubPullRequestCheckState::Skipped | GitHubPullRequestCheckState::Missing => Color::Muted,
+    }
+}
+
 impl Render for GitHubPullRequestView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pull = &self.pull;
@@ -339,7 +832,8 @@ impl Render for GitHubPullRequestView {
                                 window,
                                 cx,
                             ))
-                            .child(self.render_body(cx)),
+                            .child(self.render_body(window, cx))
+                            .child(self.render_review_detail(window, cx)),
                     )
                     .child(self.render_sidebar(created, updated, cx)),
             )
@@ -468,7 +962,7 @@ impl GitHubPullRequestView {
             )
     }
 
-    fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_body(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_3()
             .rounded_lg()
@@ -476,29 +970,296 @@ impl GitHubPullRequestView {
             .border_color(cx.theme().colors().border.opacity(0.5))
             .p_4()
             .child(Label::new("Summary").size(LabelSize::Large))
-            .child(div().min_h_32().child(EditorElement::new(
-                &self.body_editor,
-                self.body_editor_style(cx),
+            .child(div().min_h_16().child(MarkdownElement::new(
+                self.body_markdown.clone(),
+                self.markdown_style(window, cx),
             )))
     }
 
-    fn body_editor_style(&self, cx: &mut Context<Self>) -> EditorStyle {
-        let settings = ThemeSettings::get_global(cx);
-        EditorStyle {
-            background: cx.theme().colors().editor_background,
-            local_player: cx.theme().players().local(),
-            text: TextStyle {
-                color: cx.theme().colors().text,
-                font_family: settings.ui_font.family.clone(),
-                font_features: settings.ui_font.features.clone(),
-                font_fallbacks: settings.ui_font.fallbacks.clone(),
-                font_size: rems(0.875).into(),
-                font_weight: settings.ui_font.weight,
-                line_height: relative(1.5),
-                ..Default::default()
-            },
-            ..Default::default()
+    fn markdown_style(&self, window: &Window, cx: &mut Context<Self>) -> MarkdownStyle {
+        MarkdownStyle::themed(MarkdownFont::Editor, window, cx)
+    }
+
+    fn render_review_detail(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        match &self.review_detail {
+            GitHubPullRequestReviewDetailState::NotLoaded
+            | GitHubPullRequestReviewDetailState::Loading => v_flex()
+                .gap_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().colors().border.opacity(0.5))
+                .p_4()
+                .child(Label::new("Loading pull request review details...").color(Color::Muted))
+                .into_any_element(),
+            GitHubPullRequestReviewDetailState::Error(error) => v_flex()
+                .gap_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().colors().border.opacity(0.5))
+                .p_4()
+                .child(Label::new("Failed to load pull request review details"))
+                .child(Label::new(error.clone()).color(Color::Error))
+                .child(
+                    Button::new("github-pr-review-detail-retry", "Retry")
+                        .size(ButtonSize::Compact)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.load_review_detail(window, cx);
+                        })),
+                )
+                .into_any_element(),
+            GitHubPullRequestReviewDetailState::Loaded(detail) => v_flex()
+                .gap_6()
+                .when(!detail.errors.is_empty(), |this| {
+                    this.child(
+                        v_flex()
+                            .gap_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(cx.theme().status().warning_border)
+                            .bg(cx.theme().status().warning_background.opacity(0.4))
+                            .p_4()
+                            .child(Label::new("Some GitHub data could not be loaded"))
+                            .children(detail.errors.iter().map(|error| {
+                                Label::new(error.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                            })),
+                    )
+                })
+                .child(self.render_activity_section(detail, window, cx))
+                .child(self.render_review_section(&detail.review_summary, cx))
+                .child(self.render_checks_section(&detail.checks_summary, cx))
+                .into_any_element(),
         }
+    }
+
+    fn render_activity_section(
+        &self,
+        detail: &GitHubPullRequestReviewDetail,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let markdown_style = self.markdown_style(window, cx);
+        v_flex()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border.opacity(0.5))
+            .p_4()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .child(Label::new("Activity").size(LabelSize::Large))
+                    .child(Label::new(detail.timeline.len().to_string()).color(Color::Muted)),
+            )
+            .when(detail.timeline.is_empty(), |this| {
+                this.child(Label::new("No activity loaded.").color(Color::Muted))
+            })
+            .children(
+                detail
+                    .timeline
+                    .iter()
+                    .map(|item| self.render_timeline_item(item, markdown_style.clone(), cx)),
+            )
+    }
+
+    fn render_timeline_item(
+        &self,
+        item: &GitHubPullRequestTimelineItem,
+        markdown_style: MarkdownStyle,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let icon = match item.kind {
+            GitHubPullRequestTimelineItemKind::Commit => IconName::GitCommit,
+            GitHubPullRequestTimelineItemKind::Comment => IconName::Chat,
+            GitHubPullRequestTimelineItemKind::Review => IconName::Eye,
+            GitHubPullRequestTimelineItemKind::ReviewComment => IconName::File,
+        };
+        let timestamp = item
+            .timestamp
+            .as_deref()
+            .and_then(github_format_timestamp)
+            .unwrap_or_else(|| "unknown".to_string());
+
+        v_flex()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().colors().border.opacity(0.4))
+            .pt_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .child(Label::new(item.title.clone()).truncate())
+                            .when_some(item.metadata.clone(), |this, metadata| {
+                                this.child(
+                                    Label::new(metadata)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                            }),
+                    )
+                    .child(Label::new(format!("@{}", item.author)).color(Color::Muted))
+                    .child(Label::new(timestamp).color(Color::Muted))
+                    .when_some(item.url.clone(), |this, url| {
+                        this.child(
+                            Button::new(format!("github-pr-timeline-open-{url}"), "Open")
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        )
+                    }),
+            )
+            .when_some(item.markdown.clone(), |this, markdown| {
+                this.child(
+                    div()
+                        .pl_6()
+                        .child(MarkdownElement::new(markdown, markdown_style)),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_review_section(
+        &self,
+        summary: &GitHubPullRequestReviewSummary,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let title = if summary.changes_requested > 0 {
+            "Changes requested"
+        } else if summary.approved > 0 {
+            "Approved"
+        } else if summary.pending_reviewers > 0 {
+            "Review required"
+        } else {
+            "No reviewers added"
+        };
+        let color = if summary.changes_requested > 0 {
+            Color::Error
+        } else if summary.approved > 0 {
+            Color::Success
+        } else if summary.pending_reviewers > 0 {
+            Color::Warning
+        } else {
+            Color::Muted
+        };
+
+        v_flex()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border.opacity(0.5))
+            .p_4()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Icon::new(IconName::Eye).size(IconSize::Small).color(color))
+                    .child(Label::new(title).size(LabelSize::Large)),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(self.render_review_count("Approved", summary.approved))
+                    .child(self.render_review_count("Changes requested", summary.changes_requested))
+                    .child(self.render_review_count("Commented", summary.commented))
+                    .child(self.render_review_count("Pending", summary.pending_reviewers)),
+            )
+    }
+
+    fn render_review_count(&self, label: &'static str, count: usize) -> impl IntoElement {
+        h_flex()
+            .gap_1()
+            .child(Label::new(count.to_string()))
+            .child(Label::new(label).color(Color::Muted))
+    }
+
+    fn render_checks_section(
+        &self,
+        summary: &GitHubPullRequestChecksSummary,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let title = match summary.overall {
+            GitHubPullRequestCheckState::Passed => "All checks have passed",
+            GitHubPullRequestCheckState::Failed => "Some checks failed",
+            GitHubPullRequestCheckState::Pending => "Checks are pending",
+            GitHubPullRequestCheckState::Skipped => "Checks skipped",
+            GitHubPullRequestCheckState::Missing => "No checks found",
+        };
+        let color = check_state_color(summary.overall);
+
+        v_flex()
+            .gap_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().colors().border.opacity(0.5))
+            .p_4()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(color),
+                    )
+                    .child(Label::new(title).size(LabelSize::Large)),
+            )
+            .when(summary.items.is_empty(), |this| {
+                this.child(
+                    Label::new("No check runs or commit statuses found.").color(Color::Muted),
+                )
+            })
+            .children(summary.items.iter().map(|item| {
+                h_flex()
+                    .justify_between()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(cx.theme().colors().border.opacity(0.4))
+                    .pt_2()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::Check)
+                                    .size(IconSize::Small)
+                                    .color(check_state_color(item.state)),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .child(Label::new(item.name.clone()).truncate())
+                                    .when_some(item.description.clone(), |this, description| {
+                                        this.child(
+                                            Label::new(description)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .truncate(),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        Label::new(check_state_label(item.state))
+                            .color(check_state_color(item.state)),
+                    )
+                    .when_some(item.url.clone(), |this, url| {
+                        this.child(
+                            Button::new(format!("github-pr-check-open-{url}"), "Open")
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        )
+                    })
+            }))
     }
 
     fn render_sidebar(
@@ -705,7 +1466,10 @@ impl Item for GitHubPullRequestView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_client::github::{GitHubPullRequestBranch, GitHubRepositoryRef, GitHubUser};
+    use http_client::github::{
+        GitHubCheckRun, GitHubCombinedStatus, GitHubCommitStatus, GitHubPullRequestBranch,
+        GitHubPullRequestReview, GitHubRepositoryRef, GitHubUser,
+    };
 
     fn pull_request() -> GitHubPullRequest {
         GitHubPullRequest {
@@ -776,5 +1540,79 @@ mod tests {
         assert_eq!(github_pull_request_diff_boxes(0, 0), (0, 0));
         assert_eq!(github_pull_request_diff_boxes(12, 4), (4, 1));
         assert_eq!(github_pull_request_diff_boxes(0, 7), (0, 5));
+    }
+
+    #[test]
+    fn test_github_pull_request_review_summary_counts_states() {
+        let reviews = vec![
+            review("APPROVED"),
+            review("CHANGES_REQUESTED"),
+            review("COMMENTED"),
+            review("DISMISSED"),
+        ];
+
+        let summary = github_pr_review_summary(&reviews, 2);
+
+        assert_eq!(summary.approved, 1);
+        assert_eq!(summary.changes_requested, 1);
+        assert_eq!(summary.commented, 1);
+        assert_eq!(summary.pending_reviewers, 2);
+    }
+
+    #[test]
+    fn test_github_pull_request_checks_summary_prefers_failures() {
+        let summary = github_pr_checks_summary(
+            vec![
+                check_run("unit", "completed", Some("success")),
+                check_run("lint", "completed", Some("failure")),
+            ],
+            Some(GitHubCombinedStatus {
+                state: "success".to_string(),
+                total_count: 1,
+                statuses: vec![GitHubCommitStatus {
+                    context: "legacy-ci".to_string(),
+                    state: "success".to_string(),
+                    description: Some("passed".to_string()),
+                    target_url: None,
+                    updated_at: None,
+                }],
+            }),
+        );
+
+        assert_eq!(summary.overall, GitHubPullRequestCheckState::Failed);
+        assert_eq!(summary.items.len(), 3);
+    }
+
+    #[test]
+    fn test_github_pull_request_checks_summary_handles_missing_checks() {
+        let summary = github_pr_checks_summary(Vec::new(), None);
+
+        assert_eq!(summary.overall, GitHubPullRequestCheckState::Missing);
+        assert!(summary.items.is_empty());
+    }
+
+    fn review(state: &str) -> GitHubPullRequestReview {
+        GitHubPullRequestReview {
+            id: 1,
+            html_url: None,
+            user: GitHubUser {
+                login: "reviewer".to_string(),
+            },
+            state: state.to_string(),
+            body: None,
+            submitted_at: None,
+        }
+    }
+
+    fn check_run(name: &str, status: &str, conclusion: Option<&str>) -> GitHubCheckRun {
+        GitHubCheckRun {
+            id: 1,
+            name: name.to_string(),
+            html_url: format!("https://github.com/owner/repo/actions/runs/{name}"),
+            status: status.to_string(),
+            conclusion: conclusion.map(ToString::to_string),
+            started_at: None,
+            completed_at: None,
+        }
     }
 }

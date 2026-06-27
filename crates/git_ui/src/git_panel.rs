@@ -6109,7 +6109,10 @@ impl GitPanel {
                             .ok();
                         item
                     };
-                    workspace.add_item_to_center(Box::new(item), window, cx);
+                    workspace.add_item_to_center(Box::new(item.clone()), window, cx);
+                    item.update(cx, |item, cx| {
+                        item.load_review_detail(window, cx);
+                    });
                 })?;
 
                 anyhow::Ok(())

@@ -225,6 +225,76 @@ pub async fn pull_request_files(
     Ok(files)
 }
 
+pub async fn pull_request_commits(
+    repo_name_with_owner: &str,
+    pull_number: u64,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubPullRequestCommit>> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls/{pull_number}/commits");
+    let (commits, _) =
+        get_github_json_page::<Vec<GitHubPullRequestCommit>>(http, &url, token).await?;
+    Ok(commits)
+}
+
+pub async fn pull_request_issue_comments(
+    repo_name_with_owner: &str,
+    pull_number: u64,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubIssueComment>> {
+    let url =
+        format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/issues/{pull_number}/comments");
+    let (comments, _) = get_github_json_page::<Vec<GitHubIssueComment>>(http, &url, token).await?;
+    Ok(comments)
+}
+
+pub async fn pull_request_reviews(
+    repo_name_with_owner: &str,
+    pull_number: u64,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubPullRequestReview>> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls/{pull_number}/reviews");
+    let (reviews, _) =
+        get_github_json_page::<Vec<GitHubPullRequestReview>>(http, &url, token).await?;
+    Ok(reviews)
+}
+
+pub async fn pull_request_review_comments(
+    repo_name_with_owner: &str,
+    pull_number: u64,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubPullRequestReviewComment>> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/pulls/{pull_number}/comments");
+    let (comments, _) =
+        get_github_json_page::<Vec<GitHubPullRequestReviewComment>>(http, &url, token).await?;
+    Ok(comments)
+}
+
+pub async fn commit_check_runs(
+    repo_name_with_owner: &str,
+    sha: &str,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<Vec<GitHubCheckRun>> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/commits/{sha}/check-runs");
+    let (response, _) = get_github_json_page::<GitHubCheckRunsResponse>(http, &url, token).await?;
+    Ok(response.check_runs)
+}
+
+pub async fn commit_status(
+    repo_name_with_owner: &str,
+    sha: &str,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<GitHubCombinedStatus> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/commits/{sha}/status");
+    let (status, _) = get_github_json_page::<GitHubCombinedStatus>(http, &url, token).await?;
+    Ok(status)
+}
+
 pub async fn repository_file_content(
     repo_name_with_owner: &str,
     path: &str,
@@ -428,6 +498,109 @@ pub struct GitHubPullRequestFile {
     pub changes: u32,
     #[serde(default)]
     pub patch: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubPullRequestCommit {
+    pub sha: String,
+    pub html_url: String,
+    pub commit: GitHubCommit,
+    #[serde(default)]
+    pub author: Option<GitHubUser>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubCommit {
+    pub message: String,
+    #[serde(default)]
+    pub author: Option<GitHubCommitAuthor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubCommitAuthor {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub date: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubIssueComment {
+    pub id: u64,
+    pub html_url: String,
+    pub user: GitHubUser,
+    pub body: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubPullRequestReview {
+    pub id: u64,
+    pub html_url: Option<String>,
+    pub user: GitHubUser,
+    pub state: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubPullRequestReviewComment {
+    pub id: u64,
+    pub html_url: String,
+    pub user: GitHubUser,
+    pub body: String,
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub original_line: Option<u32>,
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct GitHubCheckRunsResponse {
+    #[serde(default)]
+    check_runs: Vec<GitHubCheckRun>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubCheckRun {
+    pub id: u64,
+    pub name: String,
+    pub html_url: String,
+    pub status: String,
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubCombinedStatus {
+    pub state: String,
+    #[serde(default)]
+    pub total_count: u32,
+    #[serde(default)]
+    pub statuses: Vec<GitHubCommitStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitHubCommitStatus {
+    pub context: String,
+    pub state: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub target_url: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -796,9 +969,10 @@ mod tests {
         AsyncBody, HttpClient, RedirectPolicy, Response, StatusCode,
         github::{
             AssetKind, GitHubActivityKind, GitHubDeviceAccessTokenPoll, build_asset_url,
-            poll_device_access_token, pull_request, pull_request_files, pull_requests,
-            pull_requests_page, repository_activity, repository_file_content, request_device_code,
-            viewer,
+            commit_check_runs, commit_status, poll_device_access_token, pull_request,
+            pull_request_commits, pull_request_files, pull_request_issue_comments,
+            pull_request_review_comments, pull_request_reviews, pull_requests, pull_requests_page,
+            repository_activity, repository_file_content, request_device_code, viewer,
         },
     };
     use anyhow::Result;
@@ -1191,6 +1365,153 @@ mod tests {
                     .get("Authorization")
                     .and_then(|header| header.to_str().ok()),
                 Some("Bearer secret")
+            );
+        });
+    }
+
+    #[test]
+    fn test_pull_request_review_detail_endpoints_parse_metadata() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"[
+                        {
+                            "sha": "abcdef123456",
+                            "html_url": "https://github.com/owner/repo/commit/abcdef1",
+                            "commit": {
+                                "message": "feat: add review detail",
+                                "author": {
+                                    "name": "Octo",
+                                    "email": "octo@example.com",
+                                    "date": "2026-06-24T11:00:00Z"
+                                }
+                            },
+                            "author": { "login": "octo" }
+                        }
+                    ]"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"[
+                        {
+                            "id": 1,
+                            "html_url": "https://github.com/owner/repo/pull/7#issuecomment-1",
+                            "user": { "login": "commenter" },
+                            "body": "**Looks good**",
+                            "created_at": "2026-06-24T12:00:00Z"
+                        }
+                    ]"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"[
+                        {
+                            "id": 2,
+                            "html_url": "https://github.com/owner/repo/pull/7#pullrequestreview-2",
+                            "user": { "login": "reviewer" },
+                            "state": "APPROVED",
+                            "body": "ship it",
+                            "submitted_at": "2026-06-24T13:00:00Z"
+                        }
+                    ]"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"[
+                        {
+                            "id": 3,
+                            "html_url": "https://github.com/owner/repo/pull/7#discussion_r3",
+                            "user": { "login": "reviewer" },
+                            "body": "nit",
+                            "path": "src/main.rs",
+                            "line": 9,
+                            "created_at": "2026-06-24T14:00:00Z"
+                        }
+                    ]"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"{
+                        "total_count": 1,
+                        "check_runs": [
+                            {
+                                "id": 4,
+                                "name": "ci",
+                                "html_url": "https://github.com/owner/repo/actions/runs/4",
+                                "status": "completed",
+                                "conclusion": "success"
+                            }
+                        ]
+                    }"#,
+                },
+                TestResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: r#"{
+                        "state": "success",
+                        "total_count": 1,
+                        "statuses": [
+                            {
+                                "context": "legacy-ci",
+                                "state": "success",
+                                "description": "passed",
+                                "target_url": "https://ci.example.com/1"
+                            }
+                        ]
+                    }"#,
+                },
+            ]));
+
+            let commits = pull_request_commits("owner/repo", 7, Some("secret"), http.clone())
+                .await
+                .expect("commits should parse");
+            let issue_comments =
+                pull_request_issue_comments("owner/repo", 7, Some("secret"), http.clone())
+                    .await
+                    .expect("issue comments should parse");
+            let reviews = pull_request_reviews("owner/repo", 7, Some("secret"), http.clone())
+                .await
+                .expect("reviews should parse");
+            let review_comments =
+                pull_request_review_comments("owner/repo", 7, Some("secret"), http.clone())
+                    .await
+                    .expect("review comments should parse");
+            let check_runs =
+                commit_check_runs("owner/repo", "head-sha", Some("secret"), http.clone())
+                    .await
+                    .expect("check runs should parse");
+            let status = commit_status("owner/repo", "head-sha", Some("secret"), http.clone())
+                .await
+                .expect("commit status should parse");
+
+            assert_eq!(commits[0].sha, "abcdef123456");
+            assert_eq!(issue_comments[0].body, "**Looks good**");
+            assert_eq!(reviews[0].state, "APPROVED");
+            assert_eq!(review_comments[0].path, "src/main.rs");
+            assert_eq!(check_runs[0].conclusion.as_deref(), Some("success"));
+            assert_eq!(status.statuses[0].context, "legacy-ci");
+
+            let requests = http.requests.lock();
+            let urls = requests
+                .iter()
+                .map(|request| request.uri().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                urls,
+                vec![
+                    "https://api.github.com/repos/owner/repo/pulls/7/commits",
+                    "https://api.github.com/repos/owner/repo/issues/7/comments",
+                    "https://api.github.com/repos/owner/repo/pulls/7/reviews",
+                    "https://api.github.com/repos/owner/repo/pulls/7/comments",
+                    "https://api.github.com/repos/owner/repo/commits/head-sha/check-runs",
+                    "https://api.github.com/repos/owner/repo/commits/head-sha/status",
+                ]
             );
         });
     }
