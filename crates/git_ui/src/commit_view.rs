@@ -1,9 +1,8 @@
-use anyhow::{Context as _, Result};
+use anyhow::Context as _;
 use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, MultiBuffer, SplittableEditor,
-    hover_markdown_style, multibuffer_context_lines,
+    Addon, Editor, EditorEvent, EditorSettings, MultiBuffer, SplittableEditor, hover_markdown_style,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, CommitDiff, RepoPath, is_binary_content};
@@ -18,23 +17,19 @@ use gpui::{
     PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Task, WeakEntity,
     Window, actions,
 };
-use language::{
-    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
-    ReplicaId, Rope, TextBuffer,
-};
+use language::Capability;
 use markdown::{Markdown, MarkdownElement};
 use multi_buffer::PathKey;
-use project::{Project, ProjectPath, WorktreeId, git_store::Repository};
-use settings::{DiffViewStyle, Settings};
+use project::{Project, ProjectPath, git_store::Repository};
+use settings::Settings;
 use std::{
     any::{Any, TypeId},
     collections::HashSet,
-    path::PathBuf,
     sync::Arc,
 };
 use theme::ActiveTheme;
 use ui::{ContextMenu, DiffStat, Disclosure, Divider, Tooltip, WithScrollbar, prelude::*};
-use util::{ResultExt, paths::PathStyle, rel_path::RelPath, truncate_and_trailoff};
+use util::{ResultExt, paths::PathStyle, truncate_and_trailoff};
 use workspace::item::TabTooltipContent;
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
@@ -47,6 +42,10 @@ use workspace::{
 
 use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
+use crate::virtual_diff::{
+    VirtualDiffEntry, VirtualDiffFile, build_virtual_buffer, build_virtual_buffer_diff,
+    diff_excerpt_ranges, insert_diff_excerpts,
+};
 
 actions!(
     git,
@@ -85,14 +84,6 @@ pub struct CommitView {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     remote: Option<GitRemote>,
-}
-
-struct GitBlob {
-    path: RepoPath,
-    worktree_id: WorktreeId,
-    is_deleted: bool,
-    is_binary: bool,
-    display_name: String,
 }
 
 struct CommitDiffAddon {
@@ -335,15 +326,22 @@ impl CommitView {
                     .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
                 let display_name = format!("{short_sha} - {file_name}");
 
-                let file = Arc::new(GitBlob {
-                    path: file.path.clone(),
+                let file = VirtualDiffFile::new(
+                    file.path.as_ref().clone(),
+                    display_name,
+                    worktree_id,
                     is_deleted,
                     is_binary,
-                    worktree_id,
-                    display_name,
-                }) as Arc<dyn language::File>;
+                ) as Arc<dyn language::File>;
 
-                let buffer = build_buffer(new_text, file, &language_registry, cx).await?;
+                let buffer = build_virtual_buffer(
+                    new_text,
+                    file,
+                    Capability::ReadWrite,
+                    &language_registry,
+                    cx,
+                )
+                .await?;
                 let buffer_id = cx.update(|_, cx| buffer.read(cx).remote_id())?;
 
                 let status_code = if is_created {
@@ -378,7 +376,7 @@ impl CommitView {
                         })
                     })?
                 } else {
-                    build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
+                    build_virtual_buffer_diff(old_text, &buffer, &language_registry, cx).await?
                 };
 
                 let (excerpt_ranges, path) = cx.update(|_, cx| {
@@ -387,19 +385,7 @@ impl CommitView {
                         FILE_NAMESPACE_SORT_PREFIX,
                         snapshot.file().unwrap().path().clone(),
                     );
-                    let ranges = if is_binary {
-                        vec![language::Point::zero()..snapshot.max_point()]
-                    } else {
-                        let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
-                        let mut hunks = diff_snapshot.hunks(&snapshot).peekable();
-                        if hunks.peek().is_none() {
-                            vec![language::Point::zero()..snapshot.max_point()]
-                        } else {
-                            hunks
-                                .map(|hunk| hunk.buffer_range.to_point(&snapshot))
-                                .collect::<Vec<_>>()
-                        }
-                    };
+                    let ranges = diff_excerpt_ranges(&buffer, &buffer_diff, true, cx);
                     (ranges, path)
                 })?;
 
@@ -412,19 +398,18 @@ impl CommitView {
                     batch_end = (batch_end + EXCERPT_BATCH_SIZE).min(total);
                     let ranges = excerpt_ranges[..batch_end].to_vec();
                     this.update_in(cx, |this, window, cx| {
-                        this.editor.update(cx, |editor, cx| {
-                            editor.update_excerpts_for_path(
-                                path.clone(),
-                                buffer.clone(),
-                                ranges,
-                                multibuffer_context_lines(cx),
-                                buffer_diff.clone(),
-                                cx,
-                            );
-                            if is_first_batch && editor.diff_view_style() == DiffViewStyle::Split {
-                                editor.split(window, cx);
-                            }
-                        });
+                        insert_diff_excerpts(
+                            &this.editor,
+                            VirtualDiffEntry {
+                                path: path.clone(),
+                                buffer: buffer.clone(),
+                                diff: buffer_diff.clone(),
+                            },
+                            ranges,
+                            is_first_batch,
+                            window,
+                            cx,
+                        );
                     })?;
                     if batch_end < total {
                         yield_now().await;
@@ -910,112 +895,6 @@ impl CommitView {
             .await?;
         anyhow::Ok(())
     }
-}
-
-impl language::File for GitBlob {
-    fn as_local(&self) -> Option<&dyn language::LocalFile> {
-        None
-    }
-
-    fn disk_state(&self) -> DiskState {
-        DiskState::Historic {
-            was_deleted: self.is_deleted,
-        }
-    }
-
-    fn path_style(&self, _: &App) -> PathStyle {
-        PathStyle::local()
-    }
-
-    fn path(&self) -> &Arc<RelPath> {
-        self.path.as_ref()
-    }
-
-    fn full_path(&self, _: &App) -> PathBuf {
-        self.path.as_std_path().to_path_buf()
-    }
-
-    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
-        self.display_name.as_ref()
-    }
-
-    fn worktree_id(&self, _: &App) -> WorktreeId {
-        self.worktree_id
-    }
-
-    fn to_proto(&self, _cx: &App) -> language::proto::File {
-        unimplemented!()
-    }
-
-    fn is_private(&self) -> bool {
-        false
-    }
-
-    fn can_open(&self) -> bool {
-        !self.is_binary
-    }
-}
-
-async fn build_buffer(
-    mut text: String,
-    blob: Arc<dyn File>,
-    language_registry: &Arc<language::LanguageRegistry>,
-    cx: &mut AsyncWindowContext,
-) -> Result<Entity<Buffer>> {
-    let line_ending = LineEnding::detect(&text);
-    LineEnding::normalize(&mut text);
-    let text = Rope::from(text);
-    let language =
-        cx.update(|_, cx| language_registry.language_for_file(&blob, Some(&text), cx))?;
-    let language = if let Some(language) = language {
-        language_registry
-            .load_language(&language)
-            .await
-            .ok()
-            .and_then(|e| e.log_err())
-    } else {
-        None
-    };
-    let buffer = cx.new(|cx| {
-        let buffer = TextBuffer::new_normalized(
-            ReplicaId::LOCAL,
-            cx.entity_id().as_non_zero_u64().into(),
-            line_ending,
-            text,
-        );
-        let mut buffer = Buffer::build(buffer, Some(blob), Capability::ReadWrite);
-        buffer.set_language_async(language, cx);
-        buffer
-    });
-    Ok(buffer)
-}
-
-async fn build_buffer_diff(
-    mut old_text: Option<String>,
-    buffer: &Entity<Buffer>,
-    language_registry: &Arc<LanguageRegistry>,
-    cx: &mut AsyncWindowContext,
-) -> Result<Entity<BufferDiff>> {
-    if let Some(old_text) = &mut old_text {
-        LineEnding::normalize(old_text);
-    }
-
-    let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
-    let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
-
-    let diff =
-        cx.new(|cx| BufferDiff::new(&buffer.text, language, Some(language_registry.clone()), cx));
-
-    diff.update(cx, |diff, cx| {
-        diff.set_base_text(
-            old_text.map(|old_text| Arc::from(old_text.as_str())),
-            buffer.text.clone(),
-            cx,
-        )
-    })
-    .await;
-
-    Ok(diff)
 }
 
 impl EventEmitter<EditorEvent> for CommitView {}
