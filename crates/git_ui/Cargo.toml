@@ -83,6 +83,7 @@ tracing.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 client = { workspace = true, features = ["test-support"] }
 clock = { workspace = true, features = ["test-support"] }
 ctor.workspace = true

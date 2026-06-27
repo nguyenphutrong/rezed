@@ -1,5 +1,6 @@
 use crate::{AsyncBody, HttpClient, HttpRequestExt};
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
 pub use cloud_api_types::{GitHubActivityItem, GitHubActivityKind, GitHubActivitySyncBatch};
 use futures::AsyncReadExt;
 use http::{Request, StatusCode};
@@ -224,6 +225,34 @@ pub async fn pull_request_files(
     Ok(files)
 }
 
+pub async fn repository_file_content(
+    repo_name_with_owner: &str,
+    path: &str,
+    git_ref: &str,
+    token: Option<&str>,
+    http: Arc<dyn HttpClient>,
+) -> anyhow::Result<String> {
+    let url = github_repository_file_content_url(repo_name_with_owner, path, git_ref)?;
+    let (content, _) = get_github_json_page::<GitHubRepositoryContent>(http, &url, token).await?;
+    if content.kind != "file" {
+        bail!("GitHub content is not a file");
+    }
+    if content.encoding.as_deref() != Some("base64") {
+        bail!("GitHub content is not base64 encoded");
+    }
+    let content = content
+        .content
+        .context("GitHub content response is empty")?;
+    let content = content
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(content)
+        .context("error decoding GitHub file content")?;
+    String::from_utf8(bytes).context("GitHub file content is not UTF-8 text")
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitHubRepositoryActivity {
     pub repository_name_with_owner: String,
@@ -399,6 +428,14 @@ pub struct GitHubPullRequestFile {
     pub changes: u32,
     #[serde(default)]
     pub patch: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct GitHubRepositoryContent {
+    #[serde(rename = "type")]
+    kind: String,
+    encoding: Option<String>,
+    content: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -581,6 +618,31 @@ fn github_next_link(link_header: &str) -> Option<String> {
     })
 }
 
+fn github_repository_file_content_url(
+    repo_name_with_owner: &str,
+    path: &str,
+    git_ref: &str,
+) -> anyhow::Result<String> {
+    let (owner, repository) = repo_name_with_owner
+        .split_once('/')
+        .context("GitHub repository name must include owner and repository")?;
+    let mut url = Url::parse(GITHUB_API_URL)?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|()| anyhow!("cannot modify GitHub API URL path"))?;
+        segments.push("repos");
+        segments.push(owner);
+        segments.push(repository);
+        segments.push("contents");
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            segments.push(component);
+        }
+    }
+    url.query_pairs_mut().append_pair("ref", git_ref);
+    Ok(url.to_string())
+}
+
 fn github_status_error(status: StatusCode, body: &[u8]) -> anyhow::Error {
     let text = String::from_utf8_lossy(body);
     anyhow!(
@@ -735,7 +797,8 @@ mod tests {
         github::{
             AssetKind, GitHubActivityKind, GitHubDeviceAccessTokenPoll, build_asset_url,
             poll_device_access_token, pull_request, pull_request_files, pull_requests,
-            pull_requests_page, repository_activity, request_device_code, viewer,
+            pull_requests_page, repository_activity, repository_file_content, request_device_code,
+            viewer,
         },
     };
     use anyhow::Result;
@@ -1129,6 +1192,67 @@ mod tests {
                     .and_then(|header| header.to_str().ok()),
                 Some("Bearer secret")
             );
+        });
+    }
+
+    #[test]
+    fn test_repository_file_content_fetches_and_decodes_text() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{
+                    "type": "file",
+                    "encoding": "base64",
+                    "content": "aGVsbG8K"
+                }"#,
+            }]));
+
+            let content = repository_file_content(
+                "owner/repo",
+                "src/main.rs",
+                "head-sha",
+                Some("secret"),
+                http.clone(),
+            )
+            .await
+            .expect("file content should decode");
+
+            assert_eq!(content, "hello\n");
+            let requests = http.requests.lock();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].uri(),
+                "https://api.github.com/repos/owner/repo/contents/src/main.rs?ref=head-sha"
+            );
+            assert_eq!(
+                requests[0]
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|header| header.to_str().ok()),
+                Some("Bearer secret")
+            );
+        });
+    }
+
+    #[test]
+    fn test_repository_file_content_rejects_non_text_content() {
+        futures::executor::block_on(async {
+            let http = Arc::new(TestHttpClient::new_with_headers(vec![TestResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: r#"{
+                    "type": "file",
+                    "encoding": "base64",
+                    "content": "////"
+                }"#,
+            }]));
+
+            let error = repository_file_content("owner/repo", "image.bin", "head-sha", None, http)
+                .await
+                .expect_err("binary content should be rejected");
+
+            assert!(error.to_string().contains("not UTF-8 text"));
         });
     }
 

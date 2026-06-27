@@ -7,12 +7,16 @@ use buffer_diff::BufferDiff;
 use editor::{
     Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, scroll::Autoscroll,
 };
+use futures::StreamExt as _;
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter,
     FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, WeakEntity, Window, rems,
 };
-use http_client::github::{GitHubPullRequest, GitHubPullRequestFile};
+use http_client::{
+    HttpClient,
+    github::{GitHubPullRequest, GitHubPullRequestBranch, GitHubPullRequestFile},
+};
 use language::{Buffer, Capability};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{Project, ProjectPath};
@@ -46,6 +50,7 @@ pub(crate) struct GitHubPrDiffFile {
     pub deletions: u32,
     pub path_key: PathKey,
     pub unsupported_reason: Option<SharedString>,
+    pub preview_note: Option<SharedString>,
 }
 
 struct GitHubPrDiffEntry {
@@ -64,6 +69,7 @@ pub(crate) struct ParsedGitHubPrDiffFile {
     pub old_text: String,
     pub new_text: String,
     pub unsupported_reason: Option<String>,
+    pub preview_note: Option<String>,
 }
 
 impl GitHubPrDiffView {
@@ -71,6 +77,8 @@ impl GitHubPrDiffView {
         repo_name_with_owner: SharedString,
         pull: GitHubPullRequest,
         files: Vec<GitHubPullRequestFile>,
+        token: Option<String>,
+        http_client: Arc<dyn HttpClient>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
         cx: &mut AsyncWindowContext,
@@ -87,8 +95,30 @@ impl GitHubPrDiffView {
             })
             .ok_or_else(|| anyhow!("project has no worktrees"))?;
 
-        for (index, file) in files.into_iter().enumerate() {
-            let parsed = parse_github_pr_diff_file(&file);
+        let mut parsed_files =
+            futures::stream::iter(files.into_iter().enumerate().map(|(index, file)| {
+                let repo_name_with_owner = repo_name_with_owner.to_string();
+                let pull = pull.clone();
+                let token = token.clone();
+                let http_client = http_client.clone();
+                async move {
+                    let parsed = resolve_github_pr_diff_file(
+                        &repo_name_with_owner,
+                        &pull,
+                        file,
+                        token.as_deref(),
+                        http_client,
+                    )
+                    .await;
+                    (index, parsed)
+                }
+            }))
+            .buffer_unordered(6)
+            .collect::<Vec<_>>()
+            .await;
+        parsed_files.sort_by_key(|(index, _)| *index);
+
+        for (index, parsed) in parsed_files {
             let path_key = path_key_for_file(index, &parsed.filename)?;
             let diff_file = GitHubPrDiffFile {
                 filename: parsed.filename.clone().into(),
@@ -98,6 +128,7 @@ impl GitHubPrDiffView {
                 deletions: parsed.deletions,
                 path_key,
                 unsupported_reason: parsed.unsupported_reason.clone().map(SharedString::from),
+                preview_note: parsed.preview_note.clone().map(SharedString::from),
             };
             diff_files.push(diff_file.clone());
 
@@ -370,6 +401,7 @@ pub(crate) fn parse_github_pr_diff_file(file: &GitHubPullRequestFile) -> ParsedG
             old_text: String::new(),
             new_text: String::new(),
             unsupported_reason: Some("Binary file or diff too large to display".to_string()),
+            preview_note: None,
         };
     };
 
@@ -383,6 +415,7 @@ pub(crate) fn parse_github_pr_diff_file(file: &GitHubPullRequestFile) -> ParsedG
             old_text,
             new_text,
             unsupported_reason: None,
+            preview_note: None,
         },
         Err(error) => ParsedGitHubPrDiffFile {
             filename: file.filename.clone(),
@@ -393,8 +426,98 @@ pub(crate) fn parse_github_pr_diff_file(file: &GitHubPullRequestFile) -> ParsedG
             old_text: String::new(),
             new_text: String::new(),
             unsupported_reason: Some(error.to_string()),
+            preview_note: None,
         },
     }
+}
+
+async fn resolve_github_pr_diff_file(
+    repo_name_with_owner: &str,
+    pull: &GitHubPullRequest,
+    file: GitHubPullRequestFile,
+    token: Option<&str>,
+    http_client: Arc<dyn HttpClient>,
+) -> ParsedGitHubPrDiffFile {
+    match resolve_github_pr_diff_file_content(repo_name_with_owner, pull, &file, token, http_client)
+        .await
+    {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let mut parsed = parse_github_pr_diff_file(&file);
+            if parsed.unsupported_reason.is_none() {
+                parsed.preview_note = Some("Patch preview".to_string());
+            } else {
+                log::debug!(
+                    "Could not fetch full GitHub PR file content for {}: {error:#}",
+                    file.filename
+                );
+            }
+            parsed
+        }
+    }
+}
+
+async fn resolve_github_pr_diff_file_content(
+    repo_name_with_owner: &str,
+    pull: &GitHubPullRequest,
+    file: &GitHubPullRequestFile,
+    token: Option<&str>,
+    http_client: Arc<dyn HttpClient>,
+) -> Result<ParsedGitHubPrDiffFile> {
+    let old_filename = file
+        .previous_filename
+        .clone()
+        .unwrap_or_else(|| file.filename.clone());
+    let base_repo = branch_repo_name(&pull.base, repo_name_with_owner);
+    let head_repo = branch_repo_name(&pull.head, repo_name_with_owner);
+
+    let old_text = match file.status.as_str() {
+        "added" => String::new(),
+        _ => {
+            http_client::github::repository_file_content(
+                &base_repo,
+                &old_filename,
+                &pull.base.sha,
+                token,
+                http_client.clone(),
+            )
+            .await?
+        }
+    };
+
+    let new_text = match file.status.as_str() {
+        "removed" | "deleted" => String::new(),
+        _ => {
+            http_client::github::repository_file_content(
+                &head_repo,
+                &file.filename,
+                &pull.head.sha,
+                token,
+                http_client,
+            )
+            .await?
+        }
+    };
+
+    Ok(ParsedGitHubPrDiffFile {
+        filename: file.filename.clone(),
+        old_filename,
+        status: file.status.clone(),
+        additions: file.additions,
+        deletions: file.deletions,
+        old_text,
+        new_text,
+        unsupported_reason: None,
+        preview_note: None,
+    })
+}
+
+fn branch_repo_name(branch: &GitHubPullRequestBranch, fallback: &str) -> String {
+    branch
+        .repo
+        .as_ref()
+        .map(|repo| repo.full_name.clone())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 fn parse_unified_patch_text(patch: &str) -> Result<(String, String)> {
@@ -622,6 +745,7 @@ impl GitHubPrDiffView {
             .is_some_and(|selected| selected == &file.filename);
         let status = file.status.to_string();
         let unsupported = file.unsupported_reason.clone();
+        let preview_note = file.preview_note.clone();
         let file_for_click = file.clone();
         div()
             .id(format!("github-pr-diff-file-{}", file.filename))
@@ -657,6 +781,9 @@ impl GitHubPrDiffView {
                             .child(Label::new(format!("-{}", file.deletions)).color(Color::Error))
                             .when_some(unsupported, |this, reason| {
                                 this.child(Label::new(reason).color(Color::Muted).truncate())
+                            })
+                            .when_some(preview_note, |this, note| {
+                                this.child(Label::new(note).color(Color::Muted).truncate())
                             }),
                     ),
             )
@@ -666,6 +793,9 @@ impl GitHubPrDiffView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+    use std::sync::{Arc, Mutex};
 
     fn file(status: &str, patch: Option<&str>) -> GitHubPullRequestFile {
         GitHubPullRequestFile {
@@ -677,6 +807,58 @@ mod tests {
             changes: 2,
             patch: patch.map(ToString::to_string),
         }
+    }
+
+    fn pull() -> GitHubPullRequest {
+        GitHubPullRequest {
+            number: 7,
+            title: "Improve graph".to_string(),
+            html_url: "https://github.com/owner/repo/pull/7".to_string(),
+            state: "open".to_string(),
+            user: http_client::github::GitHubUser {
+                login: "octo".to_string(),
+            },
+            base: GitHubPullRequestBranch {
+                ref_name: "main".to_string(),
+                sha: "base-sha".to_string(),
+                repo: Some(http_client::github::GitHubRepositoryRef {
+                    full_name: "owner/repo".to_string(),
+                    clone_url: None,
+                    ssh_url: None,
+                }),
+            },
+            head: GitHubPullRequestBranch {
+                ref_name: "feature".to_string(),
+                sha: "head-sha".to_string(),
+                repo: Some(http_client::github::GitHubRepositoryRef {
+                    full_name: "fork/repo".to_string(),
+                    clone_url: None,
+                    ssh_url: None,
+                }),
+            },
+            draft: false,
+            updated_at: None,
+            created_at: None,
+            labels: Vec::new(),
+            body: None,
+            requested_reviewers: Vec::new(),
+            comments: 0,
+            review_comments: 0,
+            commits: None,
+            changed_files: None,
+            additions: None,
+            deletions: None,
+        }
+    }
+
+    fn content_response(text: &str) -> Response<AsyncBody> {
+        let content = base64::engine::general_purpose::STANDARD.encode(text);
+        Response::builder()
+            .status(200)
+            .body(AsyncBody::from(format!(
+                r#"{{"type":"file","encoding":"base64","content":"{content}"}}"#
+            )))
+            .unwrap()
     }
 
     #[test]
@@ -751,5 +933,120 @@ mod tests {
             parsed.unsupported_reason.as_deref(),
             Some("Binary file or diff too large to display")
         );
+    }
+
+    #[test]
+    fn test_resolve_modified_file_uses_full_base_and_head_content() {
+        futures::executor::block_on(async {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let responses = Arc::new(Mutex::new(vec![
+                content_response("fn main() {\n    old();\n}\n"),
+                content_response("fn main() {\n    new();\n}\n"),
+            ]));
+            let http = FakeHttpClient::create({
+                let requests = requests.clone();
+                let responses = responses.clone();
+                move |request| {
+                    requests.lock().unwrap().push(request.uri().to_string());
+                    let response = responses.lock().unwrap().remove(0);
+                    async move { Ok(response) }
+                }
+            });
+
+            let parsed = resolve_github_pr_diff_file_content(
+                "owner/repo",
+                &pull(),
+                &file("modified", Some("@@ -1 +1 @@\n-old\n+new")),
+                Some("secret"),
+                http,
+            )
+            .await
+            .expect("full file content should resolve");
+
+            assert_eq!(parsed.old_text, "fn main() {\n    old();\n}\n");
+            assert_eq!(parsed.new_text, "fn main() {\n    new();\n}\n");
+            assert_eq!(parsed.preview_note, None);
+            assert_eq!(
+                &*requests.lock().unwrap(),
+                &[
+                    "https://api.github.com/repos/owner/repo/contents/src/main.rs?ref=base-sha",
+                    "https://api.github.com/repos/fork/repo/contents/src/main.rs?ref=head-sha",
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_renamed_file_uses_previous_filename_for_base() {
+        futures::executor::block_on(async {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let responses = Arc::new(Mutex::new(vec![
+                content_response("old name\n"),
+                content_response("new name\n"),
+            ]));
+            let http = FakeHttpClient::create({
+                let requests = requests.clone();
+                let responses = responses.clone();
+                move |request| {
+                    requests.lock().unwrap().push(request.uri().to_string());
+                    let response = responses.lock().unwrap().remove(0);
+                    async move { Ok(response) }
+                }
+            });
+
+            let parsed = resolve_github_pr_diff_file_content(
+                "owner/repo",
+                &pull(),
+                &GitHubPullRequestFile {
+                    filename: "src/new.rs".to_string(),
+                    status: "renamed".to_string(),
+                    previous_filename: Some("src/old.rs".to_string()),
+                    additions: 1,
+                    deletions: 1,
+                    changes: 2,
+                    patch: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+                },
+                None,
+                http,
+            )
+            .await
+            .expect("renamed file content should resolve");
+
+            assert_eq!(parsed.old_filename, "src/old.rs");
+            assert_eq!(parsed.old_text, "old name\n");
+            assert_eq!(parsed.new_text, "new name\n");
+            assert_eq!(
+                &*requests.lock().unwrap(),
+                &[
+                    "https://api.github.com/repos/owner/repo/contents/src/old.rs?ref=base-sha",
+                    "https://api.github.com/repos/fork/repo/contents/src/new.rs?ref=head-sha",
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_file_falls_back_to_patch_preview() {
+        futures::executor::block_on(async {
+            let http = FakeHttpClient::create(|_| async {
+                Ok(Response::builder()
+                    .status(404)
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            });
+
+            let parsed = resolve_github_pr_diff_file(
+                "owner/repo",
+                &pull(),
+                file("modified", Some("@@ -1 +1 @@\n-old\n+new")),
+                None,
+                http,
+            )
+            .await;
+
+            assert_eq!(parsed.old_text, "old\n");
+            assert_eq!(parsed.new_text, "new\n");
+            assert_eq!(parsed.preview_note.as_deref(), Some("Patch preview"));
+        });
     }
 }

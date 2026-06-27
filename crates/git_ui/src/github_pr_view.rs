@@ -182,7 +182,7 @@ impl GitHubPullRequestView {
                     &operation.repo_name_with_owner,
                     operation.pull_number,
                     token.as_deref(),
-                    operation.http_client,
+                    operation.http_client.clone(),
                 )
                 .await?;
                 let project = operation
@@ -192,6 +192,8 @@ impl GitHubPullRequestView {
                     operation.repo_name_with_owner.into(),
                     operation.pull,
                     files,
+                    token,
+                    operation.http_client,
                     project,
                     operation.workspace.downgrade(),
                     cx,

@@ -26,6 +26,7 @@ doctest = true
 [dependencies]
 anyhow.workspace = true
 async-compression.workspace = true
+base64.workspace = true
 bytes.workspace = true
 cloud_api_types.workspace = true
 derive_more.workspace = true
