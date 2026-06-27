@@ -6,20 +6,23 @@ use editor::{
     multibuffer_context_lines, scroll::Autoscroll,
 };
 use gpui::{
-    AnyElement, App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    AnyElement, App, AppContext as _, AsyncWindowContext, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, WeakEntity, Window, rems,
 };
 use http_client::github::{GitHubPullRequest, GitHubPullRequestFile};
-use language::{Buffer, Capability, OffsetRangeExt};
+use language::{
+    Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt, ReplicaId,
+    Rope, TextBuffer,
+};
 use multi_buffer::{MultiBuffer, PathKey};
-use project::Project;
-use settings::Settings;
-use std::{any::TypeId, sync::Arc};
+use project::{Project, ProjectPath, WorktreeId};
+use settings::{DiffViewStyle, Settings};
+use std::{any::TypeId, path::PathBuf, sync::Arc};
 use ui::{Color, Icon, IconName, Label, LabelSize, Tooltip, div, h_flex, prelude::*, v_flex};
-use util::rel_path::RelPath;
+use util::{ResultExt, paths::PathStyle, rel_path::RelPath};
 use workspace::{
-    Item, Workspace,
+    Item, ItemHandle, ItemNavHistory, ToolbarItemLocation, Workspace,
     item::{ItemEvent, TabContentParams},
     searchable::SearchableItemHandle,
 };
@@ -52,6 +55,13 @@ struct GitHubPrDiffEntry {
     diff: Entity<BufferDiff>,
 }
 
+struct GitHubPrDiffBlob {
+    path: Arc<RelPath>,
+    display_name: String,
+    worktree_id: WorktreeId,
+    is_deleted: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParsedGitHubPrDiffFile {
     pub filename: String,
@@ -71,10 +81,19 @@ impl GitHubPrDiffView {
         files: Vec<GitHubPullRequestFile>,
         project: Entity<Project>,
         workspace: WeakEntity<Workspace>,
-        cx: &mut AsyncApp,
+        cx: &mut AsyncWindowContext,
     ) -> Result<Entity<Self>> {
         let mut entries = Vec::new();
         let mut diff_files = Vec::new();
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        let worktree_id = project
+            .read_with(cx, |project, cx| {
+                project
+                    .worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).id())
+            })
+            .ok_or_else(|| anyhow!("project has no worktrees"))?;
 
         for (index, file) in files.into_iter().enumerate() {
             let parsed = parse_github_pr_diff_file(&file);
@@ -94,16 +113,24 @@ impl GitHubPrDiffView {
                 continue;
             }
 
-            let old_buffer = cx.new(|cx| {
-                let mut buffer = Buffer::local(parsed.old_text.as_str(), cx);
-                buffer.set_capability(Capability::ReadOnly, cx);
-                buffer
-            });
-            let new_buffer = cx.new(|cx| {
-                let mut buffer = Buffer::local(parsed.new_text.as_str(), cx);
-                buffer.set_capability(Capability::ReadOnly, cx);
-                buffer
-            });
+            let old_buffer = build_buffer(
+                parsed.old_text,
+                &parsed.old_filename,
+                worktree_id,
+                parsed.status == "removed",
+                &language_registry,
+                cx,
+            )
+            .await?;
+            let new_buffer = build_buffer(
+                parsed.new_text,
+                &parsed.filename,
+                worktree_id,
+                parsed.status == "removed",
+                &language_registry,
+                cx,
+            )
+            .await?;
             let diff = build_buffer_diff(&old_buffer, &new_buffer, cx).await?;
             entries.push(GitHubPrDiffEntry {
                 file: diff_file,
@@ -255,31 +282,11 @@ fn build_editor(
     Entity<MultiBuffer>,
     Vec<GitHubPrDiffFile>,
 ) {
-    let context_lines = multibuffer_context_lines(cx);
     let multibuffer = cx.new(|cx| {
         let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
         multibuffer.set_all_diff_hunks_expanded(cx);
         multibuffer
     });
-
-    for entry in entries {
-        let snapshot = entry.new_buffer.read(cx).snapshot();
-        let diff_snapshot = entry.diff.read(cx).snapshot(cx);
-        let ranges = diff_snapshot
-            .hunks(&snapshot)
-            .map(|hunk| hunk.buffer_range.to_point(&snapshot))
-            .collect::<Vec<_>>();
-        multibuffer.update(cx, |multibuffer, cx| {
-            multibuffer.set_excerpts_for_path(
-                entry.file.path_key.clone(),
-                entry.new_buffer,
-                ranges,
-                context_lines,
-                cx,
-            );
-            multibuffer.add_diff(entry.diff, cx);
-        });
-    }
 
     let editor = cx.new(|cx| {
         let editor = SplittableEditor::new(
@@ -305,7 +312,134 @@ fn build_editor(
         editor
     });
 
+    add_entries_to_editor(entries, &editor, window, cx);
+
     (editor, multibuffer, files)
+}
+
+fn add_entries_to_editor(
+    entries: Vec<GitHubPrDiffEntry>,
+    editor: &Entity<SplittableEditor>,
+    window: &mut Window,
+    cx: &mut Context<GitHubPrDiffView>,
+) {
+    let context_lines = multibuffer_context_lines(cx);
+    let use_split = EditorSettings::get_global(cx).diff_view_style == DiffViewStyle::Split;
+
+    for entry in entries {
+        let snapshot = entry.new_buffer.read(cx).snapshot();
+        let diff_snapshot = entry.diff.read(cx).snapshot(cx);
+        let ranges = diff_snapshot
+            .hunks(&snapshot)
+            .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+            .collect::<Vec<_>>();
+
+        editor.update(cx, |editor, cx| {
+            let added_new_excerpt = editor.update_excerpts_for_path(
+                entry.file.path_key.clone(),
+                entry.new_buffer,
+                ranges,
+                context_lines,
+                entry.diff,
+                cx,
+            );
+            if added_new_excerpt && use_split {
+                editor.split(window, cx);
+            }
+        });
+    }
+}
+
+impl File for GitHubPrDiffBlob {
+    fn as_local(&self) -> Option<&dyn language::LocalFile> {
+        None
+    }
+
+    fn disk_state(&self) -> DiskState {
+        DiskState::Historic {
+            was_deleted: self.is_deleted,
+        }
+    }
+
+    fn path_style(&self, _: &App) -> PathStyle {
+        PathStyle::local()
+    }
+
+    fn path(&self) -> &Arc<RelPath> {
+        &self.path
+    }
+
+    fn full_path(&self, _: &App) -> PathBuf {
+        self.path.as_std_path().to_path_buf()
+    }
+
+    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
+        self.display_name.as_ref()
+    }
+
+    fn worktree_id(&self, _: &App) -> WorktreeId {
+        self.worktree_id
+    }
+
+    fn to_proto(&self, _cx: &App) -> language::proto::File {
+        unimplemented!()
+    }
+
+    fn is_private(&self) -> bool {
+        false
+    }
+
+    fn can_open(&self) -> bool {
+        true
+    }
+}
+
+async fn build_buffer(
+    mut text: String,
+    filename: &str,
+    worktree_id: WorktreeId,
+    is_deleted: bool,
+    language_registry: &Arc<LanguageRegistry>,
+    cx: &mut AsyncWindowContext,
+) -> Result<Entity<Buffer>> {
+    let line_ending = LineEnding::detect(&text);
+    LineEnding::normalize(&mut text);
+    let text = Rope::from(text);
+    let path = RelPath::unix(filename)?.into_arc();
+    let display_name = path
+        .file_name()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| filename.to_string());
+    let blob = Arc::new(GitHubPrDiffBlob {
+        path,
+        display_name,
+        worktree_id,
+        is_deleted,
+    }) as Arc<dyn File>;
+    let language =
+        cx.update(|_, cx| language_registry.language_for_file(&blob, Some(&text), cx))?;
+    let language = if let Some(language) = language {
+        language_registry
+            .load_language(&language)
+            .await
+            .ok()
+            .and_then(|language| language.log_err())
+    } else {
+        None
+    };
+
+    let buffer = cx.new(|cx| {
+        let buffer = TextBuffer::new_normalized(
+            ReplicaId::LOCAL,
+            cx.entity_id().as_non_zero_u64().into(),
+            line_ending,
+            text,
+        );
+        let mut buffer = Buffer::build(buffer, Some(blob), Capability::ReadOnly);
+        buffer.set_language_async(language, cx);
+        buffer
+    });
+    Ok(buffer)
 }
 
 pub(crate) fn parse_github_pr_diff_file(file: &GitHubPullRequestFile) -> ParsedGitHubPrDiffFile {
@@ -456,19 +590,66 @@ impl Item for GitHubPrDiffView {
         &'a self,
         type_id: TypeId,
         self_handle: &'a Entity<Self>,
-        _: &'a App,
+        cx: &'a App,
     ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
             Some(self_handle.clone().into())
-        } else if type_id == TypeId::of::<SplittableEditor>() {
-            Some(self.editor.clone().into())
         } else {
-            None
+            self.editor.act_as_type(type_id, cx)
         }
     }
 
     fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
-        None
+        Some(Box::new(self.editor.clone()))
+    }
+
+    fn for_each_project_item(
+        &self,
+        cx: &App,
+        f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
+    ) {
+        self.editor.for_each_project_item(cx, f)
+    }
+
+    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        self.editor.read(cx).active_project_path(cx)
+    }
+
+    fn set_nav_history(
+        &mut self,
+        nav_history: ItemNavHistory,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, _| {
+                editor.set_nav_history(Some(nav_history));
+            })
+        });
+    }
+
+    fn navigate(
+        &mut self,
+        data: Arc<dyn std::any::Any + Send>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.editor.update(cx, |editor, cx| {
+            editor
+                .rhs_editor()
+                .update(cx, |editor, cx| editor.navigate(data, window, cx))
+        })
+    }
+
+    fn breadcrumb_location(&self, _: &App) -> ToolbarItemLocation {
+        ToolbarItemLocation::PrimaryLeft
+    }
+
+    fn breadcrumbs(
+        &self,
+        cx: &App,
+    ) -> Option<(Vec<language::HighlightedText>, Option<gpui::Font>)> {
+        self.editor.breadcrumbs(cx)
     }
 }
 
@@ -657,5 +838,35 @@ mod tests {
             parsed.unsupported_reason.as_deref(),
             Some("Binary file or diff too large to display")
         );
+    }
+
+    #[gpui::test]
+    async fn test_virtual_pr_diff_file_reports_filename_and_path(cx: &mut gpui::TestAppContext) {
+        let path = RelPath::unix("app/Console/Commands/CreateFeatureFlagCommand.php")
+            .unwrap()
+            .into_arc();
+        let file = GitHubPrDiffBlob {
+            path,
+            display_name: "CreateFeatureFlagCommand.php".to_string(),
+            worktree_id: WorktreeId::from_usize(7),
+            is_deleted: false,
+        };
+
+        cx.update(|cx| {
+            assert_eq!(file.file_name(cx), "CreateFeatureFlagCommand.php");
+            assert_eq!(
+                file.path().as_unix_str(),
+                "app/Console/Commands/CreateFeatureFlagCommand.php"
+            );
+            assert_eq!(
+                file.full_path(cx),
+                PathBuf::from("app/Console/Commands/CreateFeatureFlagCommand.php")
+            );
+            assert_eq!(file.worktree_id(cx), WorktreeId::from_usize(7));
+            assert_eq!(
+                file.disk_state(),
+                DiskState::Historic { was_deleted: false }
+            );
+        });
     }
 }
