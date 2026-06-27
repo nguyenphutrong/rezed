@@ -139,7 +139,7 @@ impl GitHubPrDiffView {
             });
         }
 
-        workspace.update_in(cx, |workspace, window, cx| {
+        let item = workspace.update_in(cx, |workspace, window, cx| {
             let project = project.clone();
             let workspace_entity = cx.entity();
             let existing = workspace.items_of_type::<Self>(cx).find(|item| {
@@ -180,7 +180,13 @@ impl GitHubPrDiffView {
 
             workspace.add_item_to_center(Box::new(item.clone()), window, cx);
             item
-        })
+        })?;
+
+        item.update_in(cx, |view, window, cx| {
+            view.split_if_needed(window, cx);
+        })?;
+
+        Ok(item)
     }
 
     fn new(
@@ -234,6 +240,14 @@ impl GitHubPrDiffView {
 
     fn title(&self) -> SharedString {
         format!("#{} Changes", self.pull_number).into()
+    }
+
+    fn split_if_needed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            if editor.diff_view_style() == settings::DiffViewStyle::Split {
+                editor.split(window, cx);
+            }
+        });
     }
 
     fn move_to_file(
@@ -334,6 +348,7 @@ fn add_entries_to_editor(
             },
             ranges,
             true,
+            false,
             window,
             cx,
         );

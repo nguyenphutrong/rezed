@@ -407,6 +407,7 @@ impl CommitView {
                             },
                             ranges,
                             is_first_batch,
+                            true,
                             window,
                             cx,
                         );

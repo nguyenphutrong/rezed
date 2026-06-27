@@ -175,6 +175,7 @@ pub(crate) fn insert_diff_excerpts(
     entry: VirtualDiffEntry,
     ranges: Vec<Range<language::Point>>,
     is_first_batch: bool,
+    split_on_first_batch: bool,
     window: &mut Window,
     cx: &mut Context<impl Sized + 'static>,
 ) {
@@ -188,7 +189,11 @@ pub(crate) fn insert_diff_excerpts(
             entry.diff,
             cx,
         );
-        if added_new_excerpt && is_first_batch && editor.diff_view_style() == DiffViewStyle::Split {
+        if added_new_excerpt
+            && is_first_batch
+            && split_on_first_batch
+            && editor.diff_view_style() == DiffViewStyle::Split
+        {
             editor.split(window, cx);
         }
     });
