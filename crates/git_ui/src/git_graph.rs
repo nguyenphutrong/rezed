@@ -656,6 +656,30 @@ impl BranchFilterPickerDelegate {
             self.selected_index = self.selected_index.min(self.matches.len() - 1);
         }
     }
+
+    fn render_checkbox_label(
+        checkbox_id: impl Into<ElementId>,
+        toggle_state: ToggleState,
+        label: impl Into<SharedString>,
+    ) -> Div {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .child(
+                div()
+                    .flex_none()
+                    .child(Checkbox::new(checkbox_id, toggle_state).visualization_only(true)),
+            )
+            .child(
+                Label::new(label)
+                    .color(Color::Default)
+                    .size(LabelSize::Small)
+                    .single_line()
+                    .truncate()
+                    .flex_1(),
+            )
+    }
 }
 
 impl SearchState {
@@ -4949,10 +4973,17 @@ impl GitGraph {
                 .style(ButtonStyle::Subtle)
                 .child(
                     h_flex()
+                        .debug_selector(|| "git-graph-branch-filter-trigger".into())
+                        .max_w(rems(18.))
+                        .min_w_0()
                         .gap_1()
                         .items_center()
-                        .child(Label::new(label))
-                        .child(Icon::new(IconName::ChevronDown).size(IconSize::Small)),
+                        .child(Label::new(label).single_line().truncate().flex_1())
+                        .child(
+                            div()
+                                .flex_none()
+                                .child(Icon::new(IconName::ChevronDown).size(IconSize::Small)),
+                        ),
                 )
                 .on_click(move |_, window, cx| {
                     if let Some(graph) = weak.upgrade() {
@@ -7188,16 +7219,11 @@ impl PickerDelegate for BranchFilterPickerDelegate {
                 .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
-                .child(
-                    Checkbox::new(
-                        ("git-graph-branch-filter-checkbox", index),
-                        ToggleState::from(is_selected),
-                    )
-                    .label(label)
-                    .label_size(LabelSize::Small)
-                    .label_color(Color::Default)
-                    .visualization_only(true),
-                ),
+                .child(Self::render_checkbox_label(
+                    ("git-graph-branch-filter-checkbox", index),
+                    ToggleState::from(is_selected),
+                    label,
+                )),
         )
     }
 }
@@ -11077,6 +11103,78 @@ mod tests {
         let match_count =
             git_graph.read_with(cx, |graph, _cx| graph.branch_filter_entries("").len());
         assert_eq!(match_count, 250);
+    }
+
+    #[gpui::test]
+    async fn test_branch_filter_truncates_long_branch_labels(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (git_graph, window_handle) = setup_git_graph_with_branches(&["main"], cx).await;
+        let cx = &mut gpui::VisualTestContext::from_window(window_handle, cx);
+        let long_ref_name = SharedString::from(format!(
+            "refs/heads/feature/{}",
+            "very-long-branch-name-".repeat(20)
+        ));
+
+        git_graph.update(cx, |graph, _cx| {
+            graph.branch_filter_state.available_branches = vec![
+                BranchInfo {
+                    ref_name: long_ref_name.clone(),
+                    is_head: false,
+                    is_remote: false,
+                    is_selected: true,
+                },
+                BranchInfo {
+                    ref_name: "refs/heads/main".into(),
+                    is_head: true,
+                    is_remote: false,
+                    is_selected: false,
+                },
+            ];
+            graph.branch_filter_state.selected_branches =
+                [long_ref_name.clone()].into_iter().collect();
+            graph.branch_filter_state.branches_loaded = true;
+        });
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+
+        let trigger_bounds = cx
+            .debug_bounds("git-graph-branch-filter-trigger")
+            .expect("branch filter trigger should render");
+        let trigger_width_limit = cx.update(|window, _| rems(18.).to_pixels(window.rem_size()));
+        assert!(
+            trigger_bounds.size.width <= trigger_width_limit + px(1.),
+            "branch filter trigger should truncate long selected branch names"
+        );
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.open_branch_filter(window, cx);
+        });
+        assert!(
+            git_graph.read_with(cx, |graph, _| graph
+                .branch_filter_state
+                .handle
+                .is_deployed()),
+            "branch filter picker should be deployed after opening"
+        );
+        git_graph.read_with(cx, |graph, cx| {
+            assert!(
+                graph.branch_filter_picker.is_some(),
+                "branch filter picker should be created"
+            );
+            let match_count = graph
+                .branch_filter_picker
+                .as_ref()
+                .expect("branch filter picker should be created")
+                .read(cx)
+                .delegate
+                .match_count();
+            assert_eq!(match_count, 2);
+        });
     }
 
     #[test]
