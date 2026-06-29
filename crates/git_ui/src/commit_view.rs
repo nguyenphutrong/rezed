@@ -257,14 +257,7 @@ impl CommitView {
             multibuffer
         });
 
-        let message = cx.new(|cx| {
-            Markdown::new(
-                commit.message.clone(),
-                Some(language_registry.clone()),
-                None,
-                cx,
-            )
-        });
+        let message = cx.new(|cx| Markdown::new_text(commit.message.clone(), cx));
 
         let editor = cx.new(|cx| {
             let editor = SplittableEditor::new(
@@ -1206,15 +1199,7 @@ impl Item for CommitView {
                     editor
                 }
             });
-            let language_registry = project.read(cx).languages().clone();
-            let message = cx.new(|cx| {
-                Markdown::new(
-                    self.commit.message.clone(),
-                    Some(language_registry),
-                    None,
-                    cx,
-                )
-            });
+            let message = cx.new(|cx| Markdown::new_text(self.commit.message.clone(), cx));
             Self {
                 editor,
                 message,

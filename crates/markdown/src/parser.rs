@@ -1217,6 +1217,16 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_links_only_preserves_ascii_quotes() {
+        use MarkdownEvent::*;
+
+        assert_eq!(
+            parse_links_only("Merge branch 'feature/test' into develop"),
+            vec![(0..40, Text)]
+        );
+    }
+
+    #[test]
     fn test_code_block_metadata() {
         assert_eq!(
             parse_markdown_with_options(

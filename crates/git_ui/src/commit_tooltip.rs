@@ -206,14 +206,12 @@ impl CommitTooltip {
         cx: &mut Context<Self>,
     ) -> Self {
         let markdown = cx.new(|cx| {
-            Markdown::new(
+            Markdown::new_text(
                 commit
                     .message
                     .as_ref()
                     .map(|message| message.message.clone())
                     .unwrap_or_default(),
-                None,
-                None,
                 cx,
             )
         });
