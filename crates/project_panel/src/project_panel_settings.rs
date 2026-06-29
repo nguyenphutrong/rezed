@@ -107,6 +107,7 @@ impl Settings for ProjectPanelSettings {
             folder_icons: project_panel.folder_icons.unwrap(),
             git_status: project_panel.git_status.unwrap()
                 && content
+                    .project
                     .git
                     .as_ref()
                     .unwrap()

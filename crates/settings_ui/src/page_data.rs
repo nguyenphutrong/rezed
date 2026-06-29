@@ -7325,6 +7325,7 @@ fn version_control_page() -> SettingsPage {
                         json_path: Some("git.disable_git"),
                         pick: |settings_content| {
                             settings_content
+                                .project
                                 .git
                                 .as_ref()?
                                 .enabled
@@ -7334,6 +7335,7 @@ fn version_control_page() -> SettingsPage {
                         },
                         write: |settings_content, value, _| {
                             settings_content
+                                .project
                                 .git
                                 .get_or_insert_default()
                                 .enabled
@@ -7345,6 +7347,7 @@ fn version_control_page() -> SettingsPage {
                 },
                 pick_discriminant: |settings_content| {
                     let disabled = settings_content
+                        .project
                         .git
                         .as_ref()?
                         .enabled
@@ -7365,6 +7368,7 @@ fn version_control_page() -> SettingsPage {
                                 json_path: Some("git.enable_status"),
                                 pick: |settings_content| {
                                     settings_content
+                                        .project
                                         .git
                                         .as_ref()?
                                         .enabled
@@ -7374,6 +7378,7 @@ fn version_control_page() -> SettingsPage {
                                 },
                                 write: |settings_content, value, _| {
                                     settings_content
+                                        .project
                                         .git
                                         .get_or_insert_default()
                                         .enabled
@@ -7392,6 +7397,7 @@ fn version_control_page() -> SettingsPage {
                                 json_path: Some("git.enable_diff"),
                                 pick: |settings_content| {
                                     settings_content
+                                        .project
                                         .git
                                         .as_ref()?
                                         .enabled
@@ -7401,6 +7407,7 @@ fn version_control_page() -> SettingsPage {
                                 },
                                 write: |settings_content, value, _| {
                                     settings_content
+                                        .project
                                         .git
                                         .get_or_insert_default()
                                         .enabled
@@ -7425,9 +7432,15 @@ fn version_control_page() -> SettingsPage {
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git.git_gutter"),
-                    pick: |settings_content| settings_content.git.as_ref()?.git_gutter.as_ref(),
+                    pick: |settings_content| {
+                        settings_content.project.git.as_ref()?.git_gutter.as_ref()
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.git.get_or_insert_default().git_gutter = value;
+                        settings_content
+                            .project
+                            .git
+                            .get_or_insert_default()
+                            .git_gutter = value;
                     },
                 }),
                 metadata: None,
@@ -7441,10 +7454,19 @@ fn version_control_page() -> SettingsPage {
                     organization_override: None,
                     json_path: Some("git.gutter_debounce"),
                     pick: |settings_content| {
-                        settings_content.git.as_ref()?.gutter_debounce.as_ref()
+                        settings_content
+                            .project
+                            .git
+                            .as_ref()?
+                            .gutter_debounce
+                            .as_ref()
                     },
                     write: |settings_content, value, _| {
-                        settings_content.git.get_or_insert_default().gutter_debounce = value;
+                        settings_content
+                            .project
+                            .git
+                            .get_or_insert_default()
+                            .gutter_debounce = value;
                     },
                 }),
                 metadata: None,
@@ -7464,6 +7486,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.inline_blame.enabled"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .inline_blame
@@ -7473,6 +7496,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .inline_blame
@@ -7491,6 +7515,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.inline_blame.delay_ms"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .inline_blame
@@ -7500,6 +7525,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .inline_blame
@@ -7518,6 +7544,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.inline_blame.padding"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .inline_blame
@@ -7527,6 +7554,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .inline_blame
@@ -7545,6 +7573,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.inline_blame.min_column"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .inline_blame
@@ -7554,6 +7583,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .inline_blame
@@ -7572,6 +7602,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.inline_blame.show_commit_summary"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .inline_blame
@@ -7581,6 +7612,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .inline_blame
@@ -7605,6 +7637,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.blame.show_avatar"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .blame
@@ -7614,6 +7647,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .blame
@@ -7638,6 +7672,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.branch_picker.show_author_name"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .branch_picker
@@ -7647,6 +7682,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .branch_picker
@@ -7669,9 +7705,15 @@ fn version_control_page() -> SettingsPage {
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git.hunk_style"),
-                    pick: |settings_content| settings_content.git.as_ref()?.hunk_style.as_ref(),
+                    pick: |settings_content| {
+                        settings_content.project.git.as_ref()?.hunk_style.as_ref()
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.git.get_or_insert_default().hunk_style = value;
+                        settings_content
+                            .project
+                            .git
+                            .get_or_insert_default()
+                            .hunk_style = value;
                     },
                 }),
                 metadata: None,
@@ -7683,9 +7725,15 @@ fn version_control_page() -> SettingsPage {
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("git.path_style"),
-                    pick: |settings_content| settings_content.git.as_ref()?.path_style.as_ref(),
+                    pick: |settings_content| {
+                        settings_content.project.git.as_ref()?.path_style.as_ref()
+                    },
                     write: |settings_content, value, _| {
-                        settings_content.git.get_or_insert_default().path_style = value;
+                        settings_content
+                            .project
+                            .git
+                            .get_or_insert_default()
+                            .path_style = value;
                     },
                 }),
                 metadata: None,
@@ -7699,6 +7747,7 @@ fn version_control_page() -> SettingsPage {
                     json_path: Some("git.show_stage_restore_buttons"),
                     pick: |settings_content| {
                         settings_content
+                            .project
                             .git
                             .as_ref()?
                             .show_stage_restore_buttons
@@ -7706,6 +7755,7 @@ fn version_control_page() -> SettingsPage {
                     },
                     write: |settings_content, value, _| {
                         settings_content
+                            .project
                             .git
                             .get_or_insert_default()
                             .show_stage_restore_buttons = value;

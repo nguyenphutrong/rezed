@@ -80,6 +80,7 @@ impl Settings for ItemSettings {
         Self {
             git_status: tabs.git_status.unwrap()
                 && content
+                    .project
                     .git
                     .as_ref()
                     .unwrap()

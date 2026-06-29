@@ -487,6 +487,10 @@ pub struct GitSettings {
     ///
     /// Default: true
     pub show_stage_restore_buttons: bool,
+    /// Rules for linking issue references in commit messages.
+    ///
+    /// Default: []
+    pub issue_linking: Vec<IssueLinkingRule>,
     /// Directory where git worktrees are created, relative to the repository
     /// working directory. When the resolved directory is outside the project
     /// root, the project's directory name is automatically appended so that
@@ -494,6 +498,18 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueLinkingRule {
+    /// Human-readable name for this issue linking rule.
+    pub name: Option<String>,
+    /// Regex used to find issue references in commit messages.
+    pub issue_regex: String,
+    /// URL template for matched issue references.
+    pub issue_url: String,
+    /// Whether this rule is enabled.
+    pub enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -648,7 +664,7 @@ impl Settings for ProjectSettings {
         let lsp_pull_diagnostics = diagnostics.lsp_pull_diagnostics.as_ref().unwrap();
         let inline_diagnostics = diagnostics.inline.as_ref().unwrap();
 
-        let git = content.git.as_ref().unwrap();
+        let git = content.project.git.as_ref().unwrap();
         let git_enabled = {
             GitEnabledSettings {
                 status: git.enabled.as_ref().unwrap().is_git_status_enabled(),
@@ -684,6 +700,20 @@ impl Settings for ProjectSettings {
             hunk_style: git.hunk_style.unwrap(),
             path_style: git.path_style.unwrap().into(),
             show_stage_restore_buttons: git.show_stage_restore_buttons.unwrap_or(true),
+            issue_linking: git
+                .issue_linking
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|rule| {
+                    Some(IssueLinkingRule {
+                        name: rule.name,
+                        issue_regex: rule.issue_regex?,
+                        issue_url: rule.issue_url?,
+                        enabled: rule.enabled.unwrap_or(true),
+                    })
+                })
+                .collect(),
             worktree_directory: git
                 .worktree_directory
                 .clone()
@@ -764,6 +794,113 @@ impl Settings for ProjectSettings {
                 trust_all_worktrees: content.session.unwrap().trust_all_worktrees.unwrap(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::BorrowAppContext;
+    use settings::settings_content::ParseStatus;
+    use settings::{LocalSettingsKind, LocalSettingsPath, Settings as _, SettingsStore};
+    use util::rel_path::{RelPath, rel_path};
+    use worktree::WorktreeId;
+
+    use super::ProjectSettings;
+
+    #[gpui::test]
+    fn test_git_issue_linking_settings(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+
+            assert!(ProjectSettings::get(None, cx).git.issue_linking.is_empty());
+
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                let result = store.set_user_settings(
+                    r##"{
+                        "git": {
+                            "issue_linking": [
+                                {
+                                    "name": "github",
+                                    "issue_regex": "#(\\d+)",
+                                    "issue_url": "https://github.test/issues/$1"
+                                },
+                                {
+                                    "name": "disabled",
+                                    "issue_regex": "(OFF-\\d+)",
+                                    "issue_url": "https://disabled.test/$1",
+                                    "enabled": false
+                                },
+                                {
+                                    "name": "missing-url",
+                                    "issue_regex": "(MISS-\\d+)"
+                                }
+                            ]
+                        }
+                    }"##,
+                    cx,
+                );
+                assert!(matches!(result.parse_status, ParseStatus::Success));
+            });
+
+            let global_rules = ProjectSettings::get(None, cx).git.issue_linking.clone();
+            assert_eq!(global_rules.len(), 2);
+            assert_eq!(global_rules[0].name.as_deref(), Some("github"));
+            assert_eq!(global_rules[0].issue_regex, r"#(\d+)");
+            assert_eq!(global_rules[0].issue_url, "https://github.test/issues/$1");
+            assert!(global_rules[0].enabled);
+            assert_eq!(global_rules[1].name.as_deref(), Some("disabled"));
+            assert!(!global_rules[1].enabled);
+
+            let worktree_id = WorktreeId::from_usize(1);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store
+                    .set_local_settings(
+                        worktree_id,
+                        LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+                        LocalSettingsKind::Settings,
+                        Some(
+                            r#"{
+                                "git": {
+                                    "issue_linking": [
+                                        {
+                                            "name": "jira",
+                                            "issue_regex": "(JIRA-\\d+)",
+                                            "issue_url": "https://jira.test/browse/$1"
+                                        }
+                                    ]
+                                }
+                            }"#,
+                        ),
+                        cx,
+                    )
+                    .expect("local issue linking settings should parse");
+            });
+
+            let local_rules = &ProjectSettings::get(
+                Some(settings::SettingsLocation {
+                    worktree_id,
+                    path: rel_path("src/main.rs"),
+                }),
+                cx,
+            )
+            .git
+            .issue_linking;
+            assert_eq!(local_rules.len(), 1);
+            assert_eq!(local_rules[0].name.as_deref(), Some("jira"));
+            assert_eq!(local_rules[0].issue_regex, r"(JIRA-\d+)");
+
+            let other_worktree_rules = &ProjectSettings::get(
+                Some(settings::SettingsLocation {
+                    worktree_id: WorktreeId::from_usize(2),
+                    path: rel_path("src/main.rs"),
+                }),
+                cx,
+            )
+            .git
+            .issue_linking;
+            assert_eq!(other_worktree_rules, &global_rules);
+        });
     }
 }
 

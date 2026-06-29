@@ -1672,6 +1672,24 @@
     "path_style": "file_name_first",
     // Whether to show the stage and restore buttons on diff hunks.
     "show_stage_restore_buttons": true,
+    // Rules for linking issue references in commit messages.
+    // Rules are evaluated in order. The first rule that claims a text range wins.
+    // Regex captures can be referenced from `issue_url` with `$1`, `$2`, etc.
+    //
+    // Examples:
+    //   [
+    //     {
+    //       "name": "github",
+    //       "issue_regex": "#(\\d+)",
+    //       "issue_url": "https://github.com/org/repo/issues/$1"
+    //     },
+    //     {
+    //       "name": "linear",
+    //       "issue_regex": "([A-Z]+-\\d+)",
+    //       "issue_url": "https://linear.app/company/issue/$1"
+    //     }
+    //   ]
+    "issue_linking": [],
     // Directory where git worktrees are created, relative to the repository
     // working directory.
     //

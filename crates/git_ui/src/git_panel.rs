@@ -3,6 +3,7 @@ use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::{CommitAvatar, CommitTooltip};
 use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
+use crate::issue_linking::IssueLinkingRules;
 use crate::project_diff::{BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::solo_diff_view::SoloDiffView;
@@ -5207,6 +5208,7 @@ impl GitPanel {
         let active_repository = self.active_repository.as_ref()?;
         let branch = active_repository.read(cx).branch.as_ref()?;
         let commit = branch.most_recent_commit.as_ref()?.clone();
+        let issue_linking_rules = IssueLinkingRules::for_repository(active_repository, cx);
         let workspace = self.workspace.clone();
         let this = cx.entity();
 
@@ -5225,11 +5227,13 @@ impl GitPanel {
                         .rounded_sm()
                         .line_clamp(1)
                         .hover(|s| s.bg(cx.theme().colors().element_hover))
-                        .child(
-                            Label::new(commit.subject.clone())
-                                .size(LabelSize::Small)
-                                .truncate(),
-                        )
+                        .child(issue_linking_rules.render_label(
+                            commit.subject.clone(),
+                            LabelSize::Small,
+                            Color::Default,
+                            true,
+                            Vec::new(),
+                        ))
                         .on_click({
                             let commit = commit.clone();
                             let repo = active_repository.downgrade();
@@ -5584,6 +5588,7 @@ impl GitPanel {
         let active_repository = self.active_repository.as_ref()?;
         let workspace = self.workspace.clone();
         let repo_weak = active_repository.downgrade();
+        let issue_linking_rules = IssueLinkingRules::for_repository(active_repository, cx);
         let item_count = shas.len();
         let commit_history_scroll_handle = self.commit_history_scroll_handle.clone();
         let remote = self.git_remote(cx);
@@ -5714,7 +5719,13 @@ impl GitPanel {
                                             h_flex()
                                                 .gap_1()
                                                 .w_full()
-                                                .child(Label::new(subject).truncate())
+                                                .child(issue_linking_rules.render_label(
+                                                    subject,
+                                                    LabelSize::Default,
+                                                    Color::Default,
+                                                    true,
+                                                    Vec::new(),
+                                                ))
                                                 .when(is_unpushed, |this| {
                                                     this.child(
                                                         Icon::new(IconName::ArrowUp)

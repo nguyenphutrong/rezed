@@ -225,6 +225,7 @@ impl Settings for EditorSettings {
                 show: scrollbar.show.map(ui_scrollbar_settings_from_raw).unwrap(),
                 git_diff: scrollbar.git_diff.unwrap()
                     && content
+                        .project
                         .git
                         .as_ref()
                         .unwrap()

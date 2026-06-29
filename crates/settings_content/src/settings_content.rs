@@ -169,9 +169,6 @@ pub struct SettingsContent {
     /// Configuration for Diagnostics-related features.
     pub diagnostics: Option<DiagnosticsSettingsContent>,
 
-    /// Configuration for Git-related features
-    pub git: Option<GitSettings>,
-
     /// Common language server settings.
     pub global_lsp_settings: Option<GlobalLspSettingsContent>,
 

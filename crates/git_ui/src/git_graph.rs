@@ -2,7 +2,9 @@ use crate::{
     askpass_modal::AskPassModal,
     commit_tooltip::{CommitAvatar, CommitDetails, CommitTooltip},
     commit_view::CommitView,
-    git_status_icon, picker_prompt,
+    git_status_icon,
+    issue_linking::IssueLinkingRules,
+    picker_prompt,
 };
 use askpass::AskPassDelegate;
 use collections::{BTreeMap, HashMap, HashSet, IndexSet};
@@ -53,12 +55,11 @@ use theme::AccentColors;
 use time::{OffsetDateTime, UtcOffset, format_description::BorrowedFormatItem};
 use ui::{
     ButtonLike, Checkbox, Chip, ColumnWidthConfig, CommonAnimationExt as _, ContextMenu,
-    ContextMenuEntry, DiffStat, Divider, DropdownMenu, DropdownStyle, HeaderResizeInfo,
-    HighlightedLabel, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle,
-    RedistributableColumnsState, ScrollableHandle, Table, TableInteractionState,
-    TableRenderContext, TableResizeBehavior, ToggleState, Tooltip, WithScrollbar,
-    bind_redistributable_columns, prelude::*, render_redistributable_columns_resize_handles,
-    render_table_header, table_row::TableRow,
+    ContextMenuEntry, DiffStat, Divider, DropdownMenu, DropdownStyle, HeaderResizeInfo, ListItem,
+    ListItemSpacing, PopoverMenu, PopoverMenuHandle, RedistributableColumnsState, ScrollableHandle,
+    Table, TableInteractionState, TableRenderContext, TableResizeBehavior, ToggleState, Tooltip,
+    WithScrollbar, bind_redistributable_columns, prelude::*,
+    render_redistributable_columns_resize_handles, render_table_header, table_row::TableRow,
 };
 use ui_input::ErasedEditor;
 use workspace::{
@@ -2741,6 +2742,10 @@ impl GitGraph {
         cx: &mut Context<Self>,
     ) -> Vec<Vec<AnyElement>> {
         let repository = self.get_repository(cx);
+        let issue_linking_rules = repository
+            .as_ref()
+            .map(|repository| IssueLinkingRules::for_repository(repository, cx))
+            .unwrap_or_default();
 
         let (head_branch_name, stash_entries) = repository
             .as_ref()
@@ -2858,12 +2863,12 @@ impl GitGraph {
                         .into_any_element()
                 };
 
-                let subject_label = if is_matched {
+                let highlight_ranges = if is_matched {
                     let query = match &self.search_state.state {
                         QueryState::Confirmed((query, _)) => Some(query.clone()),
                         _ => None,
                     };
-                    let highlight_ranges = query
+                    query
                         .and_then(|q| {
                             let ranges = if self.search_state.case_sensitive {
                                 subject
@@ -2887,14 +2892,22 @@ impl GitGraph {
 
                             (!ranges.is_empty()).then_some(ranges)
                         })
-                        .unwrap_or_default();
-                    HighlightedLabel::from_ranges(subject, highlight_ranges)
-                        .when(!is_selected, |c| c.color(Color::Muted))
-                        .truncate()
-                        .into_any_element()
+                        .unwrap_or_default()
                 } else {
-                    column_label(subject)
+                    Vec::new()
                 };
+                let subject_color = if is_selected {
+                    Color::Default
+                } else {
+                    Color::Muted
+                };
+                let subject_label = issue_linking_rules.render_label(
+                    subject,
+                    LabelSize::Default,
+                    subject_color,
+                    true,
+                    highlight_ranges,
+                );
 
                 vec![
                     div()
@@ -5208,6 +5221,7 @@ impl GitGraph {
                 repo: parsed.repo.into(),
             })
         });
+        let issue_linking_rules = IssueLinkingRules::for_repository(&repository, cx);
 
         let avatar = {
             let author_email_for_avatar = if author_email.is_empty() {
@@ -5460,7 +5474,13 @@ impl GitGraph {
                     ),
             )
             .child(Divider::horizontal())
-            .child(div().p_2().child(Label::new(commit_message)))
+            .child(div().p_2().child(issue_linking_rules.render_label(
+                commit_message,
+                LabelSize::Default,
+                Color::Default,
+                false,
+                Vec::new(),
+            )))
             .child(Divider::horizontal())
             .child(
                 v_flex()

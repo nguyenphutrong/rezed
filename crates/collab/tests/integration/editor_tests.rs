@@ -4038,14 +4038,14 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
     cx_a.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.git.get_or_insert_default().inline_blame = inline_blame_off_settings;
+                settings.project.git.get_or_insert_default().inline_blame = inline_blame_off_settings;
             });
         });
     });
     cx_b.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.git.get_or_insert_default().inline_blame = inline_blame_off_settings;
+                settings.project.git.get_or_insert_default().inline_blame = inline_blame_off_settings;
             });
         });
     });

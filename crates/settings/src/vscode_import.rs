@@ -185,7 +185,6 @@ impl VsCodeSettings {
             editor: self.editor_settings_content(),
             extension: ExtensionSettingsContent::default(),
             file_finder: None,
-            git: self.git_settings_content(),
             git_panel: self.git_panel_settings_content(),
             global_lsp_settings: skip_default(GlobalLspSettingsContent {
                 semantic_token_rules: self.semantic_token_rules(),
@@ -521,6 +520,7 @@ impl VsCodeSettings {
             context_server_timeout: None,
             load_direnv: None,
             git_hosting_providers: None,
+            git: self.git_settings_content(),
             disable_ai: None,
         }
     }

@@ -45,8 +45,8 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
-use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
+use crate::{commit_tooltip::CommitAvatar, issue_linking::IssueLinkingRules};
 
 actions!(
     git,
@@ -85,6 +85,7 @@ pub struct CommitView {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     remote: Option<GitRemote>,
+    issue_linking_rules: IssueLinkingRules,
 }
 
 struct GitBlob {
@@ -257,7 +258,12 @@ impl CommitView {
             multibuffer
         });
 
-        let message = cx.new(|cx| Markdown::new_text(commit.message.clone(), cx));
+        let issue_linking_rules = IssueLinkingRules::for_repository(&repository, cx);
+        let commit_message = commit.message.clone();
+        let message = cx.new({
+            let issue_linking_rules = issue_linking_rules.clone();
+            move |cx| issue_linking_rules.markdown(commit_message.clone(), cx)
+        });
 
         let editor = cx.new(|cx| {
             let editor = SplittableEditor::new(
@@ -475,6 +481,7 @@ impl CommitView {
             project,
             workspace,
             remote,
+            issue_linking_rules,
         }
     }
 
@@ -738,7 +745,13 @@ impl CommitView {
                                         .overflow_y_scroll()
                                         .track_scroll(&self.message_scroll_handle)
                                 })
-                                .child(MarkdownElement::new(self.message.clone(), markdown_style)),
+                                .child(
+                                    MarkdownElement::new(self.message.clone(), markdown_style)
+                                        .on_url_click(|url, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.open_url(&url);
+                                        }),
+                                ),
                         )
                         .vertical_scrollbar_for(&self.message_scroll_handle, window, cx),
                 ),
@@ -1199,7 +1212,11 @@ impl Item for CommitView {
                     editor
                 }
             });
-            let message = cx.new(|cx| Markdown::new_text(self.commit.message.clone(), cx));
+            let commit_message = self.commit.message.clone();
+            let message = cx.new({
+                let issue_linking_rules = self.issue_linking_rules.clone();
+                move |cx| issue_linking_rules.markdown(commit_message.clone(), cx)
+            });
             Self {
                 editor,
                 message,
@@ -1212,6 +1229,7 @@ impl Item for CommitView {
                 project: self.project.clone(),
                 workspace: self.workspace.clone(),
                 remote: self.remote.clone(),
+                issue_linking_rules: self.issue_linking_rules.clone(),
             }
         })))
     }

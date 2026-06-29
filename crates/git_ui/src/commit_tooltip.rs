@@ -1,4 +1,4 @@
-use crate::commit_view::CommitView;
+use crate::{commit_view::CommitView, issue_linking::IssueLinkingRules};
 use editor::hover_markdown_style;
 use futures::Future;
 use git::blame::BlameEntry;
@@ -205,16 +205,13 @@ impl CommitTooltip {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let markdown = cx.new(|cx| {
-            Markdown::new_text(
-                commit
-                    .message
-                    .as_ref()
-                    .map(|message| message.message.clone())
-                    .unwrap_or_default(),
-                cx,
-            )
-        });
+        let issue_linking_rules = IssueLinkingRules::for_repository(&repository, cx);
+        let commit_message = commit
+            .message
+            .as_ref()
+            .map(|message| message.message.clone())
+            .unwrap_or_default();
+        let markdown = cx.new(move |cx| issue_linking_rules.markdown(commit_message.clone(), cx));
         Self {
             commit,
             repository,
@@ -258,6 +255,10 @@ impl Render for CommitTooltip {
             .as_ref()
             .map(|_| {
                 MarkdownElement::new(self.markdown.clone(), markdown_style)
+                    .on_url_click(|url, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    })
                     .scroll_handle(self.scroll_handle.clone())
                     .into_any()
             })

@@ -81,6 +81,9 @@ pub struct ProjectSettingsContent {
     /// The list of custom Git hosting providers.
     pub git_hosting_providers: Option<ExtendingVec<GitHostingProviderConfig>>,
 
+    /// Configuration for Git-related features.
+    pub git: Option<GitSettings>,
+
     /// Whether to disable all AI features in Zed.
     ///
     /// Default: false
@@ -552,6 +555,12 @@ pub struct GitSettings {
     ///
     /// Default: true
     pub show_stage_restore_buttons: Option<bool>,
+    /// Rules for linking issue references in commit messages.
+    ///
+    /// Rules are evaluated in order. The first rule that matches a range wins.
+    ///
+    /// Default: []
+    pub issue_linking: Option<Vec<IssueLinkingRule>>,
     /// Directory where git worktrees are created, relative to the repository
     /// working directory.
     ///
@@ -573,6 +582,23 @@ pub struct GitSettings {
     ///
     /// Default: ../worktrees
     pub worktree_directory: Option<String>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub struct IssueLinkingRule {
+    /// Human-readable name for this issue linking rule.
+    pub name: Option<String>,
+    /// Regex used to find issue references in commit messages.
+    pub issue_regex: Option<String>,
+    /// URL template for matched issue references. Regex captures can be
+    /// referenced with `$1`, `$2`, etc.
+    pub issue_url: Option<String>,
+    /// Whether this rule is enabled.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
 }
 
 #[with_fallible_options]
@@ -870,5 +896,38 @@ mod tests {
             panic!("expected Stdio variant, got {settings:?}");
         };
         assert_eq!(command.args, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn test_git_issue_linking_settings() {
+        let settings: GitSettings = serde_json::from_str(
+            r##"{
+                "issue_linking": [
+                    {
+                        "name": "github",
+                        "issue_regex": "#(\\d+)",
+                        "issue_url": "https://github.com/org/repo/issues/$1"
+                    },
+                    {
+                        "name": "linear",
+                        "issue_regex": "([A-Z]+-\\d+)",
+                        "issue_url": "https://linear.app/company/issue/$1",
+                        "enabled": false
+                    }
+                ]
+            }"##,
+        )
+        .expect("issue linking settings should parse");
+
+        let rules = settings.issue_linking.expect("issue linking rules");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].name.as_deref(), Some("github"));
+        assert_eq!(rules[0].issue_regex.as_deref(), Some("#(\\d+)"));
+        assert_eq!(
+            rules[0].issue_url.as_deref(),
+            Some("https://github.com/org/repo/issues/$1")
+        );
+        assert_eq!(rules[0].enabled, None);
+        assert_eq!(rules[1].enabled, Some(false));
     }
 }

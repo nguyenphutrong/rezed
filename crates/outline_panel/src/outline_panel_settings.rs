@@ -56,6 +56,7 @@ impl Settings for OutlinePanelSettings {
             folder_icons: panel.folder_icons.unwrap(),
             git_status: panel.git_status.unwrap()
                 && content
+                    .project
                     .git
                     .as_ref()
                     .unwrap()
