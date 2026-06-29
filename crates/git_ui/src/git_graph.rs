@@ -5050,6 +5050,15 @@ impl GitGraph {
                         .min_w_0()
                         .gap_1()
                         .items_center()
+                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                            if let Some(graph) = weak.upgrade() {
+                                graph.update(cx, |graph, cx| {
+                                    if !graph.branch_filter_state.branches_loaded {
+                                        graph.load_available_branches(window, cx);
+                                    }
+                                });
+                            }
+                        })
                         .child(Label::new(label).single_line().truncate().flex_1())
                         .child(
                             div()
@@ -5061,19 +5070,6 @@ impl GitGraph {
             Anchor::TopRight,
             cx,
         )
-        .on_open(Rc::new(move |window, cx| {
-            let weak = weak.clone();
-            window.defer(cx, move |window, cx| {
-                let Some(graph) = weak.upgrade() else {
-                    return;
-                };
-                graph.update(cx, |graph, cx| {
-                    if !graph.branch_filter_state.branches_loaded {
-                        graph.load_available_branches(window, cx);
-                    }
-                });
-            });
-        }))
         .with_handle(self.branch_filter_state.handle.clone())
         .render(window, cx)
         .into_any_element()
@@ -11254,7 +11250,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_branch_filter_popover_loads_branches_on_open(cx: &mut TestAppContext) {
+    async fn test_branch_filter_trigger_mouse_down_loads_branches(cx: &mut TestAppContext) {
         init_test(cx);
 
         let (git_graph, window_handle) = setup_git_graph_with_branches(
@@ -11285,14 +11281,17 @@ mod tests {
             assert_eq!(match_count, 0);
         });
 
-        cx.debug_bounds("git-graph-branch-filter-trigger")
+        let trigger_bounds = cx
+            .debug_bounds("git-graph-branch-filter-trigger")
             .expect("branch filter trigger should render");
-        let handle = git_graph.read_with(cx, |graph, _| graph.branch_filter_state.handle.clone());
-        cx.update(|window, cx| handle.show(window, cx));
+        cx.simulate_mouse_down(
+            trigger_bounds.center(),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         cx.run_until_parked();
 
         git_graph.read_with(cx, |graph, cx| {
-            assert!(graph.branch_filter_state.handle.is_deployed());
             assert!(graph.branch_filter_state.branches_loaded);
             assert_eq!(graph.branch_filter_state.available_branches.len(), 3);
             let match_count = graph
@@ -11336,8 +11335,14 @@ mod tests {
             graph.graph_data.add_commits(&[graph_refs_commit]);
         });
 
-        let handle = git_graph.read_with(cx, |graph, _| graph.branch_filter_state.handle.clone());
-        cx.update(|window, cx| handle.show(window, cx));
+        let trigger_bounds = cx
+            .debug_bounds("git-graph-branch-filter-trigger")
+            .expect("branch filter trigger should render");
+        cx.simulate_mouse_down(
+            trigger_bounds.center(),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
         cx.run_until_parked();
 
         git_graph.read_with(cx, |graph, cx| {

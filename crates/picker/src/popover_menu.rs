@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use gpui::{
     Anchor, AnyView, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point,
     Subscription,
@@ -22,7 +20,6 @@ where
     handle: Option<PopoverMenuHandle<Picker<P>>>,
     anchor: Anchor,
     offset: Option<Point<Pixels>>,
-    on_open: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -52,7 +49,6 @@ where
                 x: px(0.0),
                 y: px(-2.0),
             }),
-            on_open: None,
             anchor,
         }
     }
@@ -64,11 +60,6 @@ where
 
     pub fn offset(mut self, offset: Point<Pixels>) -> Self {
         self.offset = Some(offset);
-        self
-    }
-
-    pub fn on_open(mut self, on_open: Rc<dyn Fn(&mut Window, &mut App)>) -> Self {
-        self.on_open = Some(on_open);
         self
     }
 }
@@ -105,7 +96,6 @@ where
             .menu(move |_window, _cx| Some(picker.clone()))
             .trigger_with_tooltip(self.trigger, self.tooltip)
             .anchor(self.anchor)
-            .when_some(self.on_open, |menu, on_open| menu.on_open(on_open))
             .when_some(self.handle, |menu, handle| menu.with_handle(handle))
             .when_some(self.offset, |menu, offset| menu.offset(offset))
     }
