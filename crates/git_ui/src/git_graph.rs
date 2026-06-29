@@ -2339,6 +2339,18 @@ impl GitGraph {
         self.refresh_branch_filter_picker(cx);
     }
 
+    fn sort_available_branches(available_branches: &mut [BranchInfo]) {
+        available_branches.sort_by(|left, right| {
+            right.is_head.cmp(&left.is_head).then_with(|| {
+                left.is_remote.cmp(&right.is_remote).then_with(|| {
+                    Self::branch_display_name(left.ref_name.as_ref())
+                        .as_ref()
+                        .cmp(Self::branch_display_name(right.ref_name.as_ref()).as_ref())
+                })
+            })
+        });
+    }
+
     fn build_available_branches(branches: Vec<Branch>) -> Vec<BranchInfo> {
         let mut available_branches = branches
             .into_iter()
@@ -2349,15 +2361,63 @@ impl GitGraph {
                 is_selected: false,
             })
             .collect::<Vec<_>>();
-        available_branches.sort_by(|left, right| {
-            right.is_head.cmp(&left.is_head).then_with(|| {
-                left.is_remote.cmp(&right.is_remote).then_with(|| {
-                    Self::branch_display_name(left.ref_name.as_ref())
-                        .as_ref()
-                        .cmp(Self::branch_display_name(right.ref_name.as_ref()).as_ref())
-                })
-            })
-        });
+        Self::sort_available_branches(&mut available_branches);
+        available_branches
+    }
+
+    fn branch_info_from_graph_ref(ref_name: &str) -> Option<BranchInfo> {
+        let (ref_name, is_head) = ref_name
+            .strip_prefix("HEAD -> ")
+            .map_or((ref_name, false), |ref_name| (ref_name, true));
+
+        if ref_name.is_empty()
+            || ref_name == "HEAD"
+            || ref_name.starts_with("tag: ")
+            || ref_name.starts_with("refs/tags/")
+            || Self::is_stash_ref_name(ref_name)
+        {
+            return None;
+        }
+
+        let (ref_name, is_remote) = if ref_name.starts_with("refs/heads/") {
+            (ref_name.to_string(), false)
+        } else if ref_name.starts_with("refs/remotes/") {
+            (ref_name.to_string(), true)
+        } else if ref_name
+            .split_once('/')
+            .is_some_and(|(remote_name, _)| remote_name == "origin" || remote_name == "upstream")
+        {
+            (format!("refs/remotes/{ref_name}"), true)
+        } else {
+            (format!("refs/heads/{ref_name}"), false)
+        };
+
+        Some(BranchInfo {
+            ref_name: ref_name.into(),
+            is_head,
+            is_remote,
+            is_selected: false,
+        })
+    }
+
+    fn build_available_branches_from_graph_refs(&self) -> Vec<BranchInfo> {
+        let mut branches_by_ref_name = HashMap::default();
+        for commit in &self.graph_data.commits {
+            for ref_name in &commit.data.ref_names {
+                let Some(branch) = Self::branch_info_from_graph_ref(ref_name.as_ref()) else {
+                    continue;
+                };
+                branches_by_ref_name
+                    .entry(branch.ref_name.clone())
+                    .and_modify(|existing_branch: &mut BranchInfo| {
+                        existing_branch.is_head |= branch.is_head;
+                    })
+                    .or_insert(branch);
+            }
+        }
+
+        let mut available_branches = branches_by_ref_name.into_values().collect::<Vec<_>>();
+        Self::sort_available_branches(&mut available_branches);
         available_branches
     }
 
@@ -2499,8 +2559,20 @@ impl GitGraph {
                 .map_err(|_| anyhow::anyhow!("Operation was canceled"))??;
 
             this.update_in(cx, |this, _window, cx| {
-                this.branch_filter_state.available_branches =
-                    Self::build_available_branches(branches.branches);
+                let use_graph_refs = branches.error.is_some() || branches.branches.is_empty();
+                let mut available_branches = Self::build_available_branches(branches.branches);
+                if use_graph_refs {
+                    for branch in this.build_available_branches_from_graph_refs() {
+                        if !available_branches
+                            .iter()
+                            .any(|available_branch| available_branch.ref_name == branch.ref_name)
+                        {
+                            available_branches.push(branch);
+                        }
+                    }
+                    Self::sort_available_branches(&mut available_branches);
+                }
+                this.branch_filter_state.available_branches = available_branches;
                 this.branch_filter_state.branches_loaded = true;
                 this.branch_filter_state.is_loading = false;
                 this.reconcile_available_branch_selection(
@@ -11231,6 +11303,70 @@ mod tests {
                 .delegate
                 .match_count();
             assert_eq!(match_count, 3);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_branch_filter_falls_back_to_graph_refs_when_branch_scan_is_empty(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (git_graph, window_handle) = setup_git_graph_with_branches(&[], cx).await;
+        let graph_refs_commit = Arc::new(InitialGraphCommitData {
+            sha: Oid::from_bytes(&[1; 20]).unwrap(),
+            parents: SmallVec::new(),
+            ref_names: vec![
+                "HEAD -> staging".into(),
+                "release/2026-06-30".into(),
+                "origin/feat/ADMIN-733_tingee".into(),
+                "tag: v1.0.0".into(),
+                "HEAD".into(),
+            ],
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window_handle, cx);
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        git_graph.update(cx, |graph, _| {
+            graph.graph_data.clear();
+            graph.graph_data.add_commits(&[graph_refs_commit]);
+        });
+
+        let handle = git_graph.read_with(cx, |graph, _| graph.branch_filter_state.handle.clone());
+        cx.update(|window, cx| handle.show(window, cx));
+        cx.run_until_parked();
+
+        git_graph.read_with(cx, |graph, cx| {
+            let available_branches = graph
+                .branch_filter_state
+                .available_branches
+                .iter()
+                .map(|branch| (branch.ref_name.as_ref(), branch.is_head, branch.is_remote))
+                .collect::<Vec<_>>();
+            assert!(available_branches.contains(&("refs/heads/staging", true, false)));
+            assert!(available_branches.contains(&("refs/heads/release/2026-06-30", false, false)));
+            assert!(available_branches.contains(&(
+                "refs/remotes/origin/feat/ADMIN-733_tingee",
+                false,
+                true
+            )));
+            assert!(
+                !available_branches
+                    .iter()
+                    .any(|(ref_name, _, _)| *ref_name == "HEAD" || ref_name.starts_with("tag: "))
+            );
+            let match_count = graph
+                .branch_filter_picker
+                .as_ref()
+                .expect("branch filter picker should be created")
+                .read(cx)
+                .delegate
+                .match_count();
+            assert!(match_count >= 3);
         });
     }
 
