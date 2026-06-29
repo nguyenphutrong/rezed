@@ -172,7 +172,7 @@ impl IssueLinkingRules {
             .collect()
     }
 
-    fn linked_markdown_source(&self, text: &str) -> Option<String> {
+    pub(crate) fn linked_markdown_source(&self, text: &str) -> Option<String> {
         let links = self.links_for_text(text);
         if !links.iter().any(|link| link.kind == IssueLinkKind::Issue) {
             return None;

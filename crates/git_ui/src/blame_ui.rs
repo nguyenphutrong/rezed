@@ -1,6 +1,7 @@
 use crate::{
     commit_tooltip::{CommitAvatar, CommitTooltip},
     commit_view::CommitView,
+    issue_linking::IssueLinkingRules,
 };
 use editor::{BlameRenderer, Editor, hover_markdown_style};
 use git::{blame::BlameEntry, commit::ParsedCommitMessage, repository::CommitSummary};
@@ -236,10 +237,24 @@ impl BlameRenderer for GitBlameRenderer {
             style
         };
 
+        let markdown = details
+            .as_ref()
+            .and_then(|details| {
+                let issue_linking_rules = IssueLinkingRules::for_repository(&repository, cx);
+                let markdown_source =
+                    issue_linking_rules.linked_markdown_source(details.message.as_ref())?;
+                Some(cx.new(|cx| Markdown::new(markdown_source.into(), None, None, cx)))
+            })
+            .unwrap_or(markdown);
+
         let message = details
             .as_ref()
             .map(|_| {
                 MarkdownElement::new(markdown.clone(), markdown_style)
+                    .on_url_click(|url, _, cx| {
+                        cx.stop_propagation();
+                        cx.open_url(&url);
+                    })
                     .scroll_handle(scroll_handle.clone())
                     .into_any()
             })
