@@ -4984,20 +4984,24 @@ impl GitGraph {
                                 .flex_none()
                                 .child(Icon::new(IconName::ChevronDown).size(IconSize::Small)),
                         ),
-                )
-                .on_click(move |_, window, cx| {
-                    if let Some(graph) = weak.upgrade() {
-                        graph.update(cx, |graph, cx| {
-                            if !graph.branch_filter_state.branches_loaded {
-                                graph.load_available_branches(window, cx);
-                            }
-                        });
-                    }
-                }),
+                ),
             Tooltip::text("Filter branches"),
             Anchor::TopRight,
             cx,
         )
+        .on_open(Rc::new(move |window, cx| {
+            let weak = weak.clone();
+            window.defer(cx, move |window, cx| {
+                let Some(graph) = weak.upgrade() else {
+                    return;
+                };
+                graph.update(cx, |graph, cx| {
+                    if !graph.branch_filter_state.branches_loaded {
+                        graph.load_available_branches(window, cx);
+                    }
+                });
+            });
+        }))
         .with_handle(self.branch_filter_state.handle.clone())
         .render(window, cx)
         .into_any_element()
@@ -11174,6 +11178,59 @@ mod tests {
                 .delegate
                 .match_count();
             assert_eq!(match_count, 2);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_branch_filter_popover_loads_branches_on_open(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (git_graph, window_handle) = setup_git_graph_with_branches(
+            &[
+                "main",
+                "refs/heads/feature-load-me",
+                "refs/heads/bugfix-no-empty-menu",
+            ],
+            cx,
+        )
+        .await;
+        let cx = &mut gpui::VisualTestContext::from_window(window_handle, cx);
+
+        cx.draw(
+            point(px(0.), px(0.)),
+            gpui::size(px(1200.), px(800.)),
+            |_, _| git_graph.clone().into_any_element(),
+        );
+        git_graph.read_with(cx, |graph, cx| {
+            assert!(!graph.branch_filter_state.branches_loaded);
+            let match_count = graph
+                .branch_filter_picker
+                .as_ref()
+                .expect("branch filter picker should be created during render")
+                .read(cx)
+                .delegate
+                .match_count();
+            assert_eq!(match_count, 0);
+        });
+
+        cx.debug_bounds("git-graph-branch-filter-trigger")
+            .expect("branch filter trigger should render");
+        let handle = git_graph.read_with(cx, |graph, _| graph.branch_filter_state.handle.clone());
+        cx.update(|window, cx| handle.show(window, cx));
+        cx.run_until_parked();
+
+        git_graph.read_with(cx, |graph, cx| {
+            assert!(graph.branch_filter_state.handle.is_deployed());
+            assert!(graph.branch_filter_state.branches_loaded);
+            assert_eq!(graph.branch_filter_state.available_branches.len(), 3);
+            let match_count = graph
+                .branch_filter_picker
+                .as_ref()
+                .expect("branch filter picker should remain created")
+                .read(cx)
+                .delegate
+                .match_count();
+            assert_eq!(match_count, 3);
         });
     }
 
