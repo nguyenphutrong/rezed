@@ -614,6 +614,13 @@ impl SplittableEditor {
 
         let render_diff_hunk_controls = self.rhs_editor.read(cx).render_diff_hunk_controls.clone();
         let render_diff_hunks_as_unstaged = self.rhs_editor.read(cx).render_diff_hunks_as_unstaged;
+        let addons_for_split = self
+            .rhs_editor
+            .read(cx)
+            .addons
+            .values()
+            .filter_map(|addon| addon.clone_for_split())
+            .collect::<Vec<_>>();
         let lhs_editor = cx.new(|cx| {
             let mut editor =
                 Editor::for_multibuffer(lhs_multibuffer.clone(), Some(project.clone()), window, cx);
@@ -633,6 +640,10 @@ impl SplittableEditor {
 
         lhs_editor.update(cx, |editor, cx| {
             editor.set_render_diff_hunk_controls(render_diff_hunk_controls, cx);
+            for addon in addons_for_split {
+                editor.register_boxed_addon(addon);
+            }
+            editor.refresh_git_blame_overrides(cx);
         });
 
         let mut subscriptions = vec![cx.subscribe_in(
@@ -2247,8 +2258,21 @@ mod tests {
     };
     use crate::inlays::Inlay;
     use crate::test::{editor_content_with_blocks_and_width, set_block_content_for_tests};
-    use crate::{Editor, SplittableEditor};
+    use crate::{Addon, Editor, SplittableEditor};
     use multi_buffer::MultiBufferOffset;
+
+    #[derive(Clone)]
+    struct SplitAddonForTest;
+
+    impl Addon for SplitAddonForTest {
+        fn clone_for_split(&self) -> Option<Box<dyn Addon>> {
+            Some(Box::new(self.clone()))
+        }
+
+        fn to_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
 
     async fn init_test(
         cx: &mut gpui::TestAppContext,
@@ -2303,6 +2327,28 @@ mod tests {
             BufferDiff::new_with_base_text(base_text, &buffer.read(cx).text_snapshot(), cx)
         });
         (buffer, diff)
+    }
+
+    #[gpui::test]
+    async fn test_split_clones_opt_in_addons(cx: &mut gpui::TestAppContext) {
+        let (editor, cx) = init_test(cx, SoftWrap::None, DiffViewStyle::Unified).await;
+
+        editor.update(cx, |editor, cx| {
+            editor
+                .rhs_editor()
+                .update(cx, |editor, _cx| editor.register_addon(SplitAddonForTest));
+        });
+        editor.update_in(cx, |editor, window, cx| editor.split(window, cx));
+
+        let lhs_has_addon = editor.read_with(cx, |editor, cx| {
+            editor
+                .lhs_editor()
+                .unwrap()
+                .read(cx)
+                .addon::<SplitAddonForTest>()
+                .is_some()
+        });
+        assert!(lhs_has_addon);
     }
 
     #[track_caller]

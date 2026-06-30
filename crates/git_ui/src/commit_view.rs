@@ -1,16 +1,16 @@
 use anyhow::{Context as _, Result};
-use buffer_diff::BufferDiff;
+use buffer_diff::{BufferDiff, BufferDiffSnapshot};
 use collections::HashMap;
 use editor::{
-    Addon, Editor, EditorEvent, EditorSettings, MultiBuffer, SplittableEditor,
+    Addon, Editor, EditorEvent, EditorSettings, GitBlameOverride, MultiBuffer, SplittableEditor,
     hover_markdown_style, multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, CommitDiff, RepoPath, is_binary_content};
 use git::status::{FileStatus, StatusCode, TrackedStatus};
 use git::{
-    BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, ParsedGitRemote,
-    parse_git_remote_url,
+    BuildCommitPermalinkParams, GitHostingProviderRegistry, GitRemote, Oid, ParsedGitRemote,
+    blame::BlameEntry, commit::ParsedCommitMessage, parse_git_remote_url,
 };
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
@@ -29,6 +29,7 @@ use settings::{DiffViewStyle, Settings};
 use std::{
     any::{Any, TypeId},
     collections::HashSet,
+    ops::Range,
     path::PathBuf,
     sync::Arc,
 };
@@ -96,8 +97,10 @@ struct GitBlob {
     display_name: String,
 }
 
+#[derive(Clone)]
 struct CommitDiffAddon {
     file_statuses: HashMap<language::BufferId, FileStatus>,
+    git_blame_override: GitBlameOverride,
     commit_view: WeakEntity<CommitView>,
 }
 
@@ -112,6 +115,14 @@ impl Addon for CommitDiffAddon {
         _cx: &App,
     ) -> Option<FileStatus> {
         self.file_statuses.get(&buffer_id).copied()
+    }
+
+    fn git_blame_override(&self, _cx: &App) -> GitBlameOverride {
+        self.git_blame_override.clone()
+    }
+
+    fn clone_for_split(&self) -> Option<Box<dyn Addon>> {
+        Some(Box::new(self.clone()))
     }
 
     fn extend_buffer_header_context_menu(
@@ -155,6 +166,68 @@ impl Addon for CommitDiffAddon {
 }
 
 const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
+
+fn row_range_for_point_range(mut range: Range<language::Point>) -> Option<Range<u32>> {
+    if range.end.column > 0 {
+        range.end.row += 1;
+        range.end.column = 0;
+    }
+    (range.start.row < range.end.row).then_some(range.start.row..range.end.row)
+}
+
+fn synthetic_blame_entries_for_commit_diff(
+    buffer_id: language::BufferId,
+    buffer_snapshot: &language::BufferSnapshot,
+    base_text_buffer_snapshot: &language::BufferSnapshot,
+    diff_snapshot: &BufferDiffSnapshot,
+    commit_oid: Oid,
+    commit_author: &str,
+    commit_author_mail: &str,
+    commit_time: i64,
+    commit_summary: Option<&str>,
+) -> HashMap<language::BufferId, Vec<BlameEntry>> {
+    let filename = buffer_snapshot
+        .file()
+        .map(|file| file.path().display(PathStyle::local()).to_string())
+        .unwrap_or_default();
+    let base_buffer_id = base_text_buffer_snapshot.remote_id();
+    let blame_entry_for_range = |range: Range<u32>| BlameEntry {
+        sha: commit_oid,
+        original_line_number: range.start + 1,
+        range,
+        author: Some(commit_author.to_string()),
+        author_mail: Some(commit_author_mail.to_string()),
+        author_time: Some(commit_time),
+        author_tz: None,
+        committer_name: Some(commit_author.to_string()),
+        committer_email: Some(commit_author_mail.to_string()),
+        committer_time: Some(commit_time),
+        committer_tz: None,
+        summary: commit_summary.map(str::to_string),
+        previous: None,
+        filename: filename.clone(),
+    };
+    let mut entries_by_buffer = HashMap::<language::BufferId, Vec<BlameEntry>>::default();
+    diff_snapshot.hunks(buffer_snapshot).for_each(|hunk| {
+        if let Some(range) = row_range_for_point_range(hunk.buffer_range.to_point(buffer_snapshot)) {
+            entries_by_buffer
+                .entry(buffer_id)
+                .or_default()
+                .push(blame_entry_for_range(range));
+        }
+
+        let base_range =
+            base_text_buffer_snapshot.offset_to_point(hunk.diff_base_byte_range.start)
+                ..base_text_buffer_snapshot.offset_to_point(hunk.diff_base_byte_range.end);
+        if let Some(range) = row_range_for_point_range(base_range) {
+            entries_by_buffer
+                .entry(base_buffer_id)
+                .or_default()
+                .push(blame_entry_for_range(range));
+        }
+    });
+    entries_by_buffer
+}
 
 impl CommitView {
     pub fn open(
@@ -292,11 +365,39 @@ impl CommitView {
             .next()
             .map(|worktree| worktree.read(cx).id());
 
+        let snapshot = repository.read(cx).snapshot();
+        let remote_url = snapshot
+            .remote_upstream_url
+            .as_ref()
+            .or(snapshot.remote_origin_url.as_ref())
+            .cloned();
+        let provider_registry = GitHostingProviderRegistry::default_global(cx);
+        let commit_oid = commit.sha.parse::<Oid>().ok();
+        let parsed_commit_message = commit_oid.map(|oid| {
+            (
+                oid,
+                ParsedCommitMessage::parse(
+                    commit.sha.to_string(),
+                    commit.message.to_string(),
+                    remote_url.as_deref(),
+                    Some(provider_registry.clone()),
+                ),
+            )
+        });
+        let commit_author = commit.author_name.to_string();
+        let commit_author_mail = format!("<{}>", commit.author_email);
+        let commit_time = commit.commit_timestamp;
+        let commit_summary = commit.message.lines().next().map(str::to_string);
+
         let repository_clone = repository.clone();
 
         cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
+            let mut git_blame_override = GitBlameOverride::default();
+            if let Some((oid, message)) = parsed_commit_message.clone() {
+                git_blame_override.messages_by_oid.insert(oid, message);
+            }
 
             for file in commit_diff.files {
                 let is_created = file.old_text.is_none();
@@ -380,6 +481,35 @@ impl CommitView {
                     build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
                 };
 
+                if let Some(commit_oid) = commit_oid {
+                    let synthetic_blame_entries_by_buffer = cx.update(|_, cx| {
+                        let snapshot = buffer.read(cx).snapshot();
+                        let base_text_buffer = buffer_diff.read(cx).base_text_buffer().clone();
+                        let base_text_snapshot = base_text_buffer.read(cx).snapshot();
+                        let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
+                        synthetic_blame_entries_for_commit_diff(
+                            buffer_id,
+                            &snapshot,
+                            &base_text_snapshot,
+                            &diff_snapshot,
+                            commit_oid,
+                            &commit_author,
+                            &commit_author_mail,
+                            commit_time,
+                            commit_summary.as_deref(),
+                        )
+                    })?;
+                    for (buffer_id, synthetic_blame_entries) in synthetic_blame_entries_by_buffer {
+                        if !synthetic_blame_entries.is_empty() {
+                            git_blame_override
+                                .entries_by_buffer
+                                .entry(buffer_id)
+                                .or_default()
+                                .extend(synthetic_blame_entries);
+                        }
+                    }
+                }
+
                 let (excerpt_ranges, path) = cx.update(|_, cx| {
                     let snapshot = buffer.read(cx).snapshot();
                     let path = PathKey::with_sort_prefix(
@@ -433,13 +563,22 @@ impl CommitView {
 
             this.update(cx, |this, cx| {
                 let commit_view = cx.weak_entity();
+                let commit_diff_addon = CommitDiffAddon {
+                    file_statuses,
+                    git_blame_override,
+                    commit_view,
+                };
                 this.editor.update(cx, |editor, cx| {
-                    editor.rhs_editor().update(cx, |editor, _cx| {
-                        editor.register_addon(CommitDiffAddon {
-                            file_statuses,
-                            commit_view,
-                        });
+                    editor.rhs_editor().update(cx, |editor, cx| {
+                        editor.register_addon(commit_diff_addon.clone());
+                        editor.refresh_git_blame_overrides(cx);
                     });
+                    if let Some(lhs_editor) = editor.lhs_editor() {
+                        lhs_editor.update(cx, |editor, cx| {
+                            editor.register_addon(commit_diff_addon.clone());
+                            editor.refresh_git_blame_overrides(cx);
+                        });
+                    }
                 });
                 if !binary_buffer_ids.is_empty() {
                     this.editor.update(cx, |editor, cx| {
@@ -454,13 +593,7 @@ impl CommitView {
         })
         .detach();
 
-        let snapshot = repository.read(cx).snapshot();
-        let remote_url = snapshot
-            .remote_upstream_url
-            .as_ref()
-            .or(snapshot.remote_origin_url.as_ref());
-
-        let remote = remote_url.and_then(|url| {
+        let remote = remote_url.as_deref().and_then(|url| {
             let provider_registry = GitHostingProviderRegistry::default_global(cx);
             parse_git_remote_url(provider_registry, url).map(|(host, parsed)| GitRemote {
                 host,
@@ -1008,9 +1141,26 @@ async fn build_buffer_diff(
 
     let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
     let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
+    let base_text = old_text
+        .as_ref()
+        .map(|old_text| old_text.as_str())
+        .unwrap_or_default();
+    let base_text = Rope::from(base_text);
+    let base_text_buffer = cx.new(|cx| {
+        let text_buffer = TextBuffer::new_normalized(
+            ReplicaId::LOCAL,
+            cx.entity_id().as_non_zero_u64().into(),
+            buffer.text.line_ending(),
+            base_text,
+        );
+        let mut buffer = Buffer::build(text_buffer, buffer.file().cloned(), Capability::ReadOnly);
+        buffer.set_language_registry(language_registry.clone());
+        buffer.set_language_async(language.clone(), cx);
+        buffer
+    });
 
     let diff =
-        cx.new(|cx| BufferDiff::new(&buffer.text, language, Some(language_registry.clone()), cx));
+        cx.new(|cx| BufferDiff::new_with_base_text_buffer(&buffer.text, base_text_buffer, cx));
 
     diff.update(cx, |diff, cx| {
         diff.set_base_text(
@@ -1022,6 +1172,73 @@ async fn build_buffer_diff(
     .await;
 
     Ok(diff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic_blame_row_ranges(
+        base_text: &str,
+        current_text: &str,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Vec<Range<u32>>, Vec<Range<u32>>) {
+        cx.update(|cx| {
+            let buffer = cx.new(|cx| Buffer::local(current_text.to_string(), cx));
+            let diff = cx.new(|cx| {
+                BufferDiff::new_with_base_text(base_text, &buffer.read(cx).text_snapshot(), cx)
+            });
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let base_text_buffer = diff.read(cx).base_text_buffer().clone();
+            let base_text_buffer_snapshot = base_text_buffer.read(cx).snapshot();
+            let diff_snapshot = diff.read(cx).snapshot(cx);
+            let entries_by_buffer = synthetic_blame_entries_for_commit_diff(
+                buffer_snapshot.remote_id(),
+                &buffer_snapshot,
+                &base_text_buffer_snapshot,
+                &diff_snapshot,
+                "9999999999999999999999999999999999999999"
+                    .parse()
+                    .unwrap(),
+                "Author",
+                "<author@example.com>",
+                1,
+                Some("Commit summary"),
+            );
+
+            let row_ranges_for_buffer = |buffer_id| {
+                entries_by_buffer
+                    .get(&buffer_id)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| entry.range.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+
+            (
+                row_ranges_for_buffer(buffer_snapshot.remote_id()),
+                row_ranges_for_buffer(base_text_buffer_snapshot.remote_id()),
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn test_synthetic_blame_entries_for_commit_diff_hunks(cx: &mut gpui::TestAppContext) {
+        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nc\n", "a\nb\nc\n", cx);
+        assert_eq!(rhs_ranges, vec![1..2]);
+        assert!(lhs_ranges.is_empty());
+
+        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nb\nc\n", "a\nB\nc\n", cx);
+        assert_eq!(rhs_ranges, vec![1..2]);
+        assert_eq!(lhs_ranges, vec![1..2]);
+
+        let (rhs_ranges, lhs_ranges) = synthetic_blame_row_ranges("a\nb\nc\n", "a\nc\n", cx);
+        assert!(rhs_ranges.is_empty());
+        assert_eq!(lhs_ranges, vec![1..2]);
+    }
 }
 
 impl EventEmitter<EditorEvent> for CommitView {}
@@ -1169,14 +1386,13 @@ impl Item for CommitView {
     where
         Self: Sized,
     {
-        let file_statuses = self
+        let commit_diff_addon = self
             .editor
             .read(cx)
             .rhs_editor()
             .read(cx)
             .addon::<CommitDiffAddon>()
-            .map(|addon| addon.file_statuses.clone())
-            .unwrap_or_default();
+            .cloned();
         let Some(workspace_entity) = self.workspace.upgrade() else {
             return Task::ready(None);
         };
@@ -1186,7 +1402,7 @@ impl Item for CommitView {
         Task::ready(Some(cx.new(|cx| {
             let commit_view = cx.weak_entity();
             let editor = cx.new({
-                let file_statuses = file_statuses.clone();
+                let commit_diff_addon = commit_diff_addon.clone();
                 let project = project.clone();
                 let workspace_entity = workspace_entity.clone();
                 let multibuffer = multibuffer.clone();
@@ -1204,10 +1420,18 @@ impl Item for CommitView {
                         editor.set_show_bookmarks(false, cx);
                         editor.set_show_breakpoints(false, cx);
                         editor.set_show_diff_review_button(true, cx);
+                        let (file_statuses, git_blame_override) = commit_diff_addon
+                            .as_ref()
+                            .map(|addon| {
+                                (addon.file_statuses.clone(), addon.git_blame_override.clone())
+                            })
+                            .unwrap_or_default();
                         editor.register_addon(CommitDiffAddon {
                             file_statuses,
+                            git_blame_override,
                             commit_view,
                         });
+                        editor.refresh_git_blame_overrides(cx);
                     });
                     editor
                 }

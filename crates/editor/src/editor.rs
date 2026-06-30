@@ -128,7 +128,7 @@ pub use split::{SplittableEditor, ToggleSplitDiff};
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
 
-use ::git::{Blame, status::FileStatus};
+use ::git::{Blame, Oid, blame::BlameEntry, commit::ParsedCommitMessage, status::FileStatus};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, BuildError};
 use anyhow::{Context as _, Result, anyhow, bail};
 use blink_manager::BlinkManager;
@@ -757,6 +757,24 @@ impl BufferSerialization {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct GitBlameOverride {
+    pub entries_by_buffer: HashMap<BufferId, Vec<BlameEntry>>,
+    pub messages_by_oid: HashMap<Oid, ParsedCommitMessage>,
+}
+
+impl GitBlameOverride {
+    pub fn extend(&mut self, other: Self) {
+        for (buffer_id, entries) in other.entries_by_buffer {
+            self.entries_by_buffer
+                .entry(buffer_id)
+                .or_default()
+                .extend(entries);
+        }
+        self.messages_by_oid.extend(other.messages_by_oid);
+    }
+}
+
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
@@ -782,6 +800,14 @@ pub trait Addon: 'static {
     }
 
     fn override_status_for_buffer_id(&self, _: BufferId, _: &App) -> Option<FileStatus> {
+        None
+    }
+
+    fn git_blame_override(&self, _: &App) -> GitBlameOverride {
+        GitBlameOverride::default()
+    }
+
+    fn clone_for_split(&self) -> Option<Box<dyn Addon>> {
         None
     }
 
@@ -10480,8 +10506,31 @@ impl Editor {
             .insert(std::any::TypeId::of::<T>(), Box::new(instance));
     }
 
+    pub(crate) fn register_boxed_addon(&mut self, instance: Box<dyn Addon>) {
+        if self.mode.is_minimap() {
+            return;
+        }
+        let type_id = instance.to_any().type_id();
+        self.addons.insert(type_id, instance);
+    }
+
     pub fn unregister_addon<T: Addon>(&mut self) {
         self.addons.remove(&std::any::TypeId::of::<T>());
+    }
+
+    pub(crate) fn git_blame_override(&self, cx: &App) -> GitBlameOverride {
+        let mut blame_override = GitBlameOverride::default();
+        for addon in self.addons.values() {
+            blame_override.extend(addon.git_blame_override(cx));
+        }
+        blame_override
+    }
+
+    pub fn refresh_git_blame_overrides(&mut self, cx: &mut Context<Self>) {
+        let blame_override = self.git_blame_override(cx);
+        if let Some(blame) = self.blame.clone() {
+            blame.update(cx, |blame, cx| blame.set_overrides(blame_override, cx));
+        }
     }
 
     pub fn addon<T: Addon>(&self) -> Option<&T> {

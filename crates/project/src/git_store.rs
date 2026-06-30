@@ -1498,9 +1498,9 @@ impl GitStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<Blame>>> {
         let buffer = buffer.read(cx);
-        let Some((repo, repo_path)) =
-            self.repository_and_path_for_buffer_id(buffer.remote_id(), cx)
-        else {
+        let buffer_id = buffer.remote_id();
+        let can_blame_remote_buffer = self.buffer_store.read(cx).get(buffer_id).is_some();
+        let Some((repo, repo_path)) = self.repository_and_path_for_buffer(buffer, cx) else {
             return Task::ready(Err(anyhow!("failed to find a git repository for buffer")));
         };
         let content = match &version {
@@ -1509,7 +1509,6 @@ impl GitStore {
         };
         let line_ending = buffer.line_ending();
         let version = version.unwrap_or(buffer.version());
-        let buffer_id = buffer.remote_id();
 
         let repo = repo.downgrade();
         cx.spawn(async move |_, cx| {
@@ -1524,6 +1523,9 @@ impl GitStore {
                     .with_context(|| format!("Failed to blame {:?}", repo_path.as_ref()))
                     .map(Some),
                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                    if !can_blame_remote_buffer {
+                        return Ok(None);
+                    }
                     let response = client
                         .request(proto::BlameBuffer {
                             project_id: project_id.to_proto(),
@@ -2195,6 +2197,25 @@ impl GitStore {
     ) -> Option<(Entity<Repository>, RepoPath)> {
         let buffer = self.buffer_store.read(cx).get(buffer_id)?;
         let project_path = buffer.read(cx).project_path(cx)?;
+        self.repository_and_path_for_project_path(&project_path, cx)
+    }
+
+    pub fn repository_and_path_for_buffer(
+        &self,
+        buffer: &Buffer,
+        cx: &App,
+    ) -> Option<(Entity<Repository>, RepoPath)> {
+        if let Some(repository_and_path) =
+            self.repository_and_path_for_buffer_id(buffer.remote_id(), cx)
+        {
+            return Some(repository_and_path);
+        }
+
+        let file = buffer.file()?;
+        let project_path = ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: file.path().clone(),
+        };
         self.repository_and_path_for_project_path(&project_path, cx)
     }
 

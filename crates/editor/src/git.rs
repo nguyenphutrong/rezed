@@ -1779,10 +1779,19 @@ impl Editor {
             }
 
             let focused = self.focus_handle(cx).contains_focused(window, cx);
+            let blame_overrides = self.git_blame_override(cx);
 
             let project = project.clone();
-            let blame = cx
-                .new(|cx| GitBlame::new(self.buffer.clone(), project, user_triggered, focused, cx));
+            let blame = cx.new(|cx| {
+                GitBlame::new_with_overrides(
+                    self.buffer.clone(),
+                    project,
+                    blame_overrides,
+                    user_triggered,
+                    focused,
+                    cx,
+                )
+            });
             self.blame_subscription =
                 Some(cx.observe_in(&blame, window, |_, _, _, cx| cx.notify()));
             self.blame = Some(blame);
