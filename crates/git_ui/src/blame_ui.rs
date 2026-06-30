@@ -237,18 +237,29 @@ impl BlameRenderer for GitBlameRenderer {
             style
         };
 
-        let markdown = details
+        let message_source = blame_popover_message_source(details.as_ref(), &blame);
+        let details_message = details
             .as_ref()
-            .and_then(|details| {
+            .map(|details| details.message.as_ref())
+            .filter(|message| !message.trim().is_empty());
+        let markdown = match message_source {
+            Some(message_source) => {
                 let issue_linking_rules = IssueLinkingRules::for_repository(&repository, cx);
-                let markdown_source =
-                    issue_linking_rules.linked_markdown_source(details.message.as_ref())?;
-                Some(cx.new(|cx| Markdown::new(markdown_source.into(), None, None, cx)))
-            })
-            .unwrap_or(markdown);
+                if let Some(markdown_source) =
+                    issue_linking_rules.linked_markdown_source(message_source)
+                {
+                    cx.new(|cx| Markdown::new(markdown_source.into(), None, None, cx))
+                } else if details_message == Some(message_source) {
+                    markdown
+                } else {
+                    let message_source = message_source.to_string();
+                    cx.new(|cx| Markdown::new_text(message_source.into(), cx))
+                }
+            }
+            None => markdown,
+        };
 
-        let message = details
-            .as_ref()
+        let message = message_source
             .map(|_| {
                 MarkdownElement::new(markdown.clone(), markdown_style)
                     .on_url_click(|url, _, cx| {
@@ -410,6 +421,21 @@ impl BlameRenderer for GitBlameRenderer {
     }
 }
 
+fn blame_popover_message_source<'a>(
+    details: Option<&'a ParsedCommitMessage>,
+    blame: &'a BlameEntry,
+) -> Option<&'a str> {
+    details
+        .map(|details| details.message.as_ref())
+        .filter(|message| !message.trim().is_empty())
+        .or_else(|| {
+            blame
+                .summary
+                .as_deref()
+                .filter(|summary| !summary.trim().is_empty())
+        })
+}
+
 fn deploy_blame_entry_context_menu(
     blame_entry: &BlameEntry,
     details: Option<&ParsedCommitMessage>,
@@ -454,5 +480,87 @@ fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {
             )
         }
         Err(_) => "Error parsing date".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use project::project_settings::IssueLinkingRule;
+
+    use super::*;
+
+    fn blame_entry(summary: Option<&str>) -> BlameEntry {
+        BlameEntry {
+            sha: "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b"
+                .parse()
+                .unwrap(),
+            range: 0..1,
+            original_line_number: 0,
+            author: None,
+            author_mail: None,
+            author_time: None,
+            author_tz: None,
+            committer_name: None,
+            committer_email: None,
+            committer_time: None,
+            committer_tz: None,
+            summary: summary.map(str::to_string),
+            previous: None,
+            filename: String::new(),
+        }
+    }
+
+    fn parsed_message(message: &str) -> ParsedCommitMessage {
+        ParsedCommitMessage::parse(
+            "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b".to_string(),
+            message.to_string(),
+            None,
+            None,
+        )
+    }
+
+    fn rule(name: &str, issue_regex: &str, issue_url: &str) -> IssueLinkingRule {
+        IssueLinkingRule {
+            name: Some(name.to_string()),
+            issue_regex: issue_regex.to_string(),
+            issue_url: issue_url.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn test_blame_popover_message_source_falls_back_to_summary() {
+        let blame = blame_entry(Some("Summary message"));
+        let details = parsed_message("Full message");
+        assert_eq!(
+            blame_popover_message_source(Some(&details), &blame),
+            Some("Full message")
+        );
+
+        let empty_details = parsed_message("");
+        assert_eq!(
+            blame_popover_message_source(Some(&empty_details), &blame),
+            Some("Summary message")
+        );
+
+        let blame_without_summary = blame_entry(None);
+        assert_eq!(
+            blame_popover_message_source(Some(&empty_details), &blame_without_summary),
+            None
+        );
+    }
+
+    #[test]
+    fn test_blame_popover_fallback_source_can_be_issue_linked() {
+        let blame = blame_entry(Some("Fix ABC-123"));
+        let empty_details = parsed_message("");
+        let source = blame_popover_message_source(Some(&empty_details), &blame).unwrap();
+        let rules =
+            IssueLinkingRules::new(&[rule("linear", r"(ABC-\d+)", "https://linear.test/issue/$1")]);
+
+        assert_eq!(
+            rules.linked_markdown_source(source),
+            Some("Fix [ABC\\-123](<https://linear.test/issue/ABC-123>)".to_string())
+        );
     }
 }

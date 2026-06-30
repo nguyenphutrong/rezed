@@ -608,7 +608,10 @@ impl GitBlame {
                                                 (oid, parsed_commit_message)
                                             })
                                             .collect::<HashMap<_, _>>();
-                                        commit_details.extend(overrides.messages_by_oid.clone());
+                                        merge_commit_details_with_overrides(
+                                            &mut commit_details,
+                                            &overrides.messages_by_oid,
+                                        );
                                         res.push((
                                             id,
                                             snapshot,
@@ -778,6 +781,21 @@ fn split_blame_entry_around(
         split_entries.push(after);
     }
     split_entries
+}
+
+fn merge_commit_details_with_overrides(
+    commit_details: &mut HashMap<Oid, ParsedCommitMessage>,
+    override_details: &HashMap<Oid, ParsedCommitMessage>,
+) {
+    for (oid, override_message) in override_details {
+        let should_insert = commit_details
+            .get(oid)
+            .is_none_or(|existing_message| existing_message.message.trim().is_empty())
+            || !override_message.message.trim().is_empty();
+        if should_insert {
+            commit_details.insert(*oid, override_message.clone());
+        }
+    }
 }
 
 fn build_blame_entry_sum_tree(entries: Vec<BlameEntry>, max_row: u32) -> SumTree<GitBlameEntry> {
@@ -1222,11 +1240,12 @@ mod tests {
         overrides
             .entries_by_buffer
             .insert(buffer_id, vec![synthetic_entry.clone()]);
+        let synthetic_message = "Synthetic commit\n\nFull body".to_string();
         overrides.messages_by_oid.insert(
             synthetic_oid,
             ParsedCommitMessage::parse(
                 synthetic_oid.to_string(),
-                "Synthetic commit".to_string(),
+                synthetic_message.clone(),
                 None,
                 None,
             ),
@@ -1254,7 +1273,76 @@ mod tests {
                 blame
                     .details_for_entry(buffer_id, &synthetic_entry)
                     .map(|details| details.message),
-                Some("Synthetic commit".into())
+                Some(synthetic_message.into())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_empty_override_message_does_not_replace_real_message(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/my-repo",
+            json!({
+                ".git": {},
+                "file.txt": "Line 1\n"
+            }),
+        )
+        .await;
+
+        let real_entry = blame_entry("1b1b1b", 0..1);
+        let oid = real_entry.sha;
+        let mut messages = HashMap::default();
+        messages.insert(oid, "Real message".to_string());
+        fs.set_blame_for_repo(
+            Path::new("/my-repo/.git"),
+            vec![(
+                repo_path("file.txt"),
+                Blame {
+                    entries: vec![real_entry.clone()],
+                    messages,
+                },
+            )],
+        );
+
+        let project = Project::test(fs, ["/my-repo".as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/my-repo/file.txt", cx)
+            })
+            .await
+            .unwrap();
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+        let mut overrides = crate::GitBlameOverride::default();
+        overrides.messages_by_oid.insert(
+            oid,
+            ParsedCommitMessage::parse(oid.to_string(), String::new(), None, None),
+        );
+
+        let git_blame = cx.new(|cx| {
+            GitBlame::new_with_overrides(buffer.clone(), project, overrides, false, true, cx)
+        });
+        cx.executor().run_until_parked();
+
+        git_blame.update(cx, |blame, cx| {
+            assert_blame_rows(
+                blame,
+                buffer_id,
+                0..1,
+                vec![Some(real_entry.clone())],
+                cx,
+            );
+            assert_eq!(
+                blame
+                    .details_for_entry(buffer_id, &real_entry)
+                    .map(|details| details.message),
+                Some("Real message".into())
             );
         });
     }
