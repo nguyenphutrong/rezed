@@ -44,6 +44,9 @@ impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+const REZED_GITHUB_RELEASES_URL: &str = "https://github.com/nguyenphutrong/rezed/releases";
+const REZED_GITHUB_LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/nguyenphutrong/rezed/releases/latest";
 
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
@@ -176,6 +179,18 @@ pub struct AutoUpdater {
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 struct MacOsUnmounter<'a> {
@@ -314,16 +329,13 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
             let auto_updater = AutoUpdater::get(cx)?;
             let auto_updater = auto_updater.read(cx);
             let mut current_version = auto_updater.current_version.clone();
-            current_version.pre = semver::Prerelease::EMPTY;
             current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+            format!("{REZED_GITHUB_RELEASES_URL}/tag/v{current_version}")
         }
         ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+            "https://github.com/nguyenphutrong/rezed/commits/nightly/".to_string()
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        ReleaseChannel::Dev => "https://github.com/nguyenphutrong/rezed/commits/rezed/".to_string(),
     };
     Some(url)
 }
@@ -591,6 +603,83 @@ impl AutoUpdater {
         Ok(Some(release.url))
     }
 
+    fn github_app_asset_name(os: &str, arch: &str) -> Result<String> {
+        match os {
+            "macos" => Ok(format!("Rezed-{arch}.dmg")),
+            "linux" => Ok(format!("rezed-linux-{arch}.tar.gz")),
+            "windows" => {
+                anyhow::bail!("Rezed GitHub releases do not publish a Windows app update asset yet")
+            }
+            unsupported_os => anyhow::bail!("not supported: {unsupported_os}"),
+        }
+    }
+
+    fn release_asset_from_github_release(
+        release: GithubRelease,
+        os: &str,
+        arch: &str,
+    ) -> Result<ReleaseAsset> {
+        let version = release
+            .tag_name
+            .strip_prefix('v')
+            .with_context(|| {
+                format!(
+                    "Rezed release tag {:?} must start with 'v'",
+                    release.tag_name
+                )
+            })?
+            .to_string();
+        let asset_name = Self::github_app_asset_name(os, arch)?;
+        let asset = release
+            .assets
+            .into_iter()
+            .find(|asset| asset.name == asset_name)
+            .with_context(|| {
+                format!(
+                    "Rezed release {} does not include app update asset {asset_name}",
+                    release.tag_name
+                )
+            })?;
+
+        Ok(ReleaseAsset {
+            version,
+            url: asset.browser_download_url,
+        })
+    }
+
+    async fn get_github_app_release_asset(
+        this: &Entity<Self>,
+        os: &str,
+        arch: &str,
+        cx: &mut AsyncApp,
+    ) -> Result<ReleaseAsset> {
+        let http_client = this.read_with(cx, |this, _| this.client.http_client());
+        let mut response = http_client
+            .get(
+                REZED_GITHUB_LATEST_RELEASE_API_URL,
+                Default::default(),
+                true,
+            )
+            .await?;
+        let mut body = Vec::new();
+        response.body_mut().read_to_end(&mut body).await?;
+
+        anyhow::ensure!(
+            response.status().is_success(),
+            "failed to fetch Rezed GitHub release: {:?}",
+            String::from_utf8_lossy(&body),
+        );
+
+        let release =
+            serde_json::from_slice::<GithubRelease>(body.as_slice()).with_context(|| {
+                format!(
+                    "error deserializing Rezed GitHub release {:?}",
+                    String::from_utf8_lossy(&body),
+                )
+            })?;
+        Self::release_asset_from_github_release(release, os, arch)
+    }
+
     async fn get_release_asset(
         this: &Entity<Self>,
         release_channel: ReleaseChannel,
@@ -673,8 +762,7 @@ impl AutoUpdater {
             cx.notify();
         });
 
-        let fetched_release_data =
-            Self::get_release_asset(&this, release_channel, None, "zed", OS, ARCH, cx).await?;
+        let fetched_release_data = Self::get_github_app_release_asset(&this, OS, ARCH, cx).await?;
         let fetched_version = fetched_release_data.clone().version;
         let app_commit_sha = Ok(cx.update(|cx| AppCommitSha::try_global(cx).map(|sha| sha.full())));
         let newer_version = Self::check_if_fetched_version_is_newer(
@@ -869,11 +957,11 @@ impl AutoUpdater {
 
     fn check_if_fetched_version_is_newer_non_nightly(
         mut installed_version: Version,
-        fetched_version: Version,
+        mut fetched_version: Version,
     ) -> Result<Option<VersionCheckType>> {
-        // For non-nightly releases, ignore build and pre-release fields as they're not provided by our endpoints right now.
-        installed_version.pre = semver::Prerelease::EMPTY;
+        // Build metadata does not affect SemVer precedence and includes local build details.
         installed_version.build = semver::BuildMetadata::EMPTY;
+        fetched_version.build = semver::BuildMetadata::EMPTY;
         let should_download = fetched_version > installed_version;
         let newer_version = should_download.then(|| VersionCheckType::Semantic(fetched_version));
         Ok(newer_version)
@@ -1238,26 +1326,29 @@ mod tests {
 
         cx.update(|cx| {
             settings::init(cx);
+            cx.set_global(db::AppDatabase::test_new());
 
             let current_version = semver::Version::new(0, 100, 0);
             release_channel::init_test(current_version, ReleaseChannel::Stable, cx);
 
             let clock = Arc::new(FakeSystemClock::new());
+            let asset_name = AutoUpdater::github_app_asset_name(OS, ARCH).unwrap();
             let release_available = Arc::clone(&release_available);
             let dmg_rx = Arc::new(parking_lot::Mutex::new(Some(dmg_rx)));
             let fake_client_http = FakeHttpClient::create(move |req| {
+                let asset_name = asset_name.clone();
                 let release_available = release_available.load(atomic::Ordering::Relaxed);
                 let dmg_rx = dmg_rx.clone();
                 async move {
-                if req.uri().path() == "/releases/stable/latest/asset" {
+                if req.uri().path() == "/repos/nguyenphutrong/rezed/releases/latest" {
                     if release_available {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.1","url":"https://test.example/new-download"}"#.into()
-                        ).unwrap());
+                        return Ok(Response::builder().status(200).body(format!(
+                            r#"{{"tag_name":"v0.100.1","assets":[{{"name":"{asset_name}","browser_download_url":"https://test.example/new-download"}}]}}"#
+                        ).into()).unwrap());
                     } else {
-                        return Ok(Response::builder().status(200).body(
-                            r#"{"version":"0.100.0","url":"https://test.example/old-download"}"#.into()
-                        ).unwrap());
+                        return Ok(Response::builder().status(200).body(format!(
+                            r#"{{"tag_name":"v0.100.0","assets":[{{"name":"{asset_name}","browser_download_url":"https://test.example/old-download"}}]}}"#
+                        ).into()).unwrap());
                     }
                 } else if req.uri().path() == "/new-download" {
                     return Ok(Response::builder().status(200).body({
@@ -1335,6 +1426,67 @@ mod tests {
         let path = will_restart.await.unwrap().unwrap();
         assert_eq!(path, tmp_dir.path().join("zed"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "<fake-zed-update>");
+    }
+
+    #[test]
+    fn test_github_release_asset_selects_linux_asset() {
+        let release_asset = AutoUpdater::release_asset_from_github_release(
+            GithubRelease {
+                tag_name: "v1.9.0-rezed.4".to_string(),
+                assets: vec![GithubReleaseAsset {
+                    name: "rezed-linux-x86_64.tar.gz".to_string(),
+                    browser_download_url: "https://example.com/rezed-linux-x86_64.tar.gz"
+                        .to_string(),
+                }],
+            },
+            "linux",
+            "x86_64",
+        )
+        .unwrap();
+
+        assert_eq!(release_asset.version, "1.9.0-rezed.4");
+        assert_eq!(
+            release_asset.url,
+            "https://example.com/rezed-linux-x86_64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn test_github_release_asset_selects_macos_asset() {
+        let release_asset = AutoUpdater::release_asset_from_github_release(
+            GithubRelease {
+                tag_name: "v1.9.0-rezed.4".to_string(),
+                assets: vec![GithubReleaseAsset {
+                    name: "Rezed-aarch64.dmg".to_string(),
+                    browser_download_url: "https://example.com/Rezed-aarch64.dmg".to_string(),
+                }],
+            },
+            "macos",
+            "aarch64",
+        )
+        .unwrap();
+
+        assert_eq!(release_asset.version, "1.9.0-rezed.4");
+        assert_eq!(release_asset.url, "https://example.com/Rezed-aarch64.dmg");
+    }
+
+    #[test]
+    fn test_github_release_asset_reports_missing_asset() {
+        let error = AutoUpdater::release_asset_from_github_release(
+            GithubRelease {
+                tag_name: "v1.9.0-rezed.4".to_string(),
+                assets: Vec::new(),
+            },
+            "linux",
+            "x86_64",
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not include app update asset rezed-linux-x86_64.tar.gz")
+        );
     }
 
     #[test]
@@ -1421,6 +1573,47 @@ mod tests {
             newer_version.unwrap(),
             Some(VersionCheckType::Semantic(fetched_version))
         );
+    }
+
+    #[test]
+    fn test_stable_rezed_prerelease_suffix_updates_when_higher() {
+        let release_channel = ReleaseChannel::Stable;
+        let app_commit_sha = Ok(Some("a".to_string()));
+        let installed_version = "1.9.0-rezed.2".parse().unwrap();
+        let status = AutoUpdateStatus::Idle;
+        let fetched_version = "1.9.0-rezed.3".parse::<semver::Version>().unwrap();
+
+        let newer_version = AutoUpdater::check_if_fetched_version_is_newer(
+            release_channel,
+            app_commit_sha,
+            installed_version,
+            fetched_version.to_string(),
+            status,
+        );
+
+        assert_eq!(
+            newer_version.unwrap(),
+            Some(VersionCheckType::Semantic(fetched_version))
+        );
+    }
+
+    #[test]
+    fn test_stable_rezed_prerelease_suffix_does_not_update_when_same() {
+        let release_channel = ReleaseChannel::Stable;
+        let app_commit_sha = Ok(Some("a".to_string()));
+        let installed_version = "1.9.0-rezed.3".parse().unwrap();
+        let status = AutoUpdateStatus::Idle;
+        let fetched_version = "1.9.0-rezed.3".parse::<semver::Version>().unwrap();
+
+        let newer_version = AutoUpdater::check_if_fetched_version_is_newer(
+            release_channel,
+            app_commit_sha,
+            installed_version,
+            fetched_version.to_string(),
+            status,
+        );
+
+        assert_eq!(newer_version.unwrap(), None);
     }
 
     #[test]

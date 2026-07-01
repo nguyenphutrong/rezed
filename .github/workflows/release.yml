@@ -28,23 +28,20 @@ jobs:
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
+      - name: Set stable release channel
+        run: |
+          printf 'stable' > crates/zed/RELEASE_CHANNEL
+          printf 'stable' > RELEASE_CHANNEL
       - name: Install Linux dependencies
         run: ./script/linux
       - name: Install WASI SDK
         run: ./script/download-wasi-sdk
-      - name: Build release binaries
-        run: cargo build --locked --release --package zed --package cli --package remote_server
-      - name: Package binaries
-        run: |
-          mkdir -p release-artifacts/rezed-linux-x86_64
-          cp target/release/zed release-artifacts/rezed-linux-x86_64/rezed
-          cp target/release/cli release-artifacts/rezed-linux-x86_64/zed
-          cp target/release/remote_server release-artifacts/rezed-linux-x86_64/remote_server
-          tar -C release-artifacts -czf rezed-linux-x86_64.tar.gz rezed-linux-x86_64
+      - name: Build Linux release archive
+        run: ./script/bundle-linux
       - uses: actions/upload-artifact@v4
         with:
           name: rezed-linux-x86_64
-          path: rezed-linux-x86_64.tar.gz
+          path: target/release/rezed-linux-x86_64.tar.gz
           if-no-files-found: error
 
   macos:
@@ -52,6 +49,10 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Set stable release channel
+        run: |
+          printf 'stable' > crates/zed/RELEASE_CHANNEL
+          printf 'stable' > RELEASE_CHANNEL
       - name: Build macOS DMG
         run: ./script/bundle-mac aarch64-apple-darwin
       - uses: actions/upload-artifact@v4
