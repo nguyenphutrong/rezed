@@ -491,9 +491,7 @@ mod tests {
 
     fn blame_entry(summary: Option<&str>) -> BlameEntry {
         BlameEntry {
-            sha: "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b"
-                .parse()
-                .unwrap(),
+            sha: "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b".parse().unwrap(),
             range: 0..1,
             original_line_number: 0,
             author: None,

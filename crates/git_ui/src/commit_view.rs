@@ -209,16 +209,16 @@ fn synthetic_blame_entries_for_commit_diff(
     };
     let mut entries_by_buffer = HashMap::<language::BufferId, Vec<BlameEntry>>::default();
     diff_snapshot.hunks(buffer_snapshot).for_each(|hunk| {
-        if let Some(range) = row_range_for_point_range(hunk.buffer_range.to_point(buffer_snapshot)) {
+        if let Some(range) = row_range_for_point_range(hunk.buffer_range.to_point(buffer_snapshot))
+        {
             entries_by_buffer
                 .entry(buffer_id)
                 .or_default()
                 .push(blame_entry_for_range(range));
         }
 
-        let base_range =
-            base_text_buffer_snapshot.offset_to_point(hunk.diff_base_byte_range.start)
-                ..base_text_buffer_snapshot.offset_to_point(hunk.diff_base_byte_range.end);
+        let base_range = base_text_buffer_snapshot.offset_to_point(hunk.diff_base_byte_range.start)
+            ..base_text_buffer_snapshot.offset_to_point(hunk.diff_base_byte_range.end);
         if let Some(range) = row_range_for_point_range(base_range) {
             entries_by_buffer
                 .entry(base_buffer_id)
@@ -1194,9 +1194,7 @@ mod tests {
                 &buffer_snapshot,
                 &base_text_buffer_snapshot,
                 &diff_snapshot,
-                "9999999999999999999999999999999999999999"
-                    .parse()
-                    .unwrap(),
+                "9999999999999999999999999999999999999999".parse().unwrap(),
                 "Author",
                 "<author@example.com>",
                 1,
@@ -1420,7 +1418,10 @@ impl Item for CommitView {
                         let (file_statuses, git_blame_override) = commit_diff_addon
                             .as_ref()
                             .map(|addon| {
-                                (addon.file_statuses.clone(), addon.git_blame_override.clone())
+                                (
+                                    addon.file_statuses.clone(),
+                                    addon.git_blame_override.clone(),
+                                )
                             })
                             .unwrap_or_default();
                         editor.register_addon(CommitDiffAddon {

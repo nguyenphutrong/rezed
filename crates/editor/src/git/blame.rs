@@ -1331,13 +1331,7 @@ mod tests {
         cx.executor().run_until_parked();
 
         git_blame.update(cx, |blame, cx| {
-            assert_blame_rows(
-                blame,
-                buffer_id,
-                0..1,
-                vec![Some(real_entry.clone())],
-                cx,
-            );
+            assert_blame_rows(blame, buffer_id, 0..1, vec![Some(real_entry.clone())], cx);
             assert_eq!(
                 blame
                     .details_for_entry(buffer_id, &real_entry)
@@ -1381,10 +1375,7 @@ mod tests {
         expected_second_override.range = 4..5;
 
         pretty_assertions::assert_eq!(
-            merge_blame_entries(
-                Vec::new(),
-                vec![first_override.clone(), second_override]
-            ),
+            merge_blame_entries(Vec::new(), vec![first_override.clone(), second_override]),
             vec![first_override, expected_second_override]
         );
     }
