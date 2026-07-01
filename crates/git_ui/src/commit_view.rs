@@ -1141,10 +1141,7 @@ async fn build_buffer_diff(
 
     let language = cx.update(|_, cx| buffer.read(cx).language().cloned())?;
     let buffer = cx.update(|_, cx| buffer.read(cx).snapshot())?;
-    let base_text = old_text
-        .as_ref()
-        .map(|old_text| old_text.as_str())
-        .unwrap_or_default();
+    let base_text = old_text.as_deref().unwrap_or_default();
     let base_text = Rope::from(base_text);
     let base_text_buffer = cx.new(|cx| {
         let text_buffer = TextBuffer::new_normalized(

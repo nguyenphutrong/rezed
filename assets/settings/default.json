@@ -1675,13 +1675,17 @@
     // Rules for linking issue references in commit messages.
     // Rules are evaluated in order. The first rule that claims a text range wins.
     // Regex captures can be referenced from `issue_url` with `$1`, `$2`, etc.
+    // Repository variables are expanded before regex captures:
+    // `$GIT_REMOTE_URL`, `$GIT_REMOTE_HOST`, `$GIT_REMOTE_OWNER`, `$GIT_REMOTE_REPO`,
+    // `$GIT_PROVIDER`, `$GIT_PROVIDER_URL`, `$GITHUB_HOST`, `$GITHUB_BASE_URL`,
+    // `$GITHUB_ORG`, `$GITHUB_REPO`.
     //
     // Examples:
     //   [
     //     {
     //       "name": "github",
     //       "issue_regex": "#(\\d+)",
-    //       "issue_url": "https://github.com/org/repo/issues/$1"
+    //       "issue_url": "$GITHUB_BASE_URL/$GITHUB_ORG/$GITHUB_REPO/issues/$1"
     //     },
     //     {
     //       "name": "linear",
